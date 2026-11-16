@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 
-class FakeStorage {
+export class FakeStorage {
     constructor() { this.m = new Map() }
     getItem(k) { return this.m.has(k) ? this.m.get(k) : null }
     setItem(k, v) { this.m.set(k, String(v)) }
@@ -33,12 +33,15 @@ class FakeElement {
  * @param {object} opts
  * @param {string} [opts.url]
  * @param {(req) => {status:number, body:any}|undefined} [opts.respond]
+ * @param {Map<string, string>} [opts.cookies] cookie jar; give two browsers the same one
+ *   (and the same localStorage) to model two tabs of one site
+ * @param {FakeStorage} [opts.localStorage]
  */
 export function createBrowser(opts = {}) {
     const url = new URL(opts.url || 'https://app.example.com/pricing?utm_source=newsletter')
     const requests = []
     const listeners = {}
-    const cookies = new Map()
+    const cookies = opts.cookies || new Map() // pass the same Map (and localStorage) to two browsers for two tabs
     const elements = { '#hero': [new FakeElement('h1', 'hero')] }
 
     const respond = opts.respond || (() => undefined)
@@ -145,7 +148,7 @@ export function createBrowser(opts = {}) {
         document,
         screen: { width: 1440, height: 900 },
         innerWidth: 1200, innerHeight: 800,
-        localStorage: new FakeStorage(),
+        localStorage: opts.localStorage || new FakeStorage(),
         sessionStorage: new FakeStorage(),
         history: {
             pushState(_s, _t, p) { window.location.pathname = p; window.location.href = url.origin + p; document.URL = window.location.href },

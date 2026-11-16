@@ -209,7 +209,15 @@ class WebStore {
   /** @override */
   set(name, value) {
     try {
-      if (win) this.storage_().setItem(name, JSON.stringify(value));
+      if (win) {
+        const s = JSON.stringify(value);
+        const storage = this.storage_();
+        // setItem with the value already stored is a no-op by spec (no storage
+        // event, no quota check) but not cheap; register_for_session rewrites
+        // the same key list on every rrweb event. Reading first still writes
+        // whenever anything else (another frame, the page) changed the item.
+        if (storage.getItem(name) !== s) storage.setItem(name, s);
+      }
       return true;
     } catch (e) {
       logger.error(this.kind_ + ' error: ' + e);

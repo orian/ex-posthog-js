@@ -8,7 +8,7 @@ const plain = (v) => (v === undefined ? v : JSON.parse(JSON.stringify(v)))
 const assert = Object.assign((...a) => strictAssert(...a), strictAssert, {
     deepEqual: (a, b, m) => strictAssert.deepEqual(plain(a), plain(b), ...(m ? [m] : [])),
 })
-import { createBrowser, sleep, capturedEvents } from './harness.mjs'
+import { createBrowser, sleep, capturedEvents, FakeStorage } from './harness.mjs'
 
 const TOKEN = 'phc_test'
 const FAST = { request_queue_config: { flush_interval_ms: 250 } } // upstream clamps to >= 250ms
@@ -849,6 +849,100 @@ Object.assign(scenarios, {
             assert.equal(ph.featureFlags.hasLoadedFlags, false)
             await sleep(150)
             assert.equal(ph.featureFlags.hasLoadedFlags, true)
+        },
+    },
+})
+
+// ---- storage writes across tabs ----------------------------------------------------
+// Two browsers sharing one cookie jar and one localStorage are two tabs of the site.
+// Writes skipped as no-ops (setItem of the stored value) must never hide another tab's
+// or another frame's change, and the persistence blob must be what JSON.stringify of
+// the tab's props gives.
+const PERSISTENCE_KEY = 'ph_' + TOKEN + '_posthog'
+const cookieBlob = (cookies) => JSON.parse(decodeURIComponent(cookies.get(PERSISTENCE_KEY)))
+Object.assign(scenarios, {
+    'persistence: two tabs sharing localStorage and cookies see each other\'s writes': {
+        builds: ['full', 'lazy'],
+        compiledOnly: true, // two SDK copies need two vm realms; source modules share state
+        async run(load) {
+            const shared = { cookies: new Map(), localStorage: new FakeStorage() }
+            const config = { ...FAST, capture_pageview: false, persistence: 'localStorage+cookie' }
+            const A = await load(shared)
+            A.ph.init(TOKEN, config)
+            const anon = A.ph.get_distinct_id()
+            assert.equal(JSON.parse(shared.localStorage.getItem(PERSISTENCE_KEY)).distinct_id, anon)
+            const B = await load(shared)
+            B.ph.init(TOKEN, config)
+            assert.equal(B.ph.get_distinct_id(), anon, 'tab B starts from tab A\'s stored identity')
+
+            B.ph.identify('user-b')
+            assert.equal(JSON.parse(shared.localStorage.getItem(PERSISTENCE_KEY)).distinct_id, 'user-b')
+            assert.equal(cookieBlob(shared.cookies).distinct_id, 'user-b')
+
+            // Tab A's props didn't change: like upstream (no-op fingerprint), it doesn't write.
+            A.ph.register({ plan: undefined })
+            A.ph.register({})
+            assert.equal(JSON.parse(shared.localStorage.getItem(PERSISTENCE_KEY)).distinct_id, 'user-b')
+
+            // A real change in tab A writes tab A's whole blob, cookie included.
+            A.ph.register({ plan: 'pro' })
+            const stored = shared.localStorage.getItem(PERSISTENCE_KEY)
+            assert.equal(stored, JSON.stringify(JSON.parse(stored)))
+            assert.equal(JSON.parse(stored).distinct_id, anon)
+            assert.equal(JSON.parse(stored).plan, 'pro')
+            assert.equal(cookieBlob(shared.cookies).distinct_id, anon)
+
+            // Tab B removes the blob (e.g. reset() there); tab A's next change writes it back.
+            shared.localStorage.removeItem(PERSISTENCE_KEY)
+            shared.cookies.delete(PERSISTENCE_KEY)
+            A.ph.register({ plan: 'team' })
+            assert.equal(JSON.parse(shared.localStorage.getItem(PERSISTENCE_KEY)).plan, 'team')
+            assert.equal(cookieBlob(shared.cookies).distinct_id, anon)
+
+            // Tab B writes the same bytes tab A would write: tab A still writes its change.
+            B.ph.register({ plan: 'team' })
+            A.ph.register({ plan: 'enterprise' })
+            assert.equal(JSON.parse(shared.localStorage.getItem(PERSISTENCE_KEY)).plan, 'enterprise')
+            assert.equal(JSON.parse(shared.localStorage.getItem(PERSISTENCE_KEY)).distinct_id, anon)
+        },
+    },
+    'persistence: session-registered keys are rewritten after another frame changes them, and only then': {
+        builds: ['full', 'lazy'],
+        compiledOnly: true,
+        async run(load) {
+            const { b, ph } = await load()
+            ph.init(TOKEN, { ...FAST, capture_pageview: false })
+            const key = 'ph_' + TOKEN + '_session_registered_properties'
+            const ss = b.window.sessionStorage
+            const writes = []
+            const setItem = ss.setItem.bind(ss)
+            ss.setItem = (k, v) => { writes.push([k, v]); setItem(k, v) }
+            const keyWrites = () => writes.filter(([k]) => k === key).map(([, v]) => v)
+
+            ph.register_for_session({ flow: 'a' })
+            const list = ss.getItem(key)
+            assert.ok(JSON.parse(list).includes('flow'))
+            assert.deepEqual(keyWrites(), [list])
+            // Same keys again (replay does this on every rrweb event): the stored value is
+            // already there, and setItem would be a no-op by spec, so it isn't called.
+            ph.register_for_session({ flow: 'a' })
+            ph.register_for_session({ flow: 'b' })
+            assert.deepEqual(keyWrites(), [list])
+            // Another same-origin frame of this tab (they share sessionStorage) changes or
+            // removes the item: the next registration writes it back.
+            ss.setItem(key, '["other"]')
+            writes.length = 0
+            ph.register_for_session({ flow: 'c' })
+            assert.deepEqual(keyWrites(), [list])
+            assert.equal(ss.getItem(key), list)
+            ss.removeItem(key)
+            ph.register_for_session({ flow: 'd' })
+            assert.equal(ss.getItem(key), list)
+            assert.deepEqual(keyWrites(), [list, list])
+            // A new key changes the list: written.
+            ph.register_for_session({ other: 1 })
+            assert.ok(JSON.parse(ss.getItem(key)).includes('other'))
+            assert.equal(keyWrites().length, 3)
         },
     },
 })

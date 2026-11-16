@@ -31,6 +31,7 @@ for (const mode of modes) {
         for (const build of scenario.builds) {
             if (mode === 'source' && build === 'chunks') continue
             if (mode === 'compiled' && scenario.sourceOnly) continue
+            if (mode === 'source' && scenario.compiledOnly) continue
             const label = `[${mode}/${build}] ${name}`
             let error = null
             if (mode === 'source') {
