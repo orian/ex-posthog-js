@@ -18,3 +18,7 @@ SCENARIO_NAMES.push('replay_recording', 'replay_server_disabled', 'replay_client
     'replay_idle_rotation', 'replay_forced_rotation', 'replay_start_stop_api', 'replay_unload_flush',
     'replay_cached_config', 'replay_stale_cached_config', 'replay_masking_network', 'replay_v2_trigger_groups',
     'replay_idle_detection', 'replay_full_snapshot_interval')
+// Web vitals and tracing headers (pages/scenarios.js, last block).
+SCENARIO_NAMES.push('wv_remote_on', 'wv_remote_off', 'wv_allowed_metrics', 'wv_client_config', 'wv_real_metrics',
+    'wv_flush_unload', 'wv_flush_timer', 'wv_external_loading_disabled',
+    'th_fetch_xhr', 'th_not_configured', 'th_alias_add_tracing_headers', 'th_alias_legacy_true', 'th_set_config')
