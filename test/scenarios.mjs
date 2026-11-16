@@ -943,6 +943,11 @@ Object.assign(scenarios, {
             ph.register_for_session({ other: 1 })
             assert.ok(JSON.parse(ss.getItem(key)).includes('other'))
             assert.equal(keyWrites().length, 3)
+            ph.unregister_for_session('other')
+            assert.equal(ss.getItem(key), list)
+            ph.register_for_session({ other: 2 })
+            assert.ok(JSON.parse(ss.getItem(key)).includes('other'))
+            assert.equal(keyWrites().length, 5)
         },
     },
 })

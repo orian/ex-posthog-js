@@ -346,6 +346,12 @@ export class PostHog {
     this.initialPersonProfilesConfig_ = null;
     /** @private {!Array<string>} keys registered via register_for_session */
     this.sessionRegisteredPropKeys_ = [];
+    /**
+     * JSON of sessionRegisteredPropKeys_ when it was that array at that length (the
+     * list only grows by push or is replaced, so identity + length means unchanged).
+     * @private {?{keys: !Array<string>, length: number, json: string}}
+     */
+    this.sessionRegisteredPropKeysJson_ = null;
     /** @private {string} */
     this.sessionRegisteredPropertiesStorageKey_ = '';
     /** @private {?string} */
@@ -1726,7 +1732,15 @@ export class PostHog {
       return;
     }
     if (this.sessionRegisteredPropKeys_.length > 0) {
-      sessionStore.set(this.sessionRegisteredPropertiesStorageKey_, this.sessionRegisteredPropKeys_.slice());
+      // register_for_session runs three times per rrweb event (trigger statuses) with
+      // the same keys: reuse their JSON, and the store skips the identical write.
+      const list = this.sessionRegisteredPropKeys_;
+      let cached = this.sessionRegisteredPropKeysJson_;
+      if (!cached || cached.keys !== list || cached.length !== list.length) {
+        cached = this.sessionRegisteredPropKeysJson_ = {keys: list, length: list.length, json: JSON.stringify(list)};
+      }
+      sessionStore.set(this.sessionRegisteredPropertiesStorageKey_, list, undefined, undefined, undefined,
+          cached.json);
     } else {
       sessionStore.remove(this.sessionRegisteredPropertiesStorageKey_);
     }
