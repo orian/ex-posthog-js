@@ -1,5 +1,16 @@
 // Headless Chrome (chromedp/headless-shell in Docker) driven over CDP.
 import { execFileSync } from 'node:child_process'
+import net from 'node:net'
+
+function freePort() {
+    return new Promise((resolve) => {
+        const srv = net.createServer()
+        srv.listen(0, '127.0.0.1', () => {
+            const { port } = srv.address()
+            srv.close(() => resolve(port))
+        })
+    })
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 export const CHROME_UA =
@@ -7,7 +18,8 @@ export const CHROME_UA =
 
 export async function launchChrome() {
     const name = 'phc-diff-' + process.pid
-    const port = 9222
+    // Host networking: pick a free port so parallel runs (e.g. several worktrees) don't collide.
+    const port = Number(process.env.CHROME_DEBUG_PORT) || await freePort()
     // The image's run.sh word-splits its arguments, so call the binary directly.
     execFileSync('docker', ['run', '-d', '--rm', '--name', name, '--network', 'host',
         '--entrypoint', '/headless-shell/headless-shell', 'chromedp/headless-shell:latest',
