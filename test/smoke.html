@@ -31,6 +31,7 @@
 </script>
 <script src="../dist/chunks/flags.js"></script>
 <script src="../dist/chunks/experiments.js"></script>
+<script src="../dist/chunks/exceptions.js"></script>
 <script>
   setTimeout(function () {
     document.getElementById('out').textContent = JSON.stringify({
@@ -39,6 +40,7 @@
       hero: document.getElementById('hero').textContent,
       xss: !!window.__xss,
       distinct: !!posthog.get_distinct_id(),
+      exception: !!posthog.captureException(new Error('smoke')),
       paths: sent.map(function (r) { return r.url.replace(/\?.*/, ''); }).sort()
     });
   }, 1200);

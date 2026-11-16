@@ -37,7 +37,7 @@ try {
     ws.close()
     console.log(out)
     const res = JSON.parse(out)
-    const ok = res.errors.length === 0 && res.flag === 'test' && res.hero === 'New' && !res.xss && res.distinct &&
+    const ok = res.errors.length === 0 && res.flag === 'test' && res.hero === 'New' && !res.xss && res.distinct && res.exception &&
         res.paths.some((p) => p.endsWith('/e/')) && res.paths.some((p) => p.endsWith('/flags/'))
     console.log(ok ? 'SMOKE OK' : 'SMOKE FAILED')
     process.exitCode = ok ? 0 : 1
