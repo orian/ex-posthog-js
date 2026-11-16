@@ -33,7 +33,9 @@ function decodeBody(buf, url, contentType) {
 }
 
 export function startServer({ port = 0 } = {}) {
-    const state = { log: [], responses: {} }
+    // log: requests to the fake PostHog (compared); sdkLog: the SDK files pages load from
+    // /sdk/ (not compared; the lazy-chunk order check reads it). `seq` orders both logs.
+    const state = { log: [], sdkLog: [], responses: {}, seq: 0 }
 
     const server = http.createServer((req, res) => {
         const host = (req.headers.host || '').split(':')[0]
@@ -64,7 +66,7 @@ export function startServer({ port = 0 } = {}) {
             // as such, so the diff can flag SDKs requesting assets that don't exist).
             const m = /^\/static\/(?:([^/]+)\/)?([^/]+)$/.exec(url.pathname)
             const versionOk = !!m && (!m[1] || m[1] === OFFICIAL_VERSION)
-            const entry = { method: req.method, path: url.pathname, query: Object.fromEntries(url.searchParams) }
+            const entry = { method: req.method, path: url.pathname, query: Object.fromEntries(url.searchParams), seq: state.seq++ }
             state.log.push(entry)
             if (versionOk && m[2] === 'toolbar.js') {
                 // A scenario may 404 the versioned toolbar on purpose (to exercise the fallback).
@@ -84,6 +86,7 @@ export function startServer({ port = 0 } = {}) {
             query: Object.fromEntries(url.searchParams),
             contentType: req.headers['content-type'],
             body: decodeBody(body, url, req.headers['content-type']),
+            seq: state.seq++,
         }
         state.log.push(entry)
         const custom = state.responses[url.pathname] ?? matchPrefix(url.pathname)
@@ -104,6 +107,9 @@ export function startServer({ port = 0 } = {}) {
     }
 
     function statics(res, url) {
+        if (url.pathname.startsWith('/sdk/')) {
+            state.sdkLog.push({ path: url.pathname, query: Object.fromEntries(url.searchParams), seq: state.seq++ })
+        }
         let file
         if (url.pathname.startsWith('/sdk/official/')) file = path.join(VENDOR, path.basename(url.pathname))
         else if (url.pathname.startsWith('/sdk/ours/')) file = path.join(ROOT, 'dist', url.pathname.slice('/sdk/ours/'.length))

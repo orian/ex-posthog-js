@@ -842,7 +842,9 @@
     },
 
     dead_clicks: async function (ph, h) {
-      ph.init(h.token, h.config({ capture_pageview: false, capture_dead_clicks: true }))
+      // disable_surveys: upstream inserts surveys.js (not ported) after its detector started, a
+      // DOM mutation ours can't mirror (it would show up as $dead_click_last_mutation_timestamp).
+      ph.init(h.token, h.config({ capture_pageview: false, capture_dead_clicks: true, disable_surveys: true }))
       await sleep(READY_MS)
       // Nothing mutates for 3s after these: #ac-dead and the plain div are dead; the link,
       // ph-no-deadclick, ph-no-capture and the ctrl-click are ignored.
