@@ -106,7 +106,10 @@ function expandSnapshot(e) {
     if (!p || !Array.isArray(p.$snapshot_data)) return e
     const expected = p.$snapshot_data.reduce((sum, ev) => sum + (ev && ev.cv
         ? estimateCompressedEventSize(ev) : Buffer.byteLength(JSON.stringify(ev))), 0)
-    const bytes = p.$snapshot_bytes === expected ? '<consistent>' : `<inconsistent: ${p.$snapshot_bytes} != ${expected}>`
+    // Upstream sizes events when they are buffered, so an event that changes
+    // before it is sent (e.g. `$posthog_config` holds the live config) is off by
+    // the same delta in both SDKs.
+    const bytes = p.$snapshot_bytes === expected ? '<consistent>' : `<inconsistent by ${p.$snapshot_bytes - expected}>`
     return { ...e, properties: { ...p, $snapshot_bytes: bytes, $snapshot_data: p.$snapshot_data.map(decompressReplayEvent) } }
 }
 

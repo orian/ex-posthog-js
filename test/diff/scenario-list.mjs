@@ -7,4 +7,5 @@ SCENARIO_NAMES.push('replay_recording', 'replay_server_disabled', 'replay_client
     'replay_sample_rate_1', 'replay_linked_flag_match', 'replay_linked_flag_miss', 'replay_url_trigger',
     'replay_url_blocklist', 'replay_event_trigger', 'replay_minimum_duration', 'replay_minimum_duration_strict',
     'replay_idle_rotation', 'replay_forced_rotation', 'replay_start_stop_api', 'replay_unload_flush',
-    'replay_cached_config', 'replay_stale_cached_config', 'replay_masking_network', 'replay_v2_trigger_groups')
+    'replay_cached_config', 'replay_stale_cached_config', 'replay_masking_network', 'replay_v2_trigger_groups',
+    'replay_idle_detection', 'replay_full_snapshot_interval')

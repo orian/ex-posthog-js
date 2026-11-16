@@ -122,6 +122,8 @@ Object.assign(RESPONSES, {
     replay_unload_flush: recordingConfig({}),
     replay_cached_config: recordingConfig({}),
     replay_stale_cached_config: recordingConfig({}),
+    replay_idle_detection: recordingConfig({}),
+    replay_full_snapshot_interval: recordingConfig({}),
     replay_masking_network: recordingConfig({
         masking: { maskAllInputs: false, maskTextSelector: '.secret' },
         networkPayloadCapture: { recordHeaders: true, recordBody: true },

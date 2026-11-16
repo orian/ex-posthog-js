@@ -566,6 +566,36 @@
       window.__flagResults = { ok: ok, s: status(ph) }
     },
 
+    replay_idle_detection: async function (ph, h) {
+      // A 1s replay idle threshold: a mutation 1.5s after the last interaction
+      // marks the recording idle (sessionIdle, flushed), the next interaction
+      // wakes it (sessionNoLongerIdle).
+      ph.init(h.token, cfg(h, { session_recording: { session_idle_threshold_ms: 1000 } }))
+      var ok = await started(ph)
+      interact()
+      await sleep(1500)
+      var p = document.createElement('p')
+      p.textContent = 'while idle'
+      document.body.appendChild(p)
+      await sleep(400)
+      var idle = status(ph)
+      interact()
+      await sleep(2500)
+      window.__flagResults = { ok: ok, idle: idle, s: status(ph) }
+    },
+
+    replay_full_snapshot_interval: async function (ph, h) {
+      // Periodic full snapshots every second; recording is stopped well
+      // between two ticks so both SDKs take the same number.
+      ph.init(h.token, cfg(h, { session_recording: { full_snapshot_interval_millis: 1000 } }))
+      var ok = await started(ph)
+      interact()
+      await sleep(2000)
+      ph.stopSessionRecording()
+      await sleep(300)
+      window.__flagResults = { ok: ok, s: status(ph) }
+    },
+
     replay_v2_trigger_groups: async function (ph, h) {
       ph.init(h.token, cfg(h))
       var ok = await started(ph)
