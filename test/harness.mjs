@@ -26,6 +26,7 @@ class FakeElement {
     }
     setAttribute(k, v) { this.attrs[k] = String(v) }
     getAttribute(k) { return this.attrs[k] ?? null }
+    get localName() { return this.tagName.toLowerCase() }
 }
 
 /**
@@ -42,8 +43,43 @@ export function createBrowser(opts = {}) {
 
     const respond = opts.respond || (() => undefined)
 
+    const listenersDoc = {}
+    const scripts = []
+    // <script> injection: the request is recorded, then the load fails (scripts
+    // don't execute here), so the SDK takes its JSON fallback paths. A route
+    // answering { script: fn } instead runs fn(window) and fires onload.
+    const appendScript = (el) => {
+        if (el.tagName !== 'SCRIPT') return el
+        scripts.push(el)
+        const u = new URL(el.src)
+        const req = { url: el.src, method: 'GET', path: u.pathname, transport: 'script' }
+        requests.push(req)
+        const res = respond(req)
+        setTimeout(() => {
+            if (res && typeof res.script === 'function') {
+                res.script(window)
+                el.onload && el.onload({ type: 'load' })
+            } else {
+                el.onerror && el.onerror({ type: 'error' })
+            }
+        }, 1)
+        return el
+    }
+    const makeElement = (tag) => {
+        const el = new FakeElement(tag)
+        el.addEventListener = () => {}
+        return el
+    }
     const document = {
         title: 'Pricing',
+        URL: url.href,
+        readyState: 'complete',
+        visibilityState: 'visible',
+        body: { appendChild: appendScript, tagName: 'BODY' },
+        head: { appendChild: appendScript, tagName: 'HEAD' },
+        documentElement: { scrollHeight: 2000, clientHeight: 800, scrollTop: 0, scrollLeft: 0 },
+        createElement: makeElement,
+        removeEventListener() {},
         referrer: 'https://www.google.com/search?q=x',
         get cookie() {
             return [...cookies].map(([k, v]) => `${k}=${v}`).join('; ')
@@ -60,17 +96,19 @@ export function createBrowser(opts = {}) {
             if (expires && new Date(expires.split('=')[1]) < new Date()) cookies.delete(k)
             else cookies.set(k, v)
         },
-        querySelectorAll(sel) { return elements[sel] || [] },
-        addEventListener() {},
+        querySelectorAll(sel) { return sel === 'script' || sel === 'body > script' ? [] : elements[sel] || [] },
+        querySelector(sel) { return (elements[sel] || [])[0] || null },
+        addEventListener(type, fn) { (listenersDoc[type] ||= []).push(fn) },
     }
 
     const decodeBody = async (u, body) => {
         if (body === undefined || body === null) return undefined
         if (typeof body !== 'string') {
-            const buf = typeof body.arrayBuffer === 'function'
+            const buf = Buffer.isBuffer(body) ? body : typeof body.arrayBuffer === "function"
                 ? Buffer.from(await body.arrayBuffer())
                 : Buffer.from(ArrayBuffer.isView(body) ? body.buffer : body)
-            return JSON.parse(zlib.gunzipSync(buf).toString('utf8'))
+            if (buf[0] === 0x1f && buf[1] === 0x8b) return JSON.parse(zlib.gunzipSync(buf).toString('utf8'))
+            body = buf.toString('utf8')
         }
         if (body.startsWith('data=')) {
             const b64 = decodeURIComponent(body.slice(5))
@@ -82,6 +120,7 @@ export function createBrowser(opts = {}) {
     const record = async (u, method, body, headers, transport) => {
         const req = { url: u, method, headers, transport, body: await decodeBody(u, body) }
         req.path = new URL(u).pathname
+        req.query = Object.fromEntries(new URL(u).searchParams)
         requests.push(req)
         return req
     }
@@ -89,7 +128,7 @@ export function createBrowser(opts = {}) {
     const window = {
         location: {
             href: url.href, host: url.host, hostname: url.hostname, pathname: url.pathname,
-            search: url.search, protocol: url.protocol, hash: url.hash,
+            search: url.search, protocol: url.protocol, hash: url.hash, origin: url.origin,
         },
         navigator: {
             userAgent: opts.userAgent ||
@@ -97,7 +136,7 @@ export function createBrowser(opts = {}) {
             language: 'en-US',
             onLine: true,
             sendBeacon(u, blob) {
-                blob.text().then((t) => record(u, 'POST', t, {}, 'sendBeacon'))
+                blob.arrayBuffer().then((b) => record(u, 'POST', Buffer.from(b), {}, 'sendBeacon'))
                 return true
             },
         },
@@ -107,7 +146,7 @@ export function createBrowser(opts = {}) {
         localStorage: new FakeStorage(),
         sessionStorage: new FakeStorage(),
         history: {
-            pushState(_s, _t, p) { window.location.pathname = p; window.location.href = url.origin + p },
+            pushState(_s, _t, p) { window.location.pathname = p; window.location.href = url.origin + p; document.URL = window.location.href },
             replaceState() {},
         },
         console,
@@ -117,24 +156,28 @@ export function createBrowser(opts = {}) {
         Blob: globalThis.Blob,
         Promise,
         AbortController,
-        Intl, JSON, Math, Date, Object, Array, String, Number, RegExp, Uint8Array, Error,
+        Intl, JSON, Math, Date, Object, Array, String, Number, RegExp, Uint8Array, Int32Array, ArrayBuffer, Error,
+        URL, Headers, TypeError,
+        performance: { now: () => performance.now() },
         encodeURIComponent, decodeURIComponent, unescape, escape, btoa, atob, parseFloat, isNaN,
         setTimeout, clearTimeout, setInterval, clearInterval,
+        onpagehide: null,
         addEventListener(type, fn) { (listeners[type] ||= []).push(fn) },
         removeEventListener(type, fn) { listeners[type] = (listeners[type] || []).filter((f) => f !== fn) },
         async fetch(u, init = {}) {
             const req = await record(u, init.method || 'GET', init.body, init.headers, 'fetch')
             const res = respond(req) || { status: 200, body: { status: 1 } }
             const text = typeof res.body === 'string' ? res.body : JSON.stringify(res.body)
-            return { status: res.status, text: async () => text }
+            return { status: res.status, text: async () => text, headers: new Headers() }
         },
     }
     window.window = window
+    document.location = window.location
     window.self = window
     window.globalThis = window
 
     return {
-        window, document, requests, elements, cookies,
+        window, document, requests, elements, cookies, scripts,
         dispatch(type) { (listeners[type] || []).forEach((fn) => fn({ type })) },
         /** Runs a compiled bundle (or chunk) as a classic script. */
         loadScript(file) {

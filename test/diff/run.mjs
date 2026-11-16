@@ -15,7 +15,8 @@ async function runScenario(chrome, srv, scenario, sdk) {
     srv.state.log = []
     srv.state.responses = { ...RESPONSES.default, ...(RESPONSES[scenario] || {}) }
     const page = await chrome.newPage()
-    const url = `http://app.example.test:${srv.port}/page.html?sdk=${sdk}&scenario=${scenario}&utm_source=newsletter&utm_campaign=launch`
+    const bundle = process.env.DIFF_BUNDLE ? `&bundle=${process.env.DIFF_BUNDLE}` : ''
+    const url = `http://app.example.test:${srv.port}/page.html?sdk=${sdk}&scenario=${scenario}&utm_source=newsletter&utm_campaign=launch${bundle}`
     await page.goto(url, REFERRER)
     await page.waitFor('window.__done === true', 20000)
     const error = await page.evaluate('window.__error || null')
@@ -44,7 +45,7 @@ function normalise(value, ids, key) {
             return ids.get(value)
         }
         if (ISO.test(value)) return '<iso>'
-        return value.replace(/:\d{4,5}\//g, ':<port>/').replace(/:\d{4,5}$/, ':<port>').replace(/sdk=(official|ours)/g, 'sdk=<sdk>')
+        return value.replace(/:\d{4,5}\//g, ':<port>/').replace(/:\d{4,5}$/, ':<port>').replace(/sdk=(official|ours)/g, 'sdk=<sdk>').replace(/&bundle=[^&]*/g, '')
     }
     if (Array.isArray(value)) return value.map((v) => normalise(v, ids))
     if (value && typeof value === 'object') {
@@ -67,7 +68,7 @@ function digest(log) {
         delete query.sent_at
         const body = r.body
         const batch = body && typeof body === 'object' ? (Array.isArray(body) ? body : body.batch) : null
-        requests.push({ method: r.method, path: r.path, query: normalise(query, ids), events: batch ? batch.map((e) => e.event) : undefined })
+        requests.push({ method: r.method, path: r.path, query: normalise(query, ids), contentType: r.contentType, events: batch ? batch.map((e) => e.event) : undefined })
         if (batch) for (const e of batch) events.push(normalise(e, ids))
         else if (body && typeof body === 'object' && r.path !== '/e/') events.push({ __request: r.path, body: normalise(body, ids) })
     }
@@ -88,7 +89,10 @@ function compare(official, ours) {
     const out = []
     const o = digest(official.log)
     const m = digest(ours.log)
-    const seq = (d) => d.requests.filter((r) => !r.path.startsWith('/static/')).map((r) => `${r.method} ${r.path}${r.events ? ' [' + r.events.join(',') + ']' : ''}`)
+    const seq = (d) => d.requests.filter((r) => !r.path.startsWith('/static/')).map((r) => {
+        const q = Object.keys(r.query).sort().map((k) => `${k}=${r.query[k]}`).join('&')
+        return `${r.method} ${r.path}${q ? '?' + q : ''}${r.contentType ? ' (' + r.contentType + ')' : ''}${r.events ? ' [' + r.events.join(',') + ']' : ''}`
+    })
     diffValues(seq(o), seq(m), 'requests', out)
     const names = (d) => d.events.map((e) => e.event || e.__request)
     diffValues(names(o), names(m), 'event-order', out)

@@ -63,9 +63,7 @@
       }))
       ph.capture('secret')
       ph.capture('public', { long: new Array(70000).join('x') })
-      ph.time_event('timed')
-      await sleep(100)
-      ph.capture('timed')
+      ph.capture('after-filter')
       await sleep(600)
     },
 
