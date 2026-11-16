@@ -9,7 +9,57 @@
   <a id="link" href="https://example.org/out">External link</a>
   <button id="buy" class="btn primary" data-ph-capture-attribute-plan="pro">Buy <span>now</span></button>
   <form id="form"><input id="email" name="email" type="email"><input id="pw" type="password"><button type="submit">Send</button></form>
+  <!-- Autocapture / heatmaps / dead clicks fixtures (scenarios ac_*, heatmaps_*, dead_clicks*) -->
+  <div id="ac">
+    <button id="ac-btn" class="btn  cta" data-ph-capture-attribute-plan="pro" data-ph-capture-attribute-cc="4111111111111111">Upgrade <span>to <span>pro</span></span></button>
+    <a id="ac-ext" class="ext" href="https://example.org/docs?a=1#section">Docs <span>here</span></a>
+    <a id="ac-int" href="/internal?x=1#top">Internal</a>
+    <button id="ac-svg" aria-label="Close" data-ph-capture-attribute-icon="close"><svg id="ac-svg-icon" width="24" height="24" viewBox="0 0 24 24"><path d="M0 0L24 24"/></svg></button>
+    <div id="ac-div">Plain div</div>
+    <div id="ac-pointer" style="cursor: pointer">Pointer div <b>bold</b></div>
+    <button id="ac-nocap" class="ph-no-capture">Secret</button>
+    <div class="ph-no-capture"><button id="ac-nocap-child">Child</button></div>
+    <button id="ac-noauto" data-ph-no-autocapture>Ignored</button>
+    <button id="ac-sensitive" class="ph-sensitive">Sensitive</button>
+    <label id="ac-label" for="ac-name">Name</label>
+    <span id="ac-shadow-host"></span>
+    <form id="ac-form" class="signup form">
+      <input id="ac-name" name="fullname" type="text" data-ph-capture-value>
+      <input id="ac-email" name="email" type="email" placeholder="you@example.com">
+      <input id="ac-pw" name="secret" type="password">
+      <input id="ac-ccnum" name="ccnum" type="text">
+      <input id="ac-plain" name="nickname" type="text">
+      <input type="hidden" name="h" value="x">
+      <select id="ac-select" name="plan" data-ph-capture-value><option value="free">Free</option><option value="pro">Pro</option></select>
+      <textarea id="ac-ta" name="bio"></textarea>
+      <input id="ac-check" type="checkbox" name="agree">
+      <button id="ac-submit" type="submit">Join <span>now</span></button>
+    </form>
+    <p id="ac-copy">Copy <b id="ac-copy-b">this text</b> 4111 1111 1111 1111 please</p>
+    <button id="ac-next">Next</button>
+    <button id="ac-plus">+</button>
+    <button id="ac-dead">Does nothing</button>
+    <button id="ac-live">Mutates</button>
+    <button id="ac-nodead" class="ph-no-deadclick">No dead</button>
+    <div id="ac-out"></div>
+  </div>
+  <div id="ac-fixed" style="position: fixed; top: 20px; right: 20px; width: 120px; height: 40px; background: #eee"><button id="ac-fixed-btn">Fixed</button></div>
   <div style="height: 3000px"></div>
+  <button id="ac-vanish" style="position: absolute; top: 3100px; left: 40px; width: 120px; height: 40px">Vanish</button>
+  <script>
+    (function () {
+      // Links must not navigate away mid-scenario; forms must not submit.
+      document.addEventListener('click', function (e) { if (e.target.closest && e.target.closest('a')) e.preventDefault() })
+      document.getElementById('ac-form').addEventListener('submit', function (e) { e.preventDefault() })
+      document.getElementById('ac-live').addEventListener('click', function () {
+        var d = document.createElement('div'); d.textContent = 'added'; document.getElementById('ac-out').appendChild(d)
+      })
+      // Moves away on pointerdown: the click lands on <body> and autocapture recovers the pointerdown target.
+      document.getElementById('ac-vanish').addEventListener('pointerdown', function (e) { e.target.style.left = '400px' })
+      var root = document.getElementById('ac-shadow-host').attachShadow({ mode: 'open' })
+      root.innerHTML = '<button id="ac-shadow-btn" class="in-shadow">Shadow <span>button</span></button>'
+    })()
+  </script>
   <script src="scenarios.js"></script>
   <script>
     (function () {

@@ -36,9 +36,11 @@ const VOLATILE_KEYS = new Set(['$time', '$insert_id', 'sent_at', 'timestamp', '$
     '$duration', '$prev_pageview_duration', '$initialization_time', '$sdk_debug_extensions_init_time_ms',
     '$event_time_override_system_time', '$sdk_debug_retry_queue_size', '$lib_rate_limit_remaining_tokens',
     '$timezone_offset', '$time_since_page_load'])
+// Dead click/swipe timing: wall-clock timestamps and measured delays (presence still compared).
+const VOLATILE_KEY_PATTERN = /^\$dead_(click|swipe)_(.*_timestamp|.*_delay_ms)$/
 
 function normalise(value, ids, key) {
-    if (VOLATILE_KEYS.has(key) && value !== undefined && value !== null) return '<volatile>'
+    if ((VOLATILE_KEYS.has(key) || VOLATILE_KEY_PATTERN.test(key || '')) && value !== undefined && value !== null) return '<volatile>'
     if (typeof value === 'string') {
         if (UUID.test(value)) {
             if (!ids.has(value)) ids.set(value, `<id${ids.size}>`)
@@ -55,7 +57,8 @@ function normalise(value, ids, key) {
     if (Array.isArray(value)) return value.map((v) => normalise(v, ids))
     if (value && typeof value === 'object') {
         const out = {}
-        for (const k of Object.keys(value).sort()) out[k] = normalise(value[k], ids, k)
+        // Keys can be URLs too (e.g. $heatmap_data is keyed by page URL).
+        for (const k of Object.keys(value).sort()) out[k.includes('://') ? normalise(k, ids) : k] = normalise(value[k], ids, k)
         return out
     }
     return value
