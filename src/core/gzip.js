@@ -1,0 +1,218 @@
+/**
+ * @fileoverview Synchronous gzip (RFC 1952) with an LZ77 + fixed-Huffman
+ * deflate encoder. Stands in for upstream's fflate `gzipSync`, which upstream
+ * uses for beacons, `send_instantly` captures and when CompressionStream is
+ * unavailable. The output is standard gzip (any inflater decodes it); the
+ * compression ratio is lower than fflate's dynamic-Huffman output.
+ */
+
+/** @type {?Array<number>} */
+let crcTable = null;
+
+/**
+ * @param {!Uint8Array} bytes
+ * @return {number}
+ */
+export function crc32(bytes) {
+  if (!crcTable) {
+    crcTable = [];
+    for (let i = 0; i < 256; i++) {
+      let c = i;
+      for (let j = 0; j < 8; j++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      crcTable[i] = c >>> 0;
+    }
+  }
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) crc = crcTable[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+/**
+ * UTF-8 encodes a string without TextEncoder (ES5 runtime).
+ * @param {string} s
+ * @return {!Uint8Array}
+ */
+export function utf8Encode(s) {
+  const bin = unescape(encodeURIComponent(s));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+// Length codes 257..285: base lengths and extra bits.
+const LEN_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
+  163, 195, 227, 258];
+const LEN_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+const DIST_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049,
+  3073, 4097, 6145, 8193, 12289, 16385, 24577];
+const DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+
+class BitWriter {
+  /** @param {number} capacity */
+  constructor(capacity) {
+    /** @type {!Uint8Array} */
+    this.buf = new Uint8Array(capacity);
+    /** @type {number} */
+    this.pos = 0;
+    /** @private {number} */
+    this.bitBuf_ = 0;
+    /** @private {number} */
+    this.bitCount_ = 0;
+  }
+
+  /** @param {number} b */
+  byte(b) {
+    if (this.pos >= this.buf.length) {
+      const next = new Uint8Array(this.buf.length * 2 + 16);
+      next.set(this.buf);
+      this.buf = next;
+    }
+    this.buf[this.pos++] = b;
+  }
+
+  /**
+   * Writes `n` bits of `value`, least significant bit first.
+   * @param {number} value
+   * @param {number} n
+   */
+  bits(value, n) {
+    this.bitBuf_ |= value << this.bitCount_;
+    this.bitCount_ += n;
+    while (this.bitCount_ >= 8) {
+      this.byte(this.bitBuf_ & 0xff);
+      this.bitBuf_ >>>= 8;
+      this.bitCount_ -= 8;
+    }
+  }
+
+  /**
+   * Writes a Huffman code (most significant bit first).
+   * @param {number} code
+   * @param {number} len
+   */
+  code(code, len) {
+    let rev = 0;
+    for (let i = 0; i < len; i++) {
+      rev = (rev << 1) | ((code >>> i) & 1);
+    }
+    this.bits(rev, len);
+  }
+
+  flushBits() {
+    if (this.bitCount_ > 0) this.byte(this.bitBuf_ & 0xff);
+    this.bitBuf_ = 0;
+    this.bitCount_ = 0;
+  }
+}
+
+/**
+ * @param {!BitWriter} w
+ * @param {number} sym literal/length symbol 0..287
+ */
+function writeLitLen(w, sym) {
+  if (sym < 144) w.code(0x30 + sym, 8);
+  else if (sym < 256) w.code(0x190 + sym - 144, 9);
+  else if (sym < 280) w.code(sym - 256, 7);
+  else w.code(0xc0 + sym - 280, 8);
+}
+
+/**
+ * @param {!BitWriter} w
+ * @param {number} len 3..258
+ * @param {number} dist 1..32768
+ */
+function writeMatch(w, len, dist) {
+  let li = 28;
+  while (LEN_BASE[li] > len) li--;
+  writeLitLen(w, 257 + li);
+  if (LEN_EXTRA[li]) w.bits(len - LEN_BASE[li], LEN_EXTRA[li]);
+  let di = 29;
+  while (DIST_BASE[di] > dist) di--;
+  w.code(di, 5);
+  if (DIST_EXTRA[di]) w.bits(dist - DIST_BASE[di], DIST_EXTRA[di]);
+}
+
+/**
+ * Raw deflate of `data` as a single fixed-Huffman block.
+ * @param {!Uint8Array} data
+ * @param {!BitWriter} w
+ */
+function deflate(data, w) {
+  const WINDOW = 32768;
+  const HASH_SIZE = 1 << 15;
+  const MAX_CHAIN = 32;
+  const head = new Int32Array(HASH_SIZE);
+  const prev = new Int32Array(WINDOW);
+  for (let i = 0; i < HASH_SIZE; i++) head[i] = -1;
+  const n = data.length;
+  w.bits(1, 1); // BFINAL
+  w.bits(1, 2); // BTYPE = fixed Huffman
+  /**
+   * @param {number} i
+   * @return {number}
+   */
+  const hash = function(i) {
+    return ((data[i] << 10) ^ (data[i + 1] << 5) ^ data[i + 2]) & (HASH_SIZE - 1);
+  };
+  /** @param {number} i */
+  const insert = function(i) {
+    if (i + 2 >= n) return;
+    const h = hash(i);
+    prev[i & (WINDOW - 1)] = head[h];
+    head[h] = i;
+  };
+  let i = 0;
+  while (i < n) {
+    let bestLen = 0;
+    let bestDist = 0;
+    if (i + 2 < n) {
+      let cand = head[hash(i)];
+      let chain = MAX_CHAIN;
+      const maxLen = Math.min(258, n - i);
+      while (cand >= 0 && i - cand <= WINDOW && chain-- > 0) {
+        if (data[cand + bestLen] === data[i + bestLen]) {
+          let l = 0;
+          while (l < maxLen && data[cand + l] === data[i + l]) l++;
+          if (l > bestLen) {
+            bestLen = l;
+            bestDist = i - cand;
+            if (l === maxLen) break;
+          }
+        }
+        const p = prev[cand & (WINDOW - 1)];
+        if (p >= cand) break;
+        cand = p;
+      }
+    }
+    if (bestLen >= 3) {
+      writeMatch(w, bestLen, bestDist);
+      for (let k = 0; k < bestLen; k++) insert(i + k);
+      i += bestLen;
+    } else {
+      writeLitLen(w, data[i]);
+      insert(i);
+      i++;
+    }
+  }
+  writeLitLen(w, 256);
+  w.flushBits();
+}
+
+/**
+ * gzip-compresses a string (UTF-8). mtime is 0, like fflate's `{mtime: 0}`.
+ * @param {string} s
+ * @return {!Uint8Array}
+ */
+export function gzipSync(s) {
+  const data = utf8Encode(s);
+  const w = new BitWriter(Math.max(64, (data.length >>> 1) + 32));
+  [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3].forEach(function(b) {
+    w.byte(b);
+  });
+  deflate(data, w);
+  const crc = crc32(data);
+  const size = data.length >>> 0;
+  for (let k = 0; k < 4; k++) w.byte((crc >>> (8 * k)) & 0xff);
+  for (let k = 0; k < 4; k++) w.byte((size >>> (8 * k)) & 0xff);
+  return w.buf.subarray(0, w.pos);
+}

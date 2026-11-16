@@ -1,54 +1,198 @@
 /**
- * @fileoverview Event batching + retry with exponential backoff.
+ * @fileoverview Event batching (upstream request-queue.ts) and retry with
+ * jittered exponential backoff (upstream retry-queue.ts).
  */
-import {request, RequestOptions, HttpResponse} from './request.js';
-import {addEventListener, nav, win} from './utils.js';
+import {RequestOptions, TransportCallback} from './request.js';
+import {addEventListener, assign, clampToRange, extendURLParams, isArray, isPositiveNumber, isUndefined, nav, win} from './utils.js';
 import {logger} from './logger.js';
 
-/**
- * A capture request before batching. `data` is a single event.
- * @typedef {{url: string, data: !Object, batchKey: (string|undefined), transport: (string|undefined)}}
- */
-export let QueuedEvent;
+/** @const {number} */
+export const DEFAULT_FLUSH_INTERVAL_MS = 3000;
 
-const MAX_RETRIES = 10;
-const MAX_BATCH = 500; // events per request
+export class RequestQueue {
+  /**
+   * @param {function(!RequestOptions, (string|undefined))} sendRequest (request, transportOverride)
+   * @param {?Object=} config request_queue_config (quoted keys)
+   */
+  constructor(sendRequest, config) {
+    /** @private {boolean} */
+    this.isPaused_ = true;
+    /** @private {!Array<!RequestOptions>} */
+    this.queue_ = [];
+    /** @private {number|undefined} */
+    this.flushTimeout_ = undefined;
+    /** @private @const {number} */
+    this.flushTimeoutMs_ = clampToRange((config && config['flush_interval_ms']) || DEFAULT_FLUSH_INTERVAL_MS,
+        250, 5000, DEFAULT_FLUSH_INTERVAL_MS);
+    /** @private @const */
+    this.sendRequest_ = sendRequest;
+  }
+
+  /** @param {!RequestOptions} req */
+  enqueue(req) {
+    this.queue_.push(req);
+    if (!this.flushTimeout_) this.setFlushTimeout_();
+  }
+
+  /** Sends everything queued with sendBeacon (page unload). */
+  unload() {
+    this.clearFlushTimeout_();
+    const requests = this.queue_.length > 0 ? this.formatQueue_() : {};
+    const values = [];
+    for (const k in requests) values.push(requests[k]);
+    const sorted = values.filter(function(r) {
+      return r.url.indexOf('/e') === 0;
+    }).concat(values.filter(function(r) {
+      return r.url.indexOf('/e') !== 0;
+    }));
+    const self = this;
+    sorted.forEach(function(req) {
+      const copy = /** @type {!RequestOptions} */ (assign(req));
+      copy.callback = undefined;
+      self.sendSafely_(copy, 'sendBeacon');
+    });
+  }
+
+  enable() {
+    this.isPaused_ = false;
+    this.setFlushTimeout_();
+  }
+
+  /** @private */
+  setFlushTimeout_() {
+    if (this.isPaused_) return;
+    const self = this;
+    this.flushTimeout_ = setTimeout(function() {
+      self.clearFlushTimeout_();
+      self.flush_();
+    }, this.flushTimeoutMs_);
+  }
+
+  /** @private */
+  flush_() {
+    if (this.queue_.length > 0) {
+      const requests = this.formatQueue_();
+      for (const key in requests) this.sendSafely_(requests[key]);
+    }
+  }
+
+  /**
+   * @param {!RequestOptions} req
+   * @param {string=} transportOverride
+   * @private
+   */
+  sendSafely_(req, transportOverride) {
+    try {
+      this.sendRequest_(req, transportOverride);
+    } catch (e) {
+      logger.error(e);
+    }
+  }
+
+  /** @private */
+  clearFlushTimeout_() {
+    clearTimeout(this.flushTimeout_);
+    this.flushTimeout_ = undefined;
+  }
+
+  /**
+   * @return {!Object<string, !RequestOptions>}
+   * @private
+   */
+  formatQueue_() {
+    const requests = {};
+    const callbacks = {};
+    this.queue_.forEach(function(req) {
+      const key = ((req ? req.batchKey : null) || req.url) + (req.batchGroup ? ':' + req.batchGroup : '');
+      if (isUndefined(requests[key])) {
+        const r = /** @type {!RequestOptions} */ (assign(req));
+        r.data = [];
+        r.callback = undefined;
+        r.fireCallbackOnDrop = undefined;
+        requests[key] = r;
+        callbacks[key] = [];
+      }
+      requests[key].data.push(req.data);
+      if (req.callback) callbacks[key].push(req.callback);
+    });
+    for (const key in callbacks) {
+      const list = callbacks[key];
+      if (list.length) {
+        requests[key].callback = function(response) {
+          list.forEach(function(cb) {
+            cb(response);
+          });
+        };
+      }
+    }
+    this.queue_ = [];
+    return requests;
+  }
+
+  /** @return {number} */
+  get length() {
+    return this.queue_.length;
+  }
+}
+
+const THIRTY_MINUTES = 30 * 60 * 1000;
+const DEFAULT_MAX_RETRIES = 10;
+const STATUS_CODE_ZERO_MAX_RETRIES = 3;
 
 /**
- * Wraps events in the batch envelope expected by /e/ (upstream "capture-body").
- * @param {!Array<!Object>} events
- * @return {!Object}
+ * @param {number} retriesSoFar
+ * @return {number}
  */
-export function captureBody(events) {
-  const batch = events.map(function(e) {
-    const copy = {};
-    for (const k in e) copy[k] = e[k];
-    if (e['timestamp'] instanceof Date) copy['timestamp'] = e['timestamp'].toISOString();
-    return copy;
-  });
-  return {
-    'api_key': batch.length && batch[0]['properties'] ? batch[0]['properties']['token'] : undefined,
-    'batch': batch,
-    'sent_at': new Date().toISOString(),
-  };
+export function pickNextRetryDelay(retriesSoFar) {
+  const raw = 3000 * Math.pow(2, retriesSoFar);
+  const minBackoff = raw / 2;
+  const capped = Math.min(THIRTY_MINUTES, raw);
+  const jitter = (Math.random() - 0.5) * (capped - minBackoff);
+  return Math.ceil(capped + jitter);
 }
 
 export class RetryQueue {
-  constructor() {
-    /** @private {!Array<{opts: !RequestOptions, retryAt: number, attempt: number}>} */
-    this.queue_ = [];
-    /** @private {number} */
-    this.timer_ = 0;
+  /**
+   * @param {function(!RequestOptions, !TransportCallback)} dispatch sends via the instance (rate limits, headers...)
+   * @param {function(!RequestOptions)} sendDirect sends without retries (used on unload)
+   */
+  constructor(dispatch, sendDirect) {
+    /** @private @const */
+    this.dispatch_ = dispatch;
+    /** @private @const */
+    this.sendDirect_ = sendDirect;
     /** @private {boolean} */
-    this.online_ = !nav || nav.onLine !== false;
-    const self = this;
-    addEventListener(win, 'online', function() {
-      self.online_ = true;
-      self.flush_();
-    });
-    addEventListener(win, 'offline', function() {
-      self.online_ = false;
-    });
+    this.isPolling_ = false;
+    /** @private {number|undefined} */
+    this.poller_ = undefined;
+    /** @private @const {number} */
+    this.pollIntervalMs_ = 3000;
+    /** @private {!Array<{retryAt: number, requestOptions: !RequestOptions}>} */
+    this.queue_ = [];
+    /** @private {boolean} */
+    this.areWeOnline_ = true;
+    /** @private {function()|undefined} */
+    this.onlineListener_ = undefined;
+    /** @private {function()|undefined} */
+    this.offlineListener_ = undefined;
+    this.resume();
+  }
+
+  resume() {
+    if (win && 'onLine' in win.navigator) {
+      this.areWeOnline_ = win.navigator.onLine;
+      if (this.onlineListener_) return;
+      const self = this;
+      this.onlineListener_ = function() {
+        self.areWeOnline_ = true;
+        self.flush_();
+      };
+      this.offlineListener_ = function() {
+        self.areWeOnline_ = false;
+      };
+      addEventListener(win, 'online', this.onlineListener_);
+      addEventListener(win, 'offline', this.offlineListener_);
+    }
   }
 
   /** @return {number} */
@@ -57,159 +201,117 @@ export class RetryQueue {
   }
 
   /**
-   * Sends a request, scheduling retries on network errors / 5xx.
-   * @param {!RequestOptions} opts
-   * @param {number=} attempt
+   * @param {!RequestOptions} requestOptions
+   * @param {string=} transportOverride
    */
-  send(opts, attempt) {
+  retriableRequest(requestOptions, transportOverride) {
+    const retriesSoFar = requestOptions.retriesPerformedSoFar;
+    const options = /** @type {!RequestOptions} */ (assign(requestOptions));
+    delete options.retriesPerformedSoFar;
+    if (isPositiveNumber(retriesSoFar)) {
+      options.url = extendURLParams(options.url, {'retry_count': retriesSoFar});
+    }
+    let toSend = options;
+    if (transportOverride) {
+      toSend = /** @type {!RequestOptions} */ (assign(options));
+      toSend.transport = transportOverride;
+    }
     const self = this;
-    const n = attempt || 0;
-    const userCallback = opts.callback;
-    /** @type {!RequestOptions} */
-    const wrapped = /** @type {!RequestOptions} */ ({});
-    for (const k in opts) wrapped[k] = opts[k];
-    // Retries must re-encode from the original URL (request() appends params).
-    const originalUrl = opts.url;
-    wrapped.callback = function(/** !HttpResponse */ res) {
-      if ((res.statusCode === 0 || res.statusCode >= 500) && n < MAX_RETRIES && opts.transport !== 'sendBeacon') {
-        const copy = /** @type {!RequestOptions} */ ({});
-        for (const k in opts) copy[k] = opts[k];
-        copy.url = originalUrl;
-        self.enqueue_(copy, n + 1);
-        return;
+    this.dispatch_(toSend, function(response, retryAfterMs) {
+      if (response.statusCode !== 200 && (response.statusCode < 400 || response.statusCode >= 500)) {
+        const maxRetries = response.statusCode === 0 ? STATUS_CODE_ZERO_MAX_RETRIES : DEFAULT_MAX_RETRIES;
+        if ((retriesSoFar || 0) < maxRetries) {
+          const again = /** @type {!RequestOptions} */ (assign(options));
+          again.retriesPerformedSoFar = retriesSoFar;
+          self.enqueue_(again, retryAfterMs);
+          return;
+        }
+        if (response.statusCode === 0) {
+          logger.warn('Request failed before receiving an HTTP response; this can happen due to network issues, CORS, ' +
+              'browser blocking, or ad blockers. Stopped retrying after ' + (retriesSoFar || 0) + ' retries.');
+        }
       }
-      if (userCallback) userCallback(res);
-    };
-    request(wrapped);
+      if (options.callback) options.callback(response);
+    });
   }
 
   /**
-   * @param {!RequestOptions} opts
-   * @param {number} attempt
+   * @param {!RequestOptions} requestOptions
+   * @param {number=} retryAfterMs
    * @private
    */
-  enqueue_(opts, attempt) {
-    // 3s, 6s, 12s ... capped at 30min, with +-50% jitter (upstream formula).
-    let delay = Math.min(3000 * Math.pow(2, attempt - 1), 30 * 60 * 1000);
-    delay += (Math.random() - 0.5) * delay;
-    logger.warn('request failed, retry #' + attempt + ' in ' + Math.round(delay) + 'ms');
-    this.queue_.push({opts: opts, retryAt: new Date().getTime() + delay, attempt: attempt});
-    this.schedule_();
+  enqueue_(requestOptions, retryAfterMs) {
+    const soFar = requestOptions.retriesPerformedSoFar || 0;
+    requestOptions.retriesPerformedSoFar = soFar + 1;
+    const ms = Math.max(pickNextRetryDelay(soFar), retryAfterMs || 0);
+    this.queue_.push({retryAt: new Date().getTime() + ms, requestOptions: requestOptions});
+    let msg = 'Enqueued failed request for retry in ' + ms;
+    if (nav && !nav.onLine) msg += ' (Browser is offline)';
+    logger.warn(msg);
+    if (!this.isPolling_) {
+      this.isPolling_ = true;
+      this.poll_();
+    }
   }
 
   /** @private */
-  schedule_() {
-    if (this.timer_ || !this.queue_.length || !win) return;
+  poll_() {
+    if (this.poller_) clearTimeout(this.poller_);
+    if (this.queue_.length === 0) {
+      this.isPolling_ = false;
+      this.poller_ = undefined;
+      return;
+    }
     const self = this;
-    this.timer_ = win.setTimeout(function() {
-      self.timer_ = 0;
-      self.flush_();
-    }, 3000);
+    this.poller_ = setTimeout(function() {
+      if (self.areWeOnline_ && self.queue_.length > 0) self.flush_();
+      self.poll_();
+    }, this.pollIntervalMs_);
   }
 
   /** @private */
   flush_() {
-    if (!this.online_) {
-      this.schedule_();
-      return;
-    }
-    const nowMs = new Date().getTime();
-    const due = this.queue_.filter(function(x) {
-      return x.retryAt <= nowMs;
+    const now = new Date().getTime();
+    const notToFlush = [];
+    const toFlush = this.queue_.filter(function(item) {
+      if (item.retryAt < now) return true;
+      notToFlush.push(item);
+      return false;
     });
-    this.queue_ = this.queue_.filter(function(x) {
-      return x.retryAt > nowMs;
-    });
+    this.queue_ = notToFlush;
     const self = this;
-    due.forEach(function(x) {
-      self.send(x.opts, x.attempt);
+    toFlush.forEach(function(item) {
+      self.retriableRequest(item.requestOptions);
     });
-    this.schedule_();
   }
 
-  /** Page is unloading: fire everything pending as beacons, best effort. */
   unload() {
-    if (this.timer_ && win) win.clearTimeout(this.timer_);
-    this.timer_ = 0;
-    const pending = this.queue_;
-    this.queue_ = [];
-    pending.forEach(function(x) {
-      const opts = x.opts;
-      opts.transport = 'sendBeacon';
-      request(opts);
-    });
-  }
-}
-
-export class RequestQueue {
-  /**
-   * @param {function(!RequestOptions)} send
-   * @param {number} flushIntervalMs
-   */
-  constructor(send, flushIntervalMs) {
-    /** @private @const */
-    this.send_ = send;
-    /** @private {number} */
-    this.interval_ = flushIntervalMs > 0 ? flushIntervalMs : 3000;
-    /** @private {!Object<string, {url: string, events: !Array<!Object>}>} */
-    this.buckets_ = {};
-    /** @private {number} */
-    this.timer_ = 0;
-    /** @type {boolean} */
-    this.paused = true;
-  }
-
-  /** @param {!QueuedEvent} item */
-  enqueue(item) {
-    const key = item.batchKey || item.url;
-    const bucket = this.buckets_[key] || (this.buckets_[key] = {url: item.url, events: []});
-    bucket.events.push(item.data);
-    this.schedule_();
-  }
-
-  /** Starts periodic flushing (called once the instance is loaded and opted in). */
-  start() {
-    this.paused = false;
-    this.schedule_();
-  }
-
-  /** @private */
-  schedule_() {
-    if (this.paused || this.timer_ || !win) return;
-    const self = this;
-    this.timer_ = win.setTimeout(function() {
-      self.timer_ = 0;
-      self.flush();
-    }, this.interval_);
-  }
-
-  /**
-   * Sends everything queued.
-   * @param {string=} transport force a transport (e.g. 'sendBeacon' on unload)
-   */
-  flush(transport) {
-    if (this.timer_ && win) win.clearTimeout(this.timer_);
-    this.timer_ = 0;
-    const buckets = this.buckets_;
-    this.buckets_ = {};
-    for (const key in buckets) {
-      const b = buckets[key];
-      for (let i = 0; i < b.events.length; i += MAX_BATCH) {
-        this.send_(/** @type {!RequestOptions} */ ({
-          url: b.url,
-          method: 'POST',
-          data: captureBody(b.events.slice(i, i + MAX_BATCH)),
-          compression: 'gzip-js',
-          transport: transport,
-        }));
+    if (this.poller_) {
+      clearTimeout(this.poller_);
+      this.poller_ = undefined;
+    }
+    this.isPolling_ = false;
+    if (win) {
+      if (this.onlineListener_) {
+        win.removeEventListener('online', this.onlineListener_);
+        this.onlineListener_ = undefined;
+      }
+      if (this.offlineListener_) {
+        win.removeEventListener('offline', this.offlineListener_);
+        this.offlineListener_ = undefined;
       }
     }
-  }
-
-  /** @return {number} */
-  get length() {
-    let n = 0;
-    for (const k in this.buckets_) n += this.buckets_[k].events.length;
-    return n;
+    const self = this;
+    this.queue_.forEach(function(item) {
+      try {
+        const o = /** @type {!RequestOptions} */ (assign(item.requestOptions));
+        o.callback = isArray(o.data) ? undefined : o.callback;
+        o.transport = 'sendBeacon';
+        self.sendDirect_(o);
+      } catch (e) {
+        logger.error(e);
+      }
+    });
+    this.queue_ = [];
   }
 }

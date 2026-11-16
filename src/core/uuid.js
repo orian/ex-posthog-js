@@ -58,3 +58,15 @@ export function uuidv7(timestampMs) {
   }
   return hex;
 }
+
+/**
+ * Upstream uuid7ToTimestampMs: throws for non-v7 input.
+ * @param {string} uuid
+ * @return {number}
+ */
+export function uuid7ToTimestampMs(uuid) {
+  const hex = uuid.replace(/-/g, '');
+  if (hex.length !== 32) throw new Error('Not a valid UUID');
+  if (hex.charAt(12) !== '7') throw new Error('Not a UUIDv7');
+  return parseInt(hex.substring(0, 12), 16);
+}

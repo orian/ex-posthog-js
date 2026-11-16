@@ -12,23 +12,30 @@
 export class Extension {
   constructor() {
     /**
-     * Called once the instance finished init (or immediately if the module
-     * was loaded after init).
+     * Called once when the extension is attached: during init (at the point
+     * upstream initialises its extensions), or immediately when the module is
+     * loaded after init.
      * @type {(function()|undefined)}
      */
     this.onInit;
     /**
-     * Extra properties merged into every event (e.g. `$feature/<key>`).
+     * Extra properties merged into every event, after persisted super
+     * properties and before the event's own properties (upstream's dynamic
+     * event-property producers). Called with the event name.
      * @type {(function(string): ?Object)|undefined}
      */
     this.eventProperties;
     /**
-     * Called after distinct_id / groups / person properties changed.
-     * @type {(function(string): void)|undefined}
+     * Remote config result: the `/array/<token>/config` object, or null when
+     * loading failed (upstream `{ok: false}`). Called once per load; an
+     * extension attached after the config arrived is called with the last
+     * result straight away.
+     * @type {(function(?Object): void)|undefined}
      */
-    this.onIdentityChange;
+    this.onRemoteConfig;
     /**
-     * Called by reset().
+     * Called by reset() after persistence was cleared and before the new
+     * anonymous identity is registered.
      * @type {(function(): void)|undefined}
      */
     this.onReset;
@@ -64,6 +71,19 @@ export function registerExtension(name, factory) {
 }
 
 /**
+ * @param {string} name
+ * @return {(function(?): !Extension)|undefined}
+ */
+export function findExtensionFactory(name) {
+  for (let i = 0; i < factories.length; i++) {
+    if (factories[i].name === name) return factories[i].factory;
+  }
+  return undefined;
+}
+
+/**
+ * Attaches every registered module to `instance` and marks it live so modules
+ * registered later attach too.
  * @param {?} instance
  */
 export function attachAllExtensions(instance) {
@@ -74,39 +94,109 @@ export function attachAllExtensions(instance) {
 }
 
 /**
- * Contract the core's feature-flag facade relies on. Implemented by
+ * Contract the core relies on for the feature-flags module (port of
+ * upstream's PostHogFeatureFlags surface). Implemented by
  * src/flags/feature-flags.js; declared here so the core needs no import.
  * @record
  * @extends {Extension}
  */
 export class FeatureFlagsApi {
   constructor() {}
+  /** @return {boolean} */
+  hasLoadedFlags() {}
   /**
    * @param {string} key
    * @param {?Object=} options
    * @return {boolean|string|undefined}
    */
-  getFlag(key, options) {}
+  getFeatureFlag(key, options) {}
+  /**
+   * @param {string} key
+   * @param {?Object=} options
+   * @return {?Object|undefined}
+   */
+  getFeatureFlagResult(key, options) {}
   /**
    * @param {string} key
    * @return {*}
    */
-  getFlagPayload(key) {}
+  getFeatureFlagPayload(key) {}
   /**
    * @param {string} key
    * @param {?Object=} options
    * @return {boolean|undefined}
    */
-  isEnabled(key, options) {}
-  /** Debounced reload from the server. */
-  reload() {}
-  /**
-   * @param {function(!Array<string>, !Object<string, (string|boolean)>, ?Object)} cb
-   * @return {function()}
-   */
-  onFlags(cb) {}
-  /** @param {(boolean|!Array<string>|!Object<string, (string|boolean)>)} overrides */
-  override(overrides) {}
+  isFeatureEnabled(key, options) {}
+  /** @return {!Array<!Object>} */
+  getAllFeatureFlags() {}
   /** @return {!Object<string, (string|boolean)>} */
   getFlagVariants() {}
+  /** @return {!Array<string>} */
+  getFlags() {}
+  /** @return {!Object} */
+  getFlagPayloads() {}
+  reloadFeatureFlags() {}
+  ensureFlagsLoaded() {}
+  /** @param {string|undefined} id */
+  setAnonymousDistinctId(id) {}
+  resetFlagCallReported() {}
+  sendFlagCallsPendingCapture() {}
+  /**
+   * @param {!Object} properties
+   * @param {boolean=} reload
+   */
+  setPersonPropertiesForFlags(properties, reload) {}
+  /**
+   * @param {!Array<string>} names
+   * @param {boolean=} reload
+   */
+  unsetPersonPropertiesForFlags(names, reload) {}
+  /** @param {boolean=} reload */
+  resetPersonPropertiesForFlags(reload) {}
+  /**
+   * @param {!Object} properties
+   * @param {boolean=} reload
+   */
+  setGroupPropertiesForFlags(properties, reload) {}
+  /** @param {string=} groupType */
+  resetGroupPropertiesForFlags(groupType) {}
+  /** Clears in-memory flag state (identity change / reset). */
+  reset() {}
+  /** Re-applies bootstrap flags. */
+  initialize() {}
+  /**
+   * @param {!Object} config
+   * @param {boolean} remoteRequestsDisabled
+   */
+  updateConfig(config, remoteRequestsDisabled) {}
+  /**
+   * @param {function(!Array<string>, !Object<string, (string|boolean)>, ?Object=)} callback
+   * @return {function()}
+   */
+  onFeatureFlags(callback) {}
+  /**
+   * @param {function()} handler
+   * @return {function()}
+   */
+  onReloading(handler) {}
+  /** @param {*} options */
+  overrideFeatureFlags(options) {}
+  /**
+   * @param {!Object} flags
+   * @param {?Object=} payloads
+   * @param {?Object=} options
+   */
+  updateFlags(flags, payloads, options) {}
+  /**
+   * @param {function(!Array<!Object>)} callback
+   * @param {boolean=} forceReload
+   * @param {!Array<string>=} stages
+   */
+  getEarlyAccessFeatures(callback, forceReload, stages) {}
+  /**
+   * @param {string} key
+   * @param {boolean} isEnrolled
+   * @param {string=} stage
+   */
+  updateEarlyAccessFeatureEnrollment(key, isEnrolled, stage) {}
 }

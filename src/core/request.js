@@ -1,35 +1,83 @@
 /**
- * @fileoverview HTTP transports: fetch, XHR and sendBeacon, with optional
- * native gzip (CompressionStream) and base64 form encoding for beacons.
+ * @fileoverview HTTP transports (port of upstream request.ts): fetch, XHR and
+ * sendBeacon, gzip (native CompressionStream when async is allowed, the sync
+ * encoder in gzip.js otherwise) and base64 form encoding, plus the
+ * `timestampMode` body/query `sent_at` handling.
  */
-import {addQueryParams, base64Encode, jsonParse, jsonStringify, nav, now, win} from './utils.js';
+import {
+  assign, base64Encode, extendURLParams, getQueryParam, isArray, isUndefined, jsonStringify, nav,
+  removeURLParam, win,
+} from './utils.js';
 import {logger} from './logger.js';
+import {gzipSync} from './gzip.js';
+
+/** @const {string} */ export const COMPRESSION_GZIP_JS = 'gzip-js';
+/** @const {string} */ export const COMPRESSION_BASE64 = 'base64';
 
 /**
- * @typedef {{
- *   statusCode: number,
- *   text: (string|undefined),
- *   json: *,
- *   error: *
- * }}
+ * A request. `compression` is 'gzip-js' | 'base64' | 'best-available' |
+ * undefined; `transport` is 'fetch' | 'XHR' | 'sendBeacon' | undefined;
+ * `timestampMode` is 'capture-body' | 'body' | 'query' | undefined.
+ * @record
  */
-export let HttpResponse;
+export class RequestOptions {
+  constructor() {
+    /** @type {string} */
+    this.url;
+    /** @type {string|undefined} */
+    this.method;
+    /** @type {*} */
+    this.data;
+    /** @type {!Object<string, string>|undefined} */
+    this.headers;
+    /** @type {string|undefined} */
+    this.transport;
+    /** @type {string|undefined} */
+    this.compression;
+    /** @type {string|undefined} */
+    this.compressionFallback;
+    /** @type {boolean|undefined} */
+    this.preferSyncCompression;
+    /** @type {string|undefined} */
+    this.timestampMode;
+    /** @type {string|undefined} */
+    this.batchKey;
+    /** @type {string|undefined} */
+    this.batchGroup;
+    /** @type {(function(!PHResponse)|undefined)} */
+    this.callback;
+    /** @type {boolean|undefined} */
+    this.fireCallbackOnDrop;
+    /** @type {number|undefined} */
+    this.timeout;
+    /** @type {!Array<string>|undefined} */
+    this.disableTransport;
+    /** @type {!Object|undefined} */
+    this.fetchOptions;
+    /** @type {number|undefined} */
+    this.retriesPerformedSoFar;
+    /** @type {(function()|undefined)} */
+    this.onDispatch;
+  }
+}
 
 /**
- * compression: 'gzip-js' | 'base64' | undefined
- * transport:   'fetch' | 'XHR' | 'sendBeacon' | undefined
- * @typedef {{
- *   url: string,
- *   method: string,
- *   data: *,
- *   headers: (!Object<string,string>|undefined),
- *   compression: (string|undefined),
- *   transport: (string|undefined),
- *   timeout: (number|undefined),
- *   callback: (function(!HttpResponse)|undefined)
- * }}
+ * Transport-level completion: (response, retryAfterMs).
+ * @typedef {function(!PHResponse, (number|undefined))}
  */
-export let RequestOptions;
+export let TransportCallback;
+
+/** @typedef {{contentType: string, body: *, estimatedSize: number}} */
+let EncodedBody;
+
+const CONTENT_TYPE_PLAIN = 'text/plain';
+const CONTENT_TYPE_JSON = 'application/json';
+const CONTENT_TYPE_FORM = 'application/x-www-form-urlencoded';
+const KEEP_ALIVE_THRESHOLD = 64 * 1024 * 0.8;
+const BEACON_SPLIT_FLOOR_BYTES = 16 * 1024;
+
+let pendingKeepaliveBytes = 0;
+let nativeAsyncGzipDisabled = false;
 
 /** @return {boolean} */
 function hasFetch() {
@@ -37,163 +85,493 @@ function hasFetch() {
 }
 
 /** @return {boolean} */
+function hasXHR() {
+  return !!(win && win['XMLHttpRequest']);
+}
+
+/** @return {boolean} */
 function hasBeacon() {
   return !!(nav && nav.sendBeacon);
 }
 
-/** @return {boolean} */
-function hasNativeGzip() {
-  return !!(win && win['CompressionStream'] && win['Response'] && win['Blob'] && win['Promise']);
-}
+/** @const {boolean} */
+export const SUPPORTS_REQUEST = hasXHR() || hasFetch();
 
 /**
- * @param {!RequestOptions} opts
- * @param {number} status
- * @param {string|undefined} text
- * @param {*=} error
+ * @param {string} s
+ * @return {number}
  */
-function respond(opts, status, text, error) {
-  if (!opts.callback) return;
-  /** @type {!HttpResponse} */
-  const res = {statusCode: status, text: text, json: jsonParse(text), error: error};
+function byteSize(s) {
   try {
-    opts.callback(res);
+    return new Blob([s]).size;
   } catch (e) {
-    logger.error('request callback threw', e);
+    return s.length;
   }
 }
 
 /**
- * @param {!RequestOptions} opts
- * @param {(string|!Blob|undefined)} body
- * @param {string} contentType
+ * @param {!Uint8Array} u8
+ * @return {!ArrayBuffer}
  */
-function sendFetch(opts, body, contentType) {
-  const headers = {};
-  if (opts.headers) {
-    for (const k in opts.headers) headers[k] = opts.headers[k];
+function toArrayBuffer(u8) {
+  return /** @type {!ArrayBuffer} */ (u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength));
+}
+
+/**
+ * @param {!RequestOptions} options
+ * @param {?EncodedBody=} preEncoded
+ * @return {?EncodedBody|undefined}
+ */
+function encodePostData(options, preEncoded) {
+  if (preEncoded) return preEncoded;
+  const data = options.data;
+  if (!data) return undefined;
+  if (options.compression === COMPRESSION_GZIP_JS) {
+    const gz = gzipSync(jsonStringify(data));
+    return {contentType: CONTENT_TYPE_PLAIN, body: toArrayBuffer(gz), estimatedSize: gz.byteLength};
   }
-  if (body !== undefined) headers['Content-Type'] = contentType;
+  if (options.compression === COMPRESSION_BASE64) {
+    const body = 'data=' + encodeURIComponent(base64Encode(jsonStringify(data)));
+    return {contentType: CONTENT_TYPE_FORM, body: body, estimatedSize: byteSize(body)};
+  }
+  const json = jsonStringify(data);
+  return {contentType: CONTENT_TYPE_JSON, body: json, estimatedSize: byteSize(json)};
+}
+
+/**
+ * @param {*} body
+ * @return {boolean}
+ */
+function isGzipData(body) {
+  if (body instanceof ArrayBuffer) {
+    const b = new Uint8Array(body);
+    return b.length >= 2 && b[0] === 0x1f && b[1] === 0x8b;
+  }
+  return false;
+}
+
+/**
+ * @param {*} compression
+ * @param {*} urlCompression
+ * @return {boolean}
+ */
+function isGzipRequest(compression, urlCompression) {
+  return compression === COMPRESSION_GZIP_JS || urlCompression === COMPRESSION_GZIP_JS || urlCompression === 'gzip';
+}
+
+/**
+ * @param {!RequestOptions} options
+ * @param {?EncodedBody=} preEncoded
+ * @return {{url: string, encodedBody: (?EncodedBody|undefined)}}
+ */
+function encodePostDataSafely(options, preEncoded) {
+  const fallback = function() {
+    const copy = /** @type {!RequestOptions} */ (assign(options));
+    if (options.transport === 'sendBeacon') {
+      copy.compression = COMPRESSION_BASE64;
+      return {url: extendURLParams(options.url, {'compression': COMPRESSION_BASE64}), encodedBody: encodePostData(copy)};
+    }
+    copy.compression = undefined;
+    return {url: removeURLParam(options.url, 'compression'), encodedBody: encodePostData(copy)};
+  };
+  let encoded;
+  try {
+    encoded = encodePostData(options, preEncoded);
+  } catch (e) {
+    if (isGzipRequest(options.compression, getQueryParam(options.url, 'compression'))) {
+      logger.error('Failed to gzip request body, sending uncompressed payload', e);
+      return fallback();
+    }
+    throw e;
+  }
+  if (!encoded || !isGzipRequest(options.compression, getQueryParam(options.url, 'compression')) ||
+      isGzipData(encoded.body)) {
+    return {url: options.url, encodedBody: encoded};
+  }
+  nativeAsyncGzipDisabled = true;
+  return fallback();
+}
+
+/**
+ * @param {!RequestOptions} options
+ * @param {?EncodedBody=} preEncoded
+ * @return {{url: string, encodedBody: (?EncodedBody|undefined)}|undefined}
+ */
+function encodeRequest(options, preEncoded) {
+  try {
+    return encodePostDataSafely(options, preEncoded);
+  } catch (error) {
+    logger.error(error);
+    if (options.callback) options.callback(/** @type {!PHResponse} */ ({statusCode: 0, error: error}));
+    return undefined;
+  }
+}
+
+/**
+ * @param {number|undefined} timeout
+ * @return {!Error}
+ */
+function timeoutAbortReason(timeout) {
+  const error = new Error('PostHog request timed out' + (timeout ? ' after ' + timeout + 'ms' : ''));
+  try {
+    Object.defineProperty(error, 'name', {value: 'AbortError', writable: true, enumerable: true, configurable: true});
+  } catch (e) {}
+  return error;
+}
+
+/**
+ * @param {*} error
+ * @return {boolean}
+ */
+function isExpectedNetworkError(error) {
+  return !!error && error['name'] === 'TypeError' && /Failed to fetch|NetworkError|Load failed/i.test(error['message'] || '');
+}
+
+/**
+ * @param {function(): ?string} getHeader
+ * @return {number|undefined}
+ */
+function readRetryAfter(getHeader) {
+  try {
+    const raw = getHeader();
+    if (!raw) return undefined;
+    const trimmed = raw.replace(/^\s+|\s+$/g, '');
+    let delay;
+    if (/^\d+$/.test(trimmed)) {
+      delay = parseInt(trimmed, 10) * 1000;
+    } else {
+      const date = Date.parse(trimmed);
+      if (isNaN(date)) return undefined;
+      delay = Math.max(0, date - new Date().getTime());
+    }
+    return Math.min(delay, 30000);
+  } catch (e) {
+    return undefined;
+  }
+}
+
+/**
+ * @param {!RequestOptions} options
+ * @param {?EncodedBody=} preEncoded
+ */
+function xhr(options, preEncoded) {
+  const encoded = encodeRequest(options, preEncoded);
+  if (!encoded) return;
+  const req = new XMLHttpRequest();
+  req.open(options.method || 'GET', encoded.url, true);
+  const body = encoded.encodedBody ? encoded.encodedBody.body : undefined;
+  const headers = options.headers || {};
+  for (const name in headers) req.setRequestHeader(name, headers[name]);
+  if (encoded.encodedBody) req.setRequestHeader('Content-Type', encoded.encodedBody.contentType);
+  if (options.timeout) req.timeout = options.timeout;
+  let timedOut = false;
+  req.ontimeout = function() {
+    timedOut = true;
+  };
+  req.onloadend = function() {
+    if (timedOut) {
+      const error = timeoutAbortReason(options.timeout);
+      logger.warn(error);
+      if (options.callback) options.callback(/** @type {!PHResponse} */ ({statusCode: 0, error: error}));
+      return;
+    }
+    const response = /** @type {!PHResponse} */ ({statusCode: req.status, text: req.responseText});
+    if (req.status === 200) {
+      try {
+        response.json = JSON.parse(req.responseText);
+      } catch (e) {}
+    }
+    if (options.callback) {
+      /** @type {!TransportCallback} */ (options.callback)(response, readRetryAfter(function() {
+        return req.getResponseHeader('Retry-After');
+      }));
+    }
+  };
+  req.send(/** @type {?} */ (body));
+}
+
+/**
+ * @param {!RequestOptions} options
+ * @param {?EncodedBody=} preEncoded
+ * @param {boolean=} keepaliveDisabled
+ */
+function fetchTransport(options, preEncoded, keepaliveDisabled) {
+  const encoded = encodeRequest(options, preEncoded);
+  if (!encoded) return;
+  const url = encoded.url;
+  const eb = encoded.encodedBody;
+  const body = eb ? eb.body : undefined;
+  const headers = new Headers();
+  const h = options.headers || {};
+  for (const name in h) headers.append(name, h[name]);
+  if (eb) headers.append('Content-Type', eb.contentType);
+
+  let timedOut = false;
+  let settled = false;
   let controller = null;
   let timer = 0;
-  if (win['AbortController']) {
-    controller = new win['AbortController']();
-    timer = win.setTimeout(function() {
-      controller['abort']();
-    }, opts.timeout || 60000);
-  }
-  const init = {
-    'method': opts.method,
-    'headers': headers,
-    'body': body,
-    // keepalive lets small requests survive navigation; limited to 64kb.
-    'keepalive': opts.method === 'POST' && (typeof body === 'string' ? body.length : 0) < 52000,
-    'signal': controller ? controller['signal'] : undefined,
+  /** @param {*} error */
+  const handleError = function(error) {
+    if (settled) return;
+    settled = true;
+    if ((timedOut && error && error['name'] === 'AbortError') || isExpectedNetworkError(error)) {
+      logger.warn(error);
+    } else {
+      logger.error(error);
+    }
+    if (options.callback) options.callback(/** @type {!PHResponse} */ ({statusCode: 0, error: error}));
   };
-  win.fetch(opts.url, /** @type {!RequestInit} */ (init)).then(function(res) {
-    return res.text().then(function(text) {
-      win.clearTimeout(timer);
-      respond(opts, res.status, text);
+  const AC = win['AbortController'];
+  if (AC) {
+    controller = new AC();
+    timer = setTimeout(function() {
+      timedOut = true;
+      try {
+        controller['abort'](timeoutAbortReason(options.timeout));
+      } catch (e) {
+        handleError(e);
+      }
+    }, options.timeout);
+  }
+  let reserved = 0;
+  const cleanup = function() {
+    pendingKeepaliveBytes -= reserved;
+    reserved = 0;
+    if (controller) clearTimeout(timer);
+  };
+  try {
+    const init = {
+      'method': options.method || 'GET',
+      'headers': headers,
+      'referrerPolicy': 'strict-origin',
+      'body': body,
+      'signal': controller ? controller['signal'] : undefined,
+    };
+    const fo = options.fetchOptions || {};
+    for (const k in fo) init[k] = fo[k];
+    const requestSize = eb ? eb.estimatedSize : (isUndefined(body) ? 0 : undefined);
+    init['keepalive'] = init['method'] === 'POST' && !keepaliveDisabled && init['keepalive'] !== false &&
+        init['body'] === body && !isUndefined(requestSize) && requestSize >= 0 &&
+        pendingKeepaliveBytes + /** @type {number} */ (requestSize) < KEEP_ALIVE_THRESHOLD;
+    if (init['keepalive']) {
+      reserved = /** @type {number} */ (requestSize);
+      pendingKeepaliveBytes += reserved;
+    }
+    win.fetch(url, /** @type {!RequestInit} */ (init)).then(function(response) {
+      return response.text().then(function(responseText) {
+        if (settled) return;
+        const res = /** @type {!PHResponse} */ ({statusCode: response.status, text: responseText});
+        if (response.status === 200) {
+          try {
+            res.json = JSON.parse(responseText);
+          } catch (e) {
+            logger.error(e);
+          }
+        }
+        settled = true;
+        cleanup();
+        if (options.callback) {
+          /** @type {!TransportCallback} */ (options.callback)(res, readRetryAfter(function() {
+            return response.headers ? response.headers.get('Retry-After') : null;
+          }));
+        }
+      });
+    })['catch'](function(error) {
+      cleanup();
+      handleError(error);
     });
-  }).catch(function(err) {
-    win.clearTimeout(timer);
-    respond(opts, 0, undefined, err);
+  } catch (error) {
+    cleanup();
+    handleError(error);
+  }
+}
+
+/**
+ * @param {!RequestOptions} options
+ */
+function sendBeaconTransport(options) {
+  try {
+    const encoded = encodePostDataSafely(options);
+    const eb = encoded.encodedBody;
+    if (!eb || !eb.body) return;
+    const blob = eb.body instanceof Blob ? eb.body : new Blob([eb.body], {type: eb.contentType});
+    if (nav.sendBeacon(encoded.url, /** @type {!Blob} */ (blob))) return;
+    const data = options.data;
+    const batch = /** @type {?} */ (isArray(data) ? data : (data ? data['batch'] : undefined));
+    if (isArray(batch) && batch.length > 1 && (eb.estimatedSize || 0) > BEACON_SPLIT_FLOOR_BYTES) {
+      const mid = Math.ceil(batch.length / 2);
+      const split = function(events) {
+        if (isArray(data)) return events;
+        const copy = assign(data);
+        copy['batch'] = events;
+        return copy;
+      };
+      const a = /** @type {!RequestOptions} */ (assign(options));
+      a.data = split(batch.slice(0, mid));
+      sendBeaconTransport(a);
+      const b = /** @type {!RequestOptions} */ (assign(options));
+      b.data = split(batch.slice(mid));
+      sendBeaconTransport(b);
+      return;
+    }
+    logger.warn('Beacon of ~' + (eb.estimatedSize || 0) + ' bytes was rejected by the browser, falling back to ' +
+        (hasFetch() ? 'fetch' : 'XHR'));
+    if (hasFetch()) fetchTransport(options, undefined, true);
+    else xhr(options);
+  } catch (error) {
+    logger.warn('Beacon send failed', error);
+  }
+}
+
+/**
+ * @param {*} data
+ * @return {*}
+ */
+function addSentAtToBody(data) {
+  const sentAt = new Date().toISOString();
+  if (!isArray(data)) {
+    const copy = assign(data);
+    copy['sent_at'] = sentAt;
+    return copy;
+  }
+  return /** @type {!Array} */ (data).map(function(item) {
+    const copy = assign(item);
+    copy['sent_at'] = sentAt;
+    return copy;
   });
 }
 
 /**
- * @param {!RequestOptions} opts
- * @param {(string|!Blob|undefined)} body
- * @param {string} contentType
+ * @param {*} data
+ * @return {!Object}
  */
-function sendXHR(opts, body, contentType) {
-  const xhr = new XMLHttpRequest();
-  xhr.open(opts.method, opts.url, true);
-  if (body !== undefined) xhr.setRequestHeader('Content-Type', contentType);
-  if (opts.headers) {
-    for (const k in opts.headers) xhr.setRequestHeader(k, opts.headers[k]);
-  }
-  xhr.timeout = opts.timeout || 60000;
-  xhr.withCredentials = true;
-  xhr.onreadystatechange = function() {
-    if (xhr.readyState === 4) respond(opts, xhr.status, xhr.responseText);
+function addSentAtToCaptureBody(data) {
+  const batch = (isArray(data) ? /** @type {!Array} */ (data) : [data]).map(function(event) {
+    const copy = assign(event);
+    const ts = event['timestamp'];
+    if (ts instanceof Date && !isNaN(ts.getTime())) copy['timestamp'] = ts.toISOString();
+    return copy;
+  });
+  const first = batch[0];
+  const props = first ? first['properties'] : undefined;
+  return {
+    'api_key': props && !isUndefined(props['token']) && props['token'] !== null ? props['token'] :
+        (first ? first['token'] : undefined),
+    'batch': batch,
+    'sent_at': new Date().toISOString(),
   };
-  xhr.send(body === undefined ? null : body);
 }
 
 /**
- * @param {!RequestOptions} opts
- * @param {string} body
+ * @param {string} url
+ * @param {string|undefined} method
+ * @param {string|undefined} compression
+ * @param {string|undefined} timestampMode
+ * @return {string}
  */
-function sendBeacon(opts, body) {
+function buildRequestURL(url, method, compression, timestampMode) {
+  const tsParam = timestampMode === 'query' ? (method === 'POST' ? 'sent_at' : '_') : undefined;
+  const params = {};
+  if (tsParam) params[tsParam] = String(new Date().getTime());
+  if (compression !== COMPRESSION_GZIP_JS) params['compression'] = compression;
+  return extendURLParams(compression === COMPRESSION_GZIP_JS ? removeURLParam(url, 'compression') : url, params);
+}
+
+/**
+ * Upstream gzipCompress over CompressionStream (async).
+ * @param {string} input
+ * @param {function(?ArrayBuffer, *)} done (buffer, error)
+ */
+function gzipNative(input, done) {
   try {
-    const blob = new Blob([body], {type: 'application/x-www-form-urlencoded'});
-    const ok = nav.sendBeacon(opts.url, blob);
-    if (!ok) {
-      logger.warn('beacon rejected, falling back');
-      if (hasFetch()) sendFetch(opts, body, 'application/x-www-form-urlencoded');
-      else sendXHR(opts, body, 'application/x-www-form-urlencoded');
-      return;
-    }
-    respond(opts, 200, undefined);
-  } catch (e) {
-    logger.warn('beacon failed', e);
-  }
-}
-
-/**
- * Gzips a string with the native CompressionStream.
- * @param {string} s
- * @return {!Promise<!Blob>}
- */
-function gzip(s) {
-  const CS = win['CompressionStream'];
-  const stream = new Blob([s])['stream']()['pipeThrough'](new CS('gzip'));
-  return new win['Response'](stream)['blob']();
-}
-
-/**
- * Sends a request. POST bodies are JSON; gzip is applied when requested and
- * natively supported, beacons always use base64 form encoding (CORS-simple).
- * @param {!RequestOptions} opts
- */
-export function request(opts) {
-  const transport = opts.transport === 'sendBeacon' && hasBeacon() ? 'sendBeacon' :
-      opts.transport === 'XHR' || !hasFetch() ? 'XHR' : 'fetch';
-  const isPost = opts.method === 'POST' && opts.data !== undefined;
-
-  if (!isPost) {
-    opts.url = addQueryParams(opts.url, {'_': String(now())});
-    if (transport === 'XHR') sendXHR(opts, undefined, '');
-    else sendFetch(opts, undefined, '');
-    return;
-  }
-
-  const json = jsonStringify(opts.data);
-
-  if (transport === 'sendBeacon' || opts.compression === 'base64') {
-    opts.url = addQueryParams(opts.url, {'compression': 'base64'});
-    const body = 'data=' + encodeURIComponent(base64Encode(json));
-    if (transport === 'sendBeacon') sendBeacon(opts, body);
-    else if (transport === 'XHR') sendXHR(opts, body, 'application/x-www-form-urlencoded');
-    else sendFetch(opts, body, 'application/x-www-form-urlencoded');
-    return;
-  }
-
-  if (opts.compression === 'gzip-js' && hasNativeGzip()) {
-    const url = opts.url;
-    gzip(json).then(function(blob) {
-      opts.url = addQueryParams(url, {'compression': 'gzip-js'});
-      if (transport === 'XHR') sendXHR(opts, blob, 'text/plain');
-      else sendFetch(opts, blob, 'text/plain');
+    const CS = win['CompressionStream'];
+    const R = win['Response'];
+    const stream = new Blob([input])['stream']()['pipeThrough'](new CS('gzip'));
+    new R(stream)['arrayBuffer']()['then'](function(buf) {
+      done(buf, null);
     }, function(err) {
-      logger.warn('gzip failed, sending uncompressed', err);
-      if (transport === 'XHR') sendXHR(opts, json, 'application/json');
-      else sendFetch(opts, json, 'application/json');
+      done(null, err);
     });
-    return;
+  } catch (e) {
+    done(null, e);
   }
+}
 
-  if (transport === 'XHR') sendXHR(opts, json, 'application/json');
-  else sendFetch(opts, json, 'application/json');
+/**
+ * Entry point: sanitises the options and dispatches to a transport.
+ * @param {!RequestOptions} _options
+ * @param {!TransportCallback=} onResponse
+ */
+export function request(_options, onResponse) {
+  const options = /** @type {!RequestOptions} */ (assign(_options));
+  options.callback = onResponse ? /** @type {?} */ (onResponse) : function(response) {
+    if (_options.callback) _options.callback(response);
+  };
+  options.timeout = options.timeout || 60000;
+  const transport = isUndefined(options.transport) ? 'fetch' : options.transport;
+  if (transport === 'sendBeacon' && isUndefined(options.compression) && options.data) {
+    options.compression = COMPRESSION_BASE64;
+  }
+  if (options.method === 'POST' && options.data) {
+    if (options.timestampMode === 'capture-body') options.data = addSentAtToCaptureBody(options.data);
+    else if (options.timestampMode === 'body') options.data = addSentAtToBody(options.data);
+  }
+  options.url = buildRequestURL(options.url, options.method, options.compression, options.timestampMode);
+
+  /** @type {!Array<{t: string, m: function(!RequestOptions, ?EncodedBody=)}>} */
+  const available = [];
+  if (hasFetch()) available.push({t: 'fetch', m: function(o, pre) {
+    fetchTransport(o, pre);
+  }});
+  if (hasXHR()) available.push({t: 'XHR', m: xhr});
+  if (hasBeacon()) available.push({t: 'sendBeacon', m: function(o) {
+    sendBeaconTransport(o);
+  }});
+  const usable = available.filter(function(a) {
+    return !options.disableTransport || options.disableTransport.indexOf(a.t) === -1;
+  });
+  let method = null;
+  for (let i = 0; i < usable.length; i++) {
+    if (usable[i].t === transport) method = usable[i].m;
+  }
+  if (!method && usable.length) method = usable[0].m;
+  if (!method) throw new Error('No available transport method');
+  const transportMethod = method;
+
+  /**
+   * @param {!RequestOptions} opts
+   * @param {?EncodedBody=} pre
+   */
+  const safeTransport = function(opts, pre) {
+    try {
+      transportMethod(opts, pre);
+    } catch (error) {
+      if (isExpectedNetworkError(error)) logger.warn(error);
+      else logger.error(error);
+      if (options.callback) options.callback(/** @type {!PHResponse} */ ({statusCode: 0, error: error}));
+    }
+  };
+
+  if (transport !== 'sendBeacon' && !options.preferSyncCompression && options.data &&
+      options.compression === COMPRESSION_GZIP_JS && win['CompressionStream'] && win['Promise'] &&
+      !nativeAsyncGzipDisabled) {
+    gzipNative(jsonStringify(options.data), function(buf, err) {
+      if (buf) {
+        safeTransport(options, {contentType: CONTENT_TYPE_PLAIN, body: buf, estimatedSize: buf.byteLength});
+        return;
+      }
+      const name = err && err['name'];
+      if (name === 'NotReadableError') {
+        nativeAsyncGzipDisabled = true;
+        const copy = /** @type {!RequestOptions} */ (assign(options));
+        copy.compression = undefined;
+        copy.url = buildRequestURL(_options.url, _options.method, undefined, _options.timestampMode);
+        safeTransport(copy);
+        return;
+      }
+      safeTransport(options);
+    });
+  } else {
+    safeTransport(options);
+  }
 }

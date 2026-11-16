@@ -42,13 +42,15 @@ closure() {
 }
 
 CORE_FILES=(
-  src/core/utils.js src/core/logger.js src/core/constants.js src/core/uuid.js
-  src/core/storage.js src/core/persistence.js src/core/session.js src/core/request.js
-  src/core/request-queue.js src/core/event-props.js src/core/extensions.js
-  src/core/posthog.js src/entry/core.js
+  src/core/utils.js src/core/constants.js src/core/logger.js src/core/uuid.js src/core/user-agent.js
+  src/core/storage.js src/core/event-utils.js src/core/persistence.js src/core/session.js
+  src/core/session-props.js src/core/scroll-manager.js src/core/page-view.js src/core/gzip.js
+  src/core/request.js src/core/request-queue.js src/core/rate-limiter.js src/core/request-router.js
+  src/core/consent.js src/core/script-loader.js src/core/remote-config.js src/core/history-autocapture.js
+  src/core/extensions.js src/core/posthog.js src/entry/core.js
 )
 FLAGS_FILES=(src/flags/feature-flags.js src/flags/index.js)
-EXPERIMENTS_FILES=(src/experiments/web-experiments.js src/experiments/index.js)
+EXPERIMENTS_FILES=(src/experiments/sanitizer.js src/experiments/web-experiments.js src/experiments/index.js)
 
 WRAPPER='(function(){%output%}).call(this);'
 
