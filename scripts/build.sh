@@ -4,10 +4,15 @@
 #   dist/posthog.core.js        core only (no flags, no experiments)
 #   dist/posthog.core-flags.js  core + feature flags
 #   dist/posthog.full.js        core + feature flags + web experiments
+#                               + autocapture, dead clicks, heatmaps
 #   dist/chunks/{core,flags,experiments}.js
 #                               the same code split into Closure chunks:
 #                               load core.js, then optionally flags.js, then
 #                               optionally experiments.js (any time later).
+#   dist/chunks/{dom,autocapture,deadclicks,heatmaps}.js
+#                               dom.js (shared DOM helpers, needs core), then
+#                               autocapture.js and/or deadclicks.js; heatmaps.js
+#                               needs deadclicks.js.
 #
 # Env: CLOSURE_IMAGE (default posthog-closure-compiler:v20261109),
 #      EXTRA_FLAGS (appended to every compile, e.g. "--debug --formatting=PRETTY_PRINT").
@@ -47,10 +52,16 @@ CORE_FILES=(
   src/core/session-props.js src/core/scroll-manager.js src/core/page-view.js src/core/gzip.js
   src/core/request.js src/core/request-queue.js src/core/rate-limiter.js src/core/request-router.js
   src/core/consent.js src/core/script-loader.js src/core/remote-config.js src/core/history-autocapture.js
-  src/core/extensions.js src/core/posthog.js src/entry/core.js
+  src/core/rageclick.js src/core/extensions.js src/core/posthog.js src/entry/core.js
 )
 FLAGS_FILES=(src/flags/feature-flags.js src/flags/index.js)
 EXPERIMENTS_FILES=(src/experiments/sanitizer.js src/experiments/web-experiments.js src/experiments/index.js)
+# Autocapture, dead clicks and heatmaps share the DOM helpers in src/dom/.
+DOM_FILES=(src/dom/autocapture-utils.js)
+AUTOCAPTURE_FILES=(src/autocapture/autocapture.js src/autocapture/index.js)
+DEADCLICKS_FILES=(src/dead-clicks/dead-clicks.js src/dead-clicks/index.js)
+HEATMAPS_FILES=(src/heatmaps/heatmaps.js src/heatmaps/index.js)
+DOM_MODULE_FILES=("${DOM_FILES[@]}" "${AUTOCAPTURE_FILES[@]}" "${DEADCLICKS_FILES[@]}" "${HEATMAPS_FILES[@]}")
 
 WRAPPER='(function(){%output%}).call(this);'
 
@@ -69,14 +80,15 @@ bundle() { # name entry files...
 
 bundle posthog.core src/entry/core.js "${CORE_FILES[@]}"
 bundle posthog.core-flags src/entry/core-flags.js "${CORE_FILES[@]}" "${FLAGS_FILES[@]}" src/entry/core-flags.js
-bundle posthog.full src/entry/full.js "${CORE_FILES[@]}" "${FLAGS_FILES[@]}" "${EXPERIMENTS_FILES[@]}" src/entry/full.js
+bundle posthog.full src/entry/full.js "${CORE_FILES[@]}" "${FLAGS_FILES[@]}" "${EXPERIMENTS_FILES[@]}" \
+  "${DOM_MODULE_FILES[@]}" src/entry/full.js
 
 # Chunked build. Chunks share renamed symbols through the global `__phc`
 # namespace object, so later chunks can be loaded on demand.
 CHUNK_WRAPPER='(function(){%s}).call(this);'
-echo "-> dist/chunks/{core,flags,experiments}.js"
+echo "-> dist/chunks/{core,flags,experiments,dom,autocapture,deadclicks,heatmaps}.js"
 args=()
-for f in "${CORE_FILES[@]}" "${FLAGS_FILES[@]}" "${EXPERIMENTS_FILES[@]}"; do args+=(--js "$f"); done
+for f in "${CORE_FILES[@]}" "${FLAGS_FILES[@]}" "${EXPERIMENTS_FILES[@]}" "${DOM_MODULE_FILES[@]}"; do args+=(--js "$f"); done
 closure "${args[@]}" \
   --rename_prefix_namespace __phc \
   --chunk "core:${#CORE_FILES[@]}" \
@@ -85,6 +97,14 @@ closure "${args[@]}" \
   --chunk_wrapper "core:var __phc=window.__phc=window.__phc||{};${CHUNK_WRAPPER}" \
   --chunk_wrapper "flags:${CHUNK_WRAPPER}" \
   --chunk_wrapper "experiments:${CHUNK_WRAPPER}" \
+  --chunk "dom:${#DOM_FILES[@]}:core" \
+  --chunk "autocapture:${#AUTOCAPTURE_FILES[@]}:dom" \
+  --chunk "deadclicks:${#DEADCLICKS_FILES[@]}:dom" \
+  --chunk "heatmaps:${#HEATMAPS_FILES[@]}:deadclicks" \
+  --chunk_wrapper "dom:${CHUNK_WRAPPER}" \
+  --chunk_wrapper "autocapture:${CHUNK_WRAPPER}" \
+  --chunk_wrapper "deadclicks:${CHUNK_WRAPPER}" \
+  --chunk_wrapper "heatmaps:${CHUNK_WRAPPER}" \
   --chunk_output_path_prefix dist/chunks/
 
 echo
