@@ -214,7 +214,10 @@ closure "${args[@]}" \
   --chunk_wrapper "web-vitals:${CHUNK_WRAPPER}" \
   --chunk_wrapper "tracing-headers:${CHUNK_WRAPPER}" \
   --chunk_wrapper "logs:${CHUNK_WRAPPER}" \
-  --chunk_output_path_prefix dist/lazy/
+  --chunk_output_path_prefix dist/lazy/ \
+  --create_source_map "%outname%.map"
+# Source maps for the profiler (test/bench/profile.mjs). The comment is only read by devtools.
+for f in dist/lazy/*.js; do echo "//# sourceMappingURL=$(basename "$f").map" >> "$f"; done
 
 echo
 ls -l dist dist/chunks dist/lazy | grep '\.js$' | awk '{printf "%8d  %s\n", $5, $NF}'
