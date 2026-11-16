@@ -119,12 +119,13 @@ function normaliseUrls(value) {
         .replace(/\/static\/(?:[\w.-]+\/)?(?:lazy-)?recorder\.js(?:\?v=[\w.-]+)?/g, '/static/<recorder>')
 }
 
-// Network plugin entries: browser-measured timings and transfer sizes.
+// Network plugin entries: browser-measured timings and transfer sizes, the
+// response `date` header and Chrome's navigation `confidence` (system load).
 const NETWORK_VOLATILE = /(Start|End|Time|duration|timeOrigin|Size|Complete|Interactive)$/
 
 function normalise(value, ids, key, inNetwork) {
     if (inNetwork && NETWORK_VOLATILE.test(key || '') && typeof value === 'number') return '<volatile>'
-    if (inNetwork && key === 'date') return '<volatile>'
+    if (inNetwork && (key === 'date' || key === 'confidence') && value !== undefined) return '<volatile>'
     if (REPLAY_VOLATILE_KEYS.has(key) && value !== undefined && value !== null) return '<volatile>'
     if (VOLATILE_KEYS.has(key) && value !== undefined && value !== null) return '<volatile>'
     if (typeof value === 'string') {
