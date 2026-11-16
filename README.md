@@ -15,6 +15,44 @@ official bundle and this SDK in headless Chrome and diffs the traffic; all
 scenarios are identical (see [Test](#test)). See [Scope](#scope) for what is
 not ported yet.
 
+## Size and performance vs the official SDK
+
+Measured against official posthog-js 1.450.0 (`array.js`, the CDN bundle) on the
+same page in headless Chrome with 4x CPU throttling, medians of 7 runs
+(`./scripts/build.sh && node test/diff/bench.mjs`). Absolute times vary with
+machine load; the ratios were stable across runs.
+
+| | official `array.js` | ours `posthog.full.js` | ours `posthog.core.js` |
+|---|---|---|---|
+| SDK script, gzip | 122 KB | 88.9 KB | 35.0 KB |
+| SDK script, raw | 372 KB | 248 KB | 94 KB |
+| Script download + parse + eval | 1x | ~0.55-0.7x | ~0.35-0.6x |
+| `posthog.init()` | 1x | ~0.55-0.7x | ~0.3-0.5x |
+| 1000 `capture()` calls (incl. client rate limiting) | 1x | ~0.45-0.5x | ~0.25-0.5x |
+| Extra scripts at startup | `surveys.js` | none | none |
+| Extra scripts with replay on | `surveys.js`, `lazy-recorder.js` (72.5 KB gzip) | `recorder.js` (46.5 KB gzip) | n/a (no replay module) |
+
+Other differences besides size and speed:
+
+- **Fewer requests.** Upstream lazy-loads `surveys.js` on every page (even with
+  surveys off in the project) and its replay logic inside `lazy-recorder.js`;
+  we have no surveys module and compile the replay logic in, loading only
+  PostHog's rrweb fork (`recorder.js`).
+- **Compiled in vs lazy-loaded.** Exception autocapture's wrappers and dead
+  clicks are part of our bundle or chunk instead of separate `/static/` downloads, so they start immediately
+  rather than after a script load. The resulting traffic is the same.
+- **Pick what you load.** Each module is also a Closure chunk; `posthog.core.js`
+  plus only the chunks you need is smaller than any upstream CDN build.
+- **Synchronous gzip** (beacons on unload, `send_instantly`, browsers without
+  `CompressionStream`) uses our compact encoder instead of fflate: same decoded
+  payload, somewhat larger request bodies.
+- **Lazy assets are pinned.** PostHog CDN assets are requested for the upstream
+  version we track (`UPSTREAM_VERSION`, currently 1.450.0), e.g.
+  `/static/1.450.0/recorder.js`, never for our own version. The diff test fails
+  if our SDK requests an asset path that doesn't exist on the CDN.
+- **ES5 output with no injected polyfills.** Like upstream, we target old
+  browsers; we use no ES2015+ built-ins at all rather than polyfilling them.
+
 ## Layout
 
 ```

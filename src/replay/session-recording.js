@@ -12,7 +12,7 @@
 import {PostHog} from '../core/posthog.js';
 import {Extension} from '../core/extensions.js';
 import {logger as baseLogger} from '../core/logger.js';
-import {Config} from '../core/constants.js';
+import {Config, UPSTREAM_VERSION} from '../core/constants.js';
 import {loadScript} from '../core/script-loader.js';
 import {addEventListener, doc, isNullish, isNumber, isObject, isUndefined, win} from '../core/utils.js';
 import {
@@ -79,7 +79,9 @@ function findScript(url) {
  * @param {function((string|!Event|undefined)=)} callback
  */
 export function loadExternalDependency(instance, kind, callback) {
-  const version = Config.LIB_VERSION;
+  // Upstream uses its own version here; ours (Config.LIB_VERSION) is not on
+  // PostHog's CDN, so ask for the upstream build we were ported against.
+  const version = UPSTREAM_VERSION;
   const legacyUrl = function() {
     return instance.requestRouter.endpointFor('assets', '/static/' + kind + '.js?v=' + version);
   };

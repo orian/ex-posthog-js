@@ -241,6 +241,8 @@ function compare(official, ours) {
     diffValues(official.results, ours.results, 'results', out)
     if (official.error || ours.error) out.push(`errors: official=${official.error} ours=${ours.error}`)
     // Errors thrown on purpose by exception scenarios are marked 'diff-expected'.
+    const missing = ours.log.filter((r) => r.status === 404).map((r) => r.path)
+    if (missing.length) out.push(`ours requested missing assets (404): ${missing.join(' ')}`)
     const pageErrors = ours.pageErrors.filter((e) => !/diff-?expected/i.test(e))
     if (pageErrors.length) out.push(`page errors (ours): ${pageErrors.join(' | ')}`)
     return out

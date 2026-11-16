@@ -1,0 +1,46 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Bench page</title></head>
+<body>
+  <h1>Bench</h1>
+  <button id="b">Button</button>
+  <div style="height: 2000px"></div>
+  <script>
+    // Measures SDK cost on the main thread. ?sdk=official|ours&bundle=...&replay=0|1
+    (function () {
+      var q = new URLSearchParams(location.search)
+      var r = (window.__bench = { longTasks: 0, longTaskMs: 0 })
+      try {
+        new PerformanceObserver(function (l) {
+          l.getEntries().forEach(function (e) { r.longTasks++; r.longTaskMs += e.duration })
+        }).observe({ type: 'longtask', buffered: true })
+      } catch (e) {}
+      var s = document.createElement('script')
+      s.src = q.get('sdk') === 'official' ? '/sdk/official/array.js' : '/sdk/ours/' + (q.get('bundle') || 'posthog.full.js')
+      var t0 = performance.now()
+      s.onload = function () {
+        r.loadEvalMs = performance.now() - t0
+        var t1 = performance.now()
+        posthog.init('phc_diff', {
+          api_host: 'http://ph.example.test:' + location.port,
+          request_queue_config: { flush_interval_ms: 3000 },
+        })
+        r.initMs = performance.now() - t1
+        var t2 = performance.now()
+        for (var i = 0; i < 1000; i++) posthog.capture('bench_event', { i: i, plan: 'pro', nested: { a: [1, 2, 3] } })
+        r.capture1000Ms = performance.now() - t2
+        setTimeout(function () {
+          var res = performance.getEntriesByType('resource').filter(function (e) {
+            return /\/sdk\/|\/static\//.test(e.name)
+          })
+          r.scripts = res.map(function (e) { return e.name.replace(/^https?:\/\/[^/]+/, '').replace(/\?.*$/, '') })
+          r.scriptBytes = res.reduce(function (a, e) { return a + (e.encodedBodySize || 0) }, 0)
+          r.requests = performance.getEntriesByType('resource').length
+          r.done = true
+        }, 6000)
+      }
+      document.head.appendChild(s)
+    })()
+  </script>
+</body>
+</html>

@@ -58,8 +58,14 @@ export function startServer({ port = 0 } = {}) {
     function api(req, res, url, body) {
         // Lazy-loaded SDK assets (official only): /static/<file>.js
         if (url.pathname.startsWith('/static/')) {
-            state.log.push({ method: req.method, path: url.pathname, query: Object.fromEntries(url.searchParams) })
-            return sendFile(res, path.join(VENDOR, path.basename(url.pathname)))
+            // Behave like PostHog's CDN: /static/<file> (latest) or /static/<version>/<file>
+            // exist only for real upstream versions; anything else is a 404 (and is logged
+            // as such, so the diff can flag SDKs requesting assets that don't exist).
+            const m = /^\/static\/(?:([^/]+)\/)?([^/]+)$/.exec(url.pathname)
+            const known = m && (!m[1] || m[1] === OFFICIAL_VERSION) && fs.existsSync(path.join(VENDOR, m[2]))
+            state.log.push({ method: req.method, path: url.pathname, query: Object.fromEntries(url.searchParams), status: known ? 200 : 404 })
+            if (!known) return res.writeHead(404).end('not found')
+            return sendFile(res, path.join(VENDOR, m[2]))
         }
         const entry = {
             method: req.method,

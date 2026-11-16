@@ -96,6 +96,8 @@ export async function launchChrome() {
             })
             return {
                 consoleErrors,
+                /** Raw CDP call on this page's session (e.g. Emulation.setCPUThrottlingRate). */
+                cdp: s,
                 async goto(url, referrer) {
                     await s('Page.navigate', { url, referrer })
                 },

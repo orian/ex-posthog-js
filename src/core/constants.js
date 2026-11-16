@@ -6,6 +6,14 @@
 
 /** @const {string} */ export const LIB_NAME = 'web';
 /** @const {string} */ export const LIB_VERSION = '0.1.0-closure';
+/**
+ * The upstream posthog-js release this SDK tracks. Lazy-loaded PostHog assets
+ * (e.g. /static/<version>/recorder.js) are requested for this version, because
+ * our code was ported against exactly those builds; LIB_VERSION is ours and
+ * does not exist on PostHog's CDN.
+ * @const {string}
+ */
+export const UPSTREAM_VERSION = '1.450.0';
 
 /**
  * Mutable SDK-wide settings (upstream `Config`). SDK_DIST_CHANNEL is set by
