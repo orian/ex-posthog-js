@@ -16,6 +16,14 @@
 //   --init JSON          extra posthog.init options
 //   --out FILE           JSON results path (default test/bench/results/<timestamp>.json)
 //   --dump-logs DIR      also write each run's raw fake-server log (decoded bodies) to DIR
+//   --profile            also run every variant once more per run under the CDP sampling
+//                        profiler and attribute CPU self time to page / SDK / replay logic /
+//                        rrweb via source maps (the plain runs stay unprofiled; see profile.mjs)
+//   --profile-interval U sampling interval in µs (default 100)
+//   --save-profiles DIR  also write the raw .cpuprofile files (open in Chrome DevTools)
+//   --profile-window W   session (default: the measured window) | load (from navigation, so
+//                        SDK evaluation, init and the first full snapshot are included)
+//   --profile-only       skip the plain runs (profile tables only)
 //
 // Positional `[runs] [seconds]` still work. See README.md "Benchmarks".
 import fs from 'node:fs'
@@ -27,10 +35,12 @@ import { launchChrome } from '../diff/chrome.mjs'
 import { benchResponses } from '../diff/fixtures.mjs'
 import { Human } from './human.mjs'
 import { siteSession, genericSession } from './journeys.mjs'
+import { startProfile, stopProfile, Attributor, makeLocator, findUpstream, summarise, printProfile } from './profile.mjs'
+import { execFileSync } from 'node:child_process'
 
 // ---- options -------------------------------------------------------------------
 function parseArgs(argv) {
-    const o = { runs: 5, duration: 60, throttle: 4, seed: 1, token: 'phc_diff', config: {}, init: {} }
+    const o = { runs: 5, duration: 60, throttle: 4, seed: 1, token: 'phc_diff', config: {}, init: {}, profile: false, profileInterval: 100, profileWindow: 'session' }
     const pos = []
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i]
@@ -48,6 +58,11 @@ function parseArgs(argv) {
         else if (a === '--init') o.init = JSON.parse(val())
         else if (a === '--out') o.out = val()
         else if (a === '--dump-logs') o.dumpLogs = val()
+        else if (a === '--profile') o.profile = true
+        else if (a === '--profile-interval') o.profileInterval = Number(val())
+        else if (a === '--save-profiles') o.saveProfiles = val()
+        else if (a === '--profile-window') o.profileWindow = val()
+        else if (a === '--profile-only') o.profile = o.profileOnly = true
         else if (a.startsWith('--')) throw new Error('unknown option ' + a)
         else pos.push(a)
     }
@@ -70,6 +85,7 @@ const VARIANTS = (opts.variants || ['none', 'official', 'ours'].concat(hasLazy ?
     return ALL_VARIANTS[k]
 })
 const VIEWPORT = { width: 1280, height: 800 }
+const VENDOR_DIST = path.join(ROOT, 'test/diff/vendor', `posthog-js-${OFFICIAL_VERSION}`, 'dist')
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 // ---- page instrumentation + SDK loader (injected before any page script) --------------
@@ -257,7 +273,7 @@ function summariseTraffic(log, navStart) {
     }
 }
 
-async function runOnce(chrome, srv, v, run) {
+async function runOnce(chrome, srv, v, run, profiled = false) {
     srv.state.log = []
     srv.state.responses = benchResponses(opts.token, opts.config)
     const byo = !!opts.url
@@ -274,6 +290,7 @@ async function runOnce(chrome, srv, v, run) {
     await page.cdp('Page.addScriptToEvaluateOnNewDocument', { source: `(${injected})(${JSON.stringify(cfg)})` })
     const fetchState = byo ? await interceptApi(page, srv.port) : null
     const url = byo ? opts.url : `http://app.example.test:${srv.port}/site/`
+    if (profiled && opts.profileWindow === 'load') await startProfile(page, opts.profileInterval)
     const navStart = Date.now()
     await page.goto(url)
     await page.waitFor(`document.readyState === 'complete' && window.__phbench && window.__phbench.ready`, 60000)
@@ -281,6 +298,9 @@ async function runOnce(chrome, srv, v, run) {
     await sleep(1000) // remote config, recorder script, first full snapshot
     if (fetchState) fetchState.blockNavigation = true
     await page.evaluate('window.__phbench.reset()')
+    // The profiler is started before and stopped after the metrics snapshots, so its own
+    // start-up (code event logging) and the profile serialisation stay out of TaskDuration.
+    if (profiled && opts.profileWindow !== 'load') await startProfile(page, opts.profileInterval)
     const before = await metrics(page)
     let peakHeap = before.JSHeapUsedSize
     let sampling = true
@@ -298,6 +318,7 @@ async function runOnce(chrome, srv, v, run) {
     sampling = false
     await sampler
     const after = await metrics(page)
+    const profile = profiled ? await stopProfile(page) : null
     peakHeap = Math.max(peakHeap, after.JSHeapUsedSize)
     const page_ = await page.evaluate('window.__phbench.result()')
     await sleep(1000)
@@ -306,11 +327,16 @@ async function runOnce(chrome, srv, v, run) {
     await page.close()
     if (opts.dumpLogs) {
         fs.mkdirSync(opts.dumpLogs, { recursive: true })
-        fs.writeFileSync(path.join(opts.dumpLogs, `${v.key}-${run}.json`), JSON.stringify({ navStart, log: srv.state.log }))
+        fs.writeFileSync(path.join(opts.dumpLogs, `${v.key}-${run}${profiled ? '-profiled' : ''}.json`), JSON.stringify({ navStart, log: srv.state.log }))
+    }
+    if (profile && opts.saveProfiles) {
+        fs.mkdirSync(opts.saveProfiles, { recursive: true })
+        fs.writeFileSync(path.join(opts.saveProfiles, `${v.key}-${run}.cpuprofile`), JSON.stringify(profile))
     }
     const d = (k) => (after[k] - before[k]) * 1000
     return {
-        variant: v.key, run, loadMs, wallMs, journeys, input: human.stats,
+        variant: v.key, run, profiled, loadMs, wallMs, journeys, input: human.stats,
+        cpu: profile ? attributor.attribute(profile) : undefined,
         taskMs: d('TaskDuration'), scriptMs: d('ScriptDuration'), layoutMs: d('LayoutDuration'), styleMs: d('RecalcStyleDuration'),
         heapEndMB: after.JSHeapUsedSize / 1048576, heapPeakMB: peakHeap / 1048576,
         ...page_, ...summariseTraffic(srv.state.log, navStart),
@@ -326,26 +352,49 @@ const median = (xs) => {
     return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2
 }
 
+/** Other headless Chrome containers (e.g. diff tests in another worktree) competing for CPU. */
+function otherChromes() {
+    try {
+        return execFileSync('docker', ['ps', '--format', '{{.Names}}'], { encoding: 'utf8' }).split('\n')
+            .filter((n) => /^phc-diff-/.test(n) && n !== 'phc-diff-' + process.pid)
+    } catch {
+        return null
+    }
+}
+
+const upstream = opts.profile ? findUpstream(ROOT) : null
+const attributor = opts.profile ? new Attributor(makeLocator(ROOT, VENDOR_DIST, upstream), upstream) : null
+if (opts.profile && !upstream) console.error('warning: upstream/ not found (set PH_UPSTREAM): rrweb time is not split by rrweb source file')
 const srv = await startServer()
 const chrome = await launchChrome()
 const samples = Object.fromEntries(VARIANTS.map((v) => [v.key, []]))
+const profiled = Object.fromEntries(VARIANTS.map((v) => [v.key, []]))
 const started = new Date()
-console.error(`${opts.url || 'demo app'} · journey ${opts.journey} · ${opts.duration}s · ${opts.runs} runs · CPU ${opts.throttle}x · seed ${opts.seed}`)
+const contention = { start: otherChromes(), seen: new Set() }
+console.error(`${opts.url || 'demo app'} · journey ${opts.journey} · ${opts.duration}s · ${opts.runs} runs · CPU ${opts.throttle}x · seed ${opts.seed}` +
+    (opts.profile ? ` · ${opts.profileOnly ? 'profiled runs only' : 'profiled runs too'} (${opts.profileInterval} µs, window: ${opts.profileWindow})` : ''))
+if (contention.start && contention.start.length) console.error(`note: other Chrome containers running: ${contention.start.join(', ')}`)
 try {
     // Variants are interleaved run by run, so slow drift (thermal, other load) hits all equally.
+    // With --profile, each round also runs every variant under the profiler, after the plain ones.
     for (let run = 0; run < opts.runs; run++) {
-        for (const v of VARIANTS) {
-            const s = await runOnce(chrome, srv, v, run)
-            samples[v.key].push(s)
-            console.error(`run ${run + 1}/${opts.runs} ${v.key.padEnd(8)} task ${s.taskMs.toFixed(0)} ms, script ${s.scriptMs.toFixed(0)} ms, ` +
-                `${s.events} events, ${s.snapshots} $snapshot (${s.rrwebEvents} rrweb), lag ${s.input.lagMs.toFixed(0)} ms` +
-                (s.pageErrors.length ? `, page errors: ${s.pageErrors.join(' | ').slice(0, 200)}` : '') + (s.sdkError ? ` SDK: ${s.sdkError}` : ''))
+        for (const prof of opts.profileOnly ? [true] : opts.profile ? [false, true] : [false]) {
+            for (const v of VARIANTS) {
+                const s = await runOnce(chrome, srv, v, run, prof)
+                ;(prof ? profiled : samples)[v.key].push(s)
+                for (const n of otherChromes() || []) contention.seen.add(n)
+                console.error(`run ${run + 1}/${opts.runs} ${(v.key + (prof ? '*' : '')).padEnd(9)} task ${s.taskMs.toFixed(0)} ms, script ${s.scriptMs.toFixed(0)} ms, ` +
+                    `${s.events} events, ${s.snapshots} $snapshot (${s.rrwebEvents} rrweb), lag ${s.input.lagMs.toFixed(0)} ms` +
+                    (s.cpu ? `, profile: SDK ${(s.cpu.buckets.sdk + s.cpu.buckets.replay).toFixed(0)} ms, rrweb ${s.cpu.buckets.rrweb.toFixed(0)} ms` : '') +
+                    (s.pageErrors.length ? `, page errors: ${s.pageErrors.join(' | ').slice(0, 200)}` : '') + (s.sdkError ? ` SDK: ${s.sdkError}` : ''))
+            }
         }
     }
 } finally {
     chrome.close()
     srv.server.close()
 }
+contention.seen = [...contention.seen]
 
 const KEYS = ['taskMs', 'scriptMs', 'layoutMs', 'styleMs', 'longTasks', 'longTaskMs', 'interactions', 'inpP75', 'inpMax', 'nextPaintP75', 'nextPaintMax', 'heapEndMB', 'heapPeakMB',
     'eventRequests', 'eventBytes', 'events', 'replayRequests', 'replayBytes', 'snapshots', 'rrwebEvents', 'fullSnapshots', 'firstFullSnapshotMs', 'otherApiRequests', 'nodes', 'wallMs']
@@ -354,6 +403,7 @@ const base = medians.none
 const f = (x, d = 0) => (x === null || x === undefined ? '-' : x.toFixed(d))
 const over = (m, k) => (base && m !== base ? f(m[k] - base[k]) : '-')
 console.log(`\n${opts.url || 'demo app (test/bench/site)'}, ${opts.journey} journeys, ${opts.duration} s planned, CPU ${opts.throttle}x, medians of ${opts.runs} runs.`)
+if (!opts.profileOnly) {
 console.log('Overhead = variant minus the no-SDK baseline (same seeded session).\n')
 console.table(Object.fromEntries(VARIANTS.map((v) => {
     const m = medians[v.key]
@@ -371,9 +421,29 @@ console.table(Object.fromEntries(VARIANTS.filter((v) => v.key !== 'none').map((v
         'replay KB': f(m.replayBytes / 1024, 1), '1st full snapshot ms': f(m.firstFullSnapshotMs), 'other API reqs': f(m.otherApiRequests),
     }]
 })))
+}
+
+let profile
+if (opts.profile) {
+    const prof = Object.fromEntries(VARIANTS.map((v) => [v.key, summarise(profiled[v.key].map((s) => s.cpu))]))
+    printProfile(prof, VARIANTS, opts)
+    // Profiler overhead: the same variant's task time profiled vs plain.
+    if (!opts.profileOnly) console.log('\nProfiler overhead (median main-thread task time, plain vs profiled runs):')
+    if (!opts.profileOnly) console.table(Object.fromEntries(VARIANTS.map((v) => {
+        const plain = median(samples[v.key].map((s) => s.taskMs))
+        const withProf = median(profiled[v.key].map((s) => s.taskMs))
+        return [v.key, { plain: f(plain), profiled: f(withProf), '+%': f((100 * (withProf - plain)) / plain, 1) }]
+    })))
+    profile = {
+        intervalUs: opts.profileInterval, window: opts.profileWindow, upstream, medians: prof,
+        taskMs: Object.fromEntries(VARIANTS.map((v) => [v.key, median(profiled[v.key].map((s) => s.taskMs))])),
+    }
+}
+if (contention.seen.length) console.log(`note: other Chrome containers were running during the measurement: ${contention.seen.join(', ')}`)
 
 const out = opts.out || path.join(ROOT, 'test/bench/results', started.toISOString().replace(/[:.]/g, '-') + '.json')
 fs.mkdirSync(path.dirname(out), { recursive: true })
-fs.writeFileSync(out, JSON.stringify({ started: started.toISOString(), options: opts, viewport: VIEWPORT, officialVersion: OFFICIAL_VERSION, medians, samples }, null, 2))
+fs.writeFileSync(out, JSON.stringify({ started: started.toISOString(), options: opts, viewport: VIEWPORT, officialVersion: OFFICIAL_VERSION,
+    otherChromeContainers: contention.seen, medians, samples, profile, profiledSamples: opts.profile ? profiled : undefined }, null, 2))
 console.log(`results: ${path.relative(process.cwd(), out)}`)
 process.exit(0)
