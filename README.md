@@ -75,6 +75,199 @@ Other differences besides size and speed:
 - **ES5 output with no injected polyfills.** Like upstream, we target old
   browsers; we use no ES2015+ built-ins at all rather than polyfilling them.
 
+### Benchmarks
+
+Two benchmarks run real headless Chrome (`chromedp/headless-shell` in Docker,
+see `test/diff/chrome.mjs`) against the fake PostHog server:
+
+- `node test/diff/bench.mjs` measures script load, `init()` and 1000
+  `capture()` calls on a bare page (the [Speed](#speed) table above).
+- `npm run bench:session` (`test/bench/session.mjs`) measures a whole user
+  session with analytics, autocapture and session replay on, on a realistic
+  single page app, against a no-SDK baseline.
+
+#### Session benchmark
+
+```sh
+./scripts/build.sh
+npm run bench:session                          # 5 runs x 60 s, 4x CPU throttling
+npm run bench:session -- --runs 3 --duration 120 --no-throttle
+npm run bench:session -- --variants official,ours --seed 7
+npm run bench:session -- --url https://example.com --journey generic   # bring your own site
+```
+
+Options: `--runs N` (default 5), `--duration S` (planned journey time per run,
+default 60), `--throttle R` (CPU throttling rate, default 4) or
+`--no-throttle`, `--variants none,official,ours[,lazy]` (`lazy` =
+`dist/lazy/posthog.js`, included by default when it exists), `--seed N`,
+`--url URL`, `--journey site|generic`, `--token T`, `--config JSON` (remote
+config overrides), `--init JSON` (extra `posthog.init` options), `--out FILE`,
+`--dump-logs DIR` (each run's raw fake-server log with decoded bodies, for
+comparing what the SDKs sent).
+
+**The demo app** (`test/bench/site/`, served at `/site/` by
+`test/diff/server.mjs`) is "Lumen AI", a plain-JS single page app in the style
+of an AI SaaS product, with no framework and no external assets: a landing
+page (hero, hover menu, features, integrations, 24 template cards, blog,
+testimonials, FAQ), a chat whose answers stream token by token and are
+re-rendered as markdown with highlighted code blocks and tables on every
+token (like React markdown renderers), a pricing page with a filterable and
+sortable model catalogue (generated SVG artwork) and a detail modal, signup
+and checkout forms (text, email, password, card number with formatting,
+expiry, CVC, native selects, radios, checkboxes, textareas), and settings with
+tabs, toggles, tables and custom dropdowns. Routes change through
+`history.pushState`; there are about 390 CSS rules and 300-1,450 DOM nodes per
+route at load (the chat transcript grows as answers stream). All content and
+the streaming delays come from seeded PRNGs, so every variant renders the same
+thing. The app knows nothing about analytics.
+
+**Journeys** (`test/bench/journeys.mjs`) drive trusted CDP input
+(`Input.dispatchMouseEvent`, `dispatchKeyEvent`, `insertText`) through
+`test/bench/human.mjs`: mouse paths are eased cubic bezier curves with a
+random bend, sampled at 60 Hz, with an overshoot and correction on a third of
+long moves; scrolling is wheel bursts whose deltas decay like momentum
+scrolling, over the scroll container under the pointer; typing has per-key
+jitter (about 70 wpm), longer pauses after words and punctuation, and ~3%
+typos (a neighbouring key, sometimes one more key, then Backspace); there are
+pastes (password manager), Tab/arrow keys for native selects, hovers and
+reading pauses with small idle mouse drifts. The journeys are *browse*
+(landing, hover menu, scroll, pricing billing toggle, filter chip, sort,
+model modal), *checkout* (email, card number, country, expiry, CVC, promo
+code, pay), *chat* (two turns while answers stream, wheel up and down the
+transcript, copy a code block), *signup* (every field type, terms, submit)
+and *settings* (profile edit, toggles, API key, usage chart, team role
+dropdown). They run back to back in that order, then in seeded random order.
+
+Every decision comes from one seeded PRNG and runs on a *planned clock*: each
+action waits until its planned time, and the session stops when the planned
+time reaches `--duration`, even mid-journey. If the page lags (throttling, a
+heavy SDK), actions start late but the plan doesn't change, so every variant
+replays exactly the same input. At 60 s a session covers *browse*, *checkout*
+and most of the first *chat* turn; `--duration 130` covers all five.
+
+**What is measured**, after load and a 1 s settle, for the duration of the
+journeys (runs are interleaved across variants; the table shows medians):
+
+- main-thread task and script time (CDP `Performance.getMetrics`
+  `TaskDuration` / `ScriptDuration`, wall time under throttling), and the SDK
+  overhead: variant minus the no-SDK baseline running the same session;
+- long tasks (`PerformanceObserver` `longtask`);
+- INP from Event Timing (p75 and max over interactions, interactions under
+  the 16 ms reporting threshold count as 0), and a next-paint probe (keydown
+  or click to the first task after the next frame). The probe exists because
+  headless Chrome sometimes reports no presentation for the keystrokes typed
+  into a text field for seconds (they all end at the same later frame, with
+  ~0 ms processing), in every variant including the baseline, which makes the
+  Event Timing *max* meaningless; the p75 is unaffected;
+- JS heap at the end and the peak of 1 s samples;
+- requests, wire bytes and events for `/e/` and `/i/v0/e/`, and for `/s/`;
+  `$snapshot` events, rrweb events and full snapshots; time from navigation to
+  the fake server receiving the first full snapshot.
+
+The JSON in `test/bench/results/<timestamp>.json` (gitignored) has every
+sample, including per-request wire and decoded sizes, event names by type,
+slow interactions, input counts and the planned-clock lag.
+
+**Bring your own site** (`--url`): the SDK is injected into an arbitrary page
+with `Page.addScriptToEvaluateOnNewDocument` (a loader that appends the SDK
+`<script>` as soon as the document has a root, then calls `posthog.init`,
+plus the same instrumentation). The api_host is `https://ph.example.test`:
+nothing listens there, but the CDP `Fetch` domain pauses every request to it
+and the runner forwards it (method, headers, raw body from `postDataEntries`)
+to the fake server and fulfils it with the response, CORS headers included.
+Because the api_host is https, https pages don't hit mixed content blocking
+(an `http://ph.example.test:<port>` api_host is blocked there), and no TLS is
+needed since requests are answered before any connection. The SDK bundles and
+the lazy-loaded `/static/` assets go through the same route.
+`Page.setBypassCSP` keeps the site's CSP from blocking the script and
+requests. The generic journey hovers visible links and buttons, clicks
+non-submit buttons (menus, tabs, accordions), types into the first visible
+text input, and scrolls; link clicks and form submits are `preventDefault`ed
+in the capture phase and main-frame document requests are failed after load,
+so the session stays on the page. Pass `--token` and `--config` to shape the
+remote config (replay and autocapture are on by default). Caveats: results
+include the site's own network, third-party scripts, ads and CPU, and the
+page can differ between runs (A/B tests, rotating content, cookie banners), so
+use more runs and read the overhead columns rather than absolute numbers; a
+site that already loads PostHog will conflict with the injected one; iframes
+are not instrumented; bot protection may serve a different page to headless
+Chrome.
+
+**Results** (`npm run bench:session`: demo app, 60 s journeys, 5 runs, 4x CPU
+throttling, medians; official 1.450.0 `array.js` vs our `posthog.full.js`, at
+b400924). Another agent's Chrome diff tests were running on the same machine
+during this run, so absolute times are somewhat noisy (one official run was an
+outlier at +2.4 s, which the median absorbs); the differences against the
+baseline and between the SDKs are what matter. The session covered *browse*,
+*checkout* and the first chat turn (68 interactions: 17 clicks and 51 key
+presses, plus 728 mouse moves and 471 wheel events).
+
+| | no SDK | official | ours |
+|---|---|---|---|
+| Main-thread task time (SDK overhead) | 3,279 ms | 5,684 ms (+2,404) | 5,421 ms (+2,141, -11%) |
+| Script time (SDK overhead) | 153 ms | 1,425 ms (+1,272) | 1,290 ms (+1,137, -11%) |
+| Long tasks | 1 (56 ms) | 4 (426 ms) | 4 (403 ms) |
+| INP p75 / max (Event Timing) | 16 / 192 ms | 16 / 200 ms | 16 / 200 ms |
+| Next-paint probe p75 / max | 11 / 66 ms | 16 / 152 ms | 16 / 134 ms |
+| JS heap at end / peak | 1.1 / 1.4 MB | 7.0 / 7.9 MB | 5.6 / 8.1 MB |
+| Analytics: events (requests), wire KB | - | 30 (15), 21.9 KB | 30 (15), 22.5 KB |
+| Replay: `$snapshot` (requests), rrweb events, full snapshots | - | 29 (17), 685, 1 | 29 (17), 684, 1 |
+| Replay wire KB | - | 204.1 KB | 208.0 KB |
+| First full snapshot received | - | 6.6 s | 6.6 s |
+
+How to read it:
+
+- **Both SDKs send the same data.** Per run, the two SDKs made the same
+  requests in the same order with the same events (5 `$pageview`, 24
+  `$autocapture`, 1 `$pageleave`; 674 incremental, 1 full, 1 meta and 8 custom
+  rrweb events). Decoded analytics bodies are within a few bytes of each other
+  (`$lib_version`); replay bodies within 0.1-1% (the recorded DOM contains the
+  SDK and recorder `<script>` URLs, which differ by design, and mouse and
+  scroll samples follow timing). The rrweb event count wobbles by ±1-2 between
+  runs in both. The 0.6 KB / 3.9 KB more on the wire
+  comes entirely from the three requests compressed synchronously: the initial
+  `$pageview` (`send_instantly`), the `$pageleave` and the last replay batch on
+  unload, which upstream gzips with fflate's dynamic Huffman and we with our
+  smaller fixed-Huffman encoder (868 vs 1,061, 1,313 vs 1,608 and 24.7 KB vs
+  29.0 KB); every CompressionStream-compressed request is the same size within
+  a few bytes. Same data and same rrweb also mean the same first full snapshot
+  time: about 6.6 s from navigation at 4x throttling (load, remote config, the
+  recorder script, the snapshot of a 1,450-node page, then the first flush).
+- **Most of the cost is session replay, and it is the same code.** About 4%
+  of the main thread over the 60 s session goes to the SDK in both cases
+  (+2.1-2.4 s of main-thread time at 4x throttling). rrweb (PostHog's fork, loaded at runtime by both) observes every
+  mutation of the streamed chat answer and every re-rendered catalogue card,
+  serialises them and compresses them; that dominates and is shared. Our ~11%
+  less script and task time has to come from the parts that differ: the
+  smaller main bundle (parse and eval, see [Speed](#speed)), init, our replay
+  logic (compiled in rather than loaded inside `lazy-recorder.js`),
+  autocapture and batching; this benchmark doesn't break it down further. The long tasks are the same
+  ones in both (SDK and recorder evaluation, the full snapshot, serialising
+  large route renders) and slightly shorter in ours.
+- **Interactions stay fast in both.** INP p75 is at the 16 ms floor with or
+  without an SDK; the worst next-paint latency roughly doubles with either SDK
+  (a click that triggers a large route render while rrweb serialises the
+  mutation). The Event Timing max (~200 ms) is the headless keystroke artefact
+  described above and is the same in the baseline.
+- **Heap.** Peaks are the same (~8 MB, rrweb's mirror of the DOM and the
+  replay buffer before a flush); at the end of the session ours holds about
+  1.4 MB less.
+
+A bring-your-own-site check on `https://en.wikipedia.org/wiki/Web_analytics`
+(generic journey, 30 s, 3 runs, 4x throttling, official vs ours only) showed
+the same picture: the same events and requests, ~6% less task and ~7% less
+script time for ours, and a lower heap peak (20 vs 28 MB). One visible
+difference there is timing, not data: our recorder starts about 0.4 s
+earlier after load (full snapshot at ~0.6 s vs ~1.0 s), so it also records
+the input and stylesheet changes Wikipedia's own scripts make right after
+load (~30 more rrweb events). rrweb records programmatic input changes as
+`Input` events, which both SDKs count as user activity, so they release the
+"no interaction since recording started" hold, and in most runs ours ships its first batch
+at ~3.2 s while the official SDK, which started after those changes, waits for
+the first real mouse move (~8.7 s). Given the same events, both SDKs make the
+same decisions.
+
+
 ## Layout
 
 ```
@@ -105,6 +298,8 @@ src/entry/         bundle entry points (core, core-flags, full)
 docker/closure-compiler/Dockerfile   Closure Compiler v20261109 (official Maven jar, JRE 21)
 scripts/build.sh   builds every bundle in Docker
 test/              Node harness (fake browser) + headless-Chrome smoke test
+test/diff/         differential test vs the official SDK (fake PostHog server, CDP driver)
+test/bench/        session benchmark: demo app (site/), human-like input, journeys
 upstream/          shallow clone of PostHog/posthog-js, kept for reference only (git-ignored)
 ```
 

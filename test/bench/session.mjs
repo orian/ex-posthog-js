@@ -15,6 +15,7 @@
 //   --config JSON        remote config overrides, e.g. '{"sessionRecording":{"sampleRate":"1.00"}}'
 //   --init JSON          extra posthog.init options
 //   --out FILE           JSON results path (default test/bench/results/<timestamp>.json)
+//   --dump-logs DIR      also write each run's raw fake-server log (decoded bodies) to DIR
 //
 // Positional `[runs] [seconds]` still work. See README.md "Benchmarks".
 import fs from 'node:fs'
@@ -46,6 +47,7 @@ function parseArgs(argv) {
         else if (a === '--config') o.config = JSON.parse(val())
         else if (a === '--init') o.init = JSON.parse(val())
         else if (a === '--out') o.out = val()
+        else if (a === '--dump-logs') o.dumpLogs = val()
         else if (a.startsWith('--')) throw new Error('unknown option ' + a)
         else pos.push(a)
     }
@@ -302,6 +304,10 @@ async function runOnce(chrome, srv, v, run) {
     await page.goto('about:blank') // unload: final flushes ($pageleave, last replay batch)
     await sleep(2000)
     await page.close()
+    if (opts.dumpLogs) {
+        fs.mkdirSync(opts.dumpLogs, { recursive: true })
+        fs.writeFileSync(path.join(opts.dumpLogs, `${v.key}-${run}.json`), JSON.stringify({ navStart, log: srv.state.log }))
+    }
     const d = (k) => (after[k] - before[k]) * 1000
     return {
         variant: v.key, run, loadMs, wallMs, journeys, input: human.stats,
