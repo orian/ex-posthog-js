@@ -39,6 +39,13 @@ export class Extension {
      * @type {(function(): void)|undefined}
      */
     this.onReset;
+    /**
+     * Called by set_config() after the config was updated (upstream calls
+     * each extension's onConfigChange / startIfEnabledOrStop there). Receives
+     * the partial config that was passed to set_config.
+     * @type {(function(!Object): void)|undefined}
+     */
+    this.onConfigChange;
   }
 }
 
@@ -199,4 +206,31 @@ export class FeatureFlagsApi {
    * @param {string=} stage
    */
   updateEarlyAccessFeatureEnrollment(key, isEnrolled, stage) {}
+}
+
+/**
+ * Contract the core relies on for the exceptions module (upstream
+ * PostHogExceptions, published as `posthog.exceptions`). Implemented by
+ * src/exceptions/exceptions.js.
+ * @record
+ * @extends {Extension}
+ */
+export class ExceptionsApi {
+  constructor() {}
+  /**
+   * @param {*} input
+   * @param {{handled: (boolean|undefined), syntheticException: (?Error|undefined)}=} metadata
+   * @return {!Object}
+   */
+  buildProperties(input, metadata) {}
+  /**
+   * @param {!Object} properties
+   * @return {?Object|undefined}
+   */
+  sendExceptionEvent(properties) {}
+  /**
+   * @param {*} message
+   * @param {*=} properties
+   */
+  addExceptionStep(message, properties) {}
 }

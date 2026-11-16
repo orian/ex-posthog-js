@@ -22,7 +22,7 @@ import {isLikelyBot} from './user-agent.js';
 import {uuidv7} from './uuid.js';
 import {logger} from './logger.js';
 import {localStore, sessionStore} from './storage.js';
-import {Extension, FeatureFlagsApi, attachAllExtensions, findExtensionFactory} from './extensions.js';
+import {ExceptionsApi, Extension, FeatureFlagsApi, attachAllExtensions, findExtensionFactory} from './extensions.js';
 import {
   addEventListener, assign, copyAndTruncateStrings, doc, each, extend, getCookieValue, getPersonPropertiesHash,
   hasOwn, isArray, isBoolean, isEmptyObject, isEmptyString, isFunction, isNullish, isNumber, isObject, isString,
@@ -2145,6 +2145,17 @@ export class PostHog {
     if (this.historyAutocapture && ('capture_pageview' in config || 'disable_capture_url_hashes' in config)) {
       this.historyAutocapture.startIfEnabledOrStop();
     }
+    const self = this;
+    this.extensionOrder_.forEach(function(name) {
+      const ext = self.extensions[name];
+      if (ext && ext.onConfigChange) {
+        try {
+          ext.onConfigChange(config);
+        } catch (e) {
+          logger.error('Error applying config to extension ' + name, e);
+        }
+      }
+    });
     this.syncOptOutWithPersistence_();
   }
 
@@ -2441,6 +2452,74 @@ export class PostHog {
       '$ai_metric_value': String(metricValue)});
   }
 
+  // ---------------------------------------------------------------------------
+  // Exceptions (upstream captureException / addExceptionStep / *ExceptionAutocapture).
+  // The work lives in the optional exceptions module (src/exceptions); without
+  // it these behave like upstream with the extension unavailable.
+
+  /**
+   * The exceptions module, attached on first use when it is registered but
+   * this instance is not initialised yet: upstream constructs it in the
+   * PostHog constructor, so steps added before init are kept.
+   * @return {?ExceptionsApi}
+   * @private
+   */
+  exceptions_() {
+    if (!this.extensions['exceptions']) {
+      const factory = findExtensionFactory('exceptions');
+      if (factory) this.attachExtension('exceptions', factory);
+    }
+    const ext = this.extensions['exceptions'];
+    return ext ? /** @type {!ExceptionsApi} */ (ext) : null;
+  }
+
+  /**
+   * Captures an exception as a `$exception` event.
+   * @param {*} error
+   * @param {?Object=} additionalProperties
+   * @return {!Object|undefined}
+   */
+  captureException(error, additionalProperties) {
+    try {
+      const exceptions = this.exceptions_();
+      if (!exceptions) return undefined;
+      const built = exceptions.buildProperties(error, {
+        handled: true,
+        syntheticException: new Error('PostHog syntheticException'),
+      });
+      const props = {};
+      [built, additionalProperties].forEach(function(src) {
+        if (src == null) return;
+        for (const k in src) {
+          if (hasOwn(src, k)) props[k] = src[k];
+        }
+      });
+      return /** @type {!Object|undefined} */ (exceptions.sendExceptionEvent(props) || undefined);
+    } catch (e) {
+      // Never throw into customer code; don't log (console.error may be instrumented).
+      return undefined;
+    }
+  }
+
+  /**
+   * Adds a breadcrumb attached to the next captured exception.
+   * @param {*} message
+   * @param {*=} properties
+   */
+  addExceptionStep(message, properties) {
+    const exceptions = this.exceptions_();
+    if (exceptions) exceptions.addExceptionStep(message, properties);
+  }
+
+  /** @param {*=} config `capture_exceptions` value (default true) */
+  startExceptionAutocapture(config) {
+    this.set_config({'capture_exceptions': config == null ? true : config});
+  }
+
+  stopExceptionAutocapture() {
+    this.set_config({'capture_exceptions': false});
+  }
+
   /**
    * @param {*} debugConfig
    * @return {*}
@@ -2612,6 +2691,10 @@ export function exportPublicApi() {
   p['getPageViewId'] = p.getPageViewId;
   p['captureTraceFeedback'] = p.captureTraceFeedback;
   p['captureTraceMetric'] = p.captureTraceMetric;
+  p['captureException'] = p.captureException;
+  p['addExceptionStep'] = p.addExceptionStep;
+  p['startExceptionAutocapture'] = p.startExceptionAutocapture;
+  p['stopExceptionAutocapture'] = p.stopExceptionAutocapture;
   p['endpointFor'] = p.endpointFor;
   p['toString'] = p.toString;
   Object.defineProperty(p, '__loaded', {get: /** @this {!PostHog} */ function() {
