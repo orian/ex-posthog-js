@@ -1,58 +1,63 @@
 /**
- * @fileoverview No-code web experiments module (optional, requires the
- * feature flags module). Fetches `/api/web_experiments/` and applies the
- * variant's DOM transforms.
- *
- * Safety: upstream sanitises `html` transforms with DOMPurify. This port does
- * not bundle a sanitizer, so `html` transforms are only applied when the host
- * supplies `web_experiments_html_sanitizer: (html) => safeHtml` in config.
- * `text`, `css`, `attributes` and `imgUrl` transforms are applied directly
- * (they cannot inject markup).
+ * @fileoverview No-code web experiments (optional, requires the feature
+ * flags module). Port of upstream web-experiments.ts: fetches
+ * `/api/web_experiments/`, and applies a variant's `html` (sanitised like
+ * upstream's DOMPurify setup, see sanitizer.js) and `css` transforms. Like
+ * upstream, `disable_web_experiments` defaults to true.
  */
 import {PostHog} from '../core/posthog.js';
-import {Extension, FeatureFlagsApi} from '../core/extensions.js';
-import {request, HttpResponse} from '../core/request.js';
+import {Extension} from '../core/extensions.js';
+import {RequestOptions} from '../core/request.js';
 import {logger} from '../core/logger.js';
-import {getCampaignParams} from '../core/persistence.js';
-import {isLikelyBot} from '../core/event-props.js';
-import {doc, getQueryParam, isArray, isFunction, isNullish, isObject, isString, userAgent, win} from '../core/utils.js';
+import {getCampaignParams} from '../core/event-utils.js';
+import {isLikelyBot} from '../core/user-agent.js';
+import {doc, getQueryParam, isFunction, isNullish, isString, nav, win} from '../core/utils.js';
+import {WEB_EXPERIMENTS} from '../core/constants.js';
+import {sanitizeExperimentHtml} from './sanitizer.js';
 
-/** @const {string} */
-const WEB_EXPERIMENTS_KEY = '$web_experiments';
-
-/** @type {!Object<string, function(string, string): boolean>} */
-const URL_MATCHERS = {
-  'exact': function(cond, href) {
-    return href === cond;
-  },
-  'is_not': function(cond, href) {
-    return href !== cond;
-  },
-  'regex': function(cond, href) {
-    return safeRegexTest(cond, href);
-  },
-  'not_regex': function(cond, href) {
-    return !safeRegexTest(cond, href);
-  },
-  'icontains': function(cond, href) {
-    return href.toLowerCase().indexOf(cond.toLowerCase()) !== -1;
-  },
-  'not_icontains': function(cond, href) {
-    return href.toLowerCase().indexOf(cond.toLowerCase()) === -1;
-  },
-};
+const BOT_REFUSE_MSG = 'Refusing to render web experiment since the viewer is a likely bot';
 
 /**
- * @param {string} pattern
  * @param {string} value
+ * @param {string} pattern
  * @return {boolean}
  */
-function safeRegexTest(pattern, value) {
+function isMatchingRegex(value, pattern) {
   try {
     return new RegExp(pattern).test(value);
   } catch (e) {
     return false;
   }
+}
+
+/** @const {!Object<string, function(string, string): boolean>} */
+export const webExperimentUrlValidationMap = {
+  'icontains': function(c, href) {
+    return href.toLowerCase().indexOf(c.toLowerCase()) > -1;
+  },
+  'not_icontains': function(c, href) {
+    return href.toLowerCase().indexOf(c.toLowerCase()) === -1;
+  },
+  'regex': function(c, href) {
+    return isMatchingRegex(href, c);
+  },
+  'not_regex': function(c, href) {
+    return !isMatchingRegex(href, c);
+  },
+  'exact': function(c, href) {
+    return href === c;
+  },
+  'is_not': function(c, href) {
+    return href !== c;
+  },
+};
+
+/**
+ * @param {*} x
+ * @param {string} msg
+ */
+function logInfo(x, msg) {
+  logger.info('[WebExperiments] ' + msg, x);
 }
 
 /** @implements {Extension} */
@@ -61,190 +66,243 @@ export class WebExperiments {
   constructor(instance) {
     /** @private @const {!PostHog} */
     this.ph_ = instance;
-    /** @private {!Array<!Object>} */
-    this.experiments_ = [];
-    /** Applied experiment names, so re-evaluation doesn't re-apply. @private {!Object<string, string>} */
-    this.applied_ = {};
+    /** @private {?Object<string, !Object>} flag key -> experiment */
+    this.flagToExperiments_ = null;
+    const self = this;
+    instance.onFeatureFlags(function(flags) {
+      self.onFeatureFlags(flags);
+    });
   }
 
-  /** @private @return {?FeatureFlagsApi} */
-  flags_() {
-    const f = this.ph_.extensions['featureFlags'];
-    return f ? /** @type {!FeatureFlagsApi} */ (f) : null;
+  /** @return {!Object} @private */
+  config_() {
+    return this.ph_.config;
   }
 
-  /** @override */
-  onInit() {
-    const c = this.ph_.config;
-    if (c['disable_web_experiments']) return;
-    if (!this.flags_()) {
-      logger.warn('[WebExperiments] feature flags module is required; experiments disabled');
+  /** @param {!Array<string>} flags */
+  onFeatureFlags(flags) {
+    if (this.isBot_()) {
+      logInfo([], BOT_REFUSE_MSG);
       return;
     }
-    if (isLikelyBot(userAgent, c['custom_blocked_useragents'])) return;
-    this.handlePreview_();
-    const self = this;
-    this.load_(function() {
-      // Flags may already be loaded; onFlags fires immediately in that case
-      // and again whenever they change.
-      /** @type {!FeatureFlagsApi} */ (self.flags_()).onFlags(function() {
-        self.evaluate_();
-      });
-      self.evaluate_();
-    });
-  }
-
-  /**
-   * @param {function()} done
-   * @private
-   */
-  load_(done) {
-    const self = this;
-    const cached = this.ph_.get_property(WEB_EXPERIMENTS_KEY);
-    if (isArray(cached)) {
-      this.experiments_ = /** @type {!Array<!Object>} */ (cached);
-      done();
+    if (this.config_()['disable_web_experiments']) return;
+    if (isNullish(this.flagToExperiments_)) {
+      this.flagToExperiments_ = {};
+      this.loadIfEnabled();
+      this.previewWebExperiment();
+      return;
     }
-    request({
-      url: this.ph_.apiUrl('/api/web_experiments/?token=' + encodeURIComponent(this.ph_.config['token'])),
-      method: 'GET',
-      data: undefined,
-      headers: this.ph_.config['request_headers'],
-      compression: undefined,
-      transport: undefined,
-      timeout: undefined,
-      callback: function(/** !HttpResponse */ res) {
-        if (res.statusCode !== 200 || !isObject(res.json)) return;
-        const list = res.json['experiments'];
-        self.experiments_ = isArray(list) ? list : [];
-        self.ph_.register({[WEB_EXPERIMENTS_KEY]: self.experiments_});
-        if (!isArray(cached)) done();
-        else self.evaluate_();
-      },
-    });
-  }
-
-  /** @private */
-  evaluate_() {
-    const flags = this.flags_();
+    logInfo([flags], 'applying feature flags');
     const self = this;
-    this.experiments_.forEach(function(exp) {
-      const variants = exp['variants'] || {};
-      const flagKey = exp['feature_flag_key'];
-      if (flagKey && flags) {
-        const variant = flags.getFlag(flagKey, {'send_event': false});
-        if (isString(variant) && variants[variant] && self.matchesUrl_(variants[variant])) {
-          self.apply_(exp, /** @type {string} */ (variant));
-        }
-      } else {
-        for (const name in variants) {
-          const v = variants[name];
-          if (v && v['conditions'] && self.matchesUrl_(v) && self.matchesUtm_(v)) {
-            self.apply_(exp, name);
-          }
+    flags.forEach(function(flag) {
+      const map = self.flagToExperiments_;
+      if (map && Object.prototype.hasOwnProperty.call(map, flag)) {
+        const variant = self.ph_.getFeatureFlag(flag);
+        const exp = map[flag];
+        if (variant && exp && exp['variants'][/** @type {string} */ (variant)]) {
+          self.applyVariantForFlag_(exp, /** @type {string} */ (variant));
         }
       }
     });
   }
 
-  /** Supports `?__experiment_id=1&__experiment_variant=test` previews. @private */
-  handlePreview_() {
-    if (!win) return;
-    const id = getQueryParam(win.location.search, '__experiment_id');
-    const variant = getQueryParam(win.location.search, '__experiment_variant');
-    if (!id || !variant) return;
+  previewWebExperiment() {
+    const location = win ? win.location : null;
+    if (location && location.search) {
+      const id = getQueryParam(location.search, '__experiment_id');
+      const variant = getQueryParam(location.search, '__experiment_variant');
+      if (id && variant) {
+        logInfo([], 'previewing web experiments ' + id + ' && ' + variant);
+        const self = this;
+        this.getWebExperiments(function(exps) {
+          self.showPreview_(parseInt(id, 10), variant, exps);
+        }, false, true);
+      }
+    }
+  }
+
+  loadIfEnabled() {
+    if (this.config_()['disable_web_experiments']) return;
+    this.getWebExperimentsAndEvaluateDisplayLogic();
+  }
+
+  /** @param {boolean=} forceReload */
+  getWebExperimentsAndEvaluateDisplayLogic(forceReload) {
     const self = this;
-    this.load_(function() {
-      self.experiments_.forEach(function(exp) {
-        if (String(exp['id']) === id && exp['variants'] && exp['variants'][variant]) {
-          self.apply_(exp, variant);
+    this.getWebExperiments(function(exps) {
+      logInfo([], 'retrieved web experiments from the server');
+      self.flagToExperiments_ = {};
+      exps.forEach(function(exp) {
+        if (exp['feature_flag_key']) {
+          if (self.flagToExperiments_) self.flagToExperiments_[exp['feature_flag_key']] = exp;
+          const variant = self.ph_.getFeatureFlag(exp['feature_flag_key']);
+          if (isString(variant) && exp['variants'][/** @type {string} */ (variant)]) {
+            self.applyVariantForFlag_(exp, /** @type {string} */ (variant));
+          }
+        } else if (exp['variants']) {
+          for (const name in exp['variants']) {
+            const v = exp['variants'][name];
+            if (WebExperiments.matchesTestVariant_(v, self.config_())) {
+              self.applyTransforms_(exp['name'], name, v['transforms']);
+            }
+          }
         }
       });
+    }, !!forceReload);
+  }
+
+  /**
+   * @param {function(!Array<!Object>)} callback
+   * @param {boolean} forceReload
+   * @param {boolean=} previewing
+   */
+  getWebExperiments(callback, forceReload, previewing) {
+    if (this.config_()['disable_web_experiments'] && !previewing) return callback([]);
+    const existing = this.ph_.get_property(WEB_EXPERIMENTS);
+    if (existing && !forceReload) return callback(/** @type {!Array<!Object>} */ (existing));
+    this.ph_.sendRequest(/** @type {!RequestOptions} */ ({
+      url: this.ph_.endpointFor('api', '/api/web_experiments/?token=' + this.config_()['token']),
+      method: 'GET',
+      timestampMode: 'query',
+      callback: function(response) {
+        if (response.statusCode !== 200 || !response.json) return callback([]);
+        return callback(response.json['experiments'] || []);
+      },
+    }));
+    return undefined;
+  }
+
+  /**
+   * @param {number} id
+   * @param {string} variant
+   * @param {!Array<!Object>} exps
+   * @private
+   */
+  showPreview_(id, variant, exps) {
+    const preview = exps.filter(function(e) {
+      return e['id'] === id;
     });
-  }
-
-  /**
-   * @param {!Object} variant
-   * @return {boolean}
-   * @private
-   */
-  matchesUrl_(variant) {
-    const cond = variant['conditions'];
-    if (isNullish(cond) || isNullish(cond['url'])) return true;
-    if (!win) return false;
-    const matcher = URL_MATCHERS[cond['urlMatchType'] || 'icontains'] || URL_MATCHERS['icontains'];
-    return matcher(String(cond['url']), win.location.href);
-  }
-
-  /**
-   * @param {!Object} variant
-   * @return {boolean}
-   * @private
-   */
-  matchesUtm_(variant) {
-    const utm = variant['conditions'] ? variant['conditions']['utm'] : null;
-    if (isNullish(utm)) return true;
-    const params = getCampaignParams();
-    if (!params['utm_source']) return false;
-    const keys = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term'];
-    for (let i = 0; i < keys.length; i++) {
-      if (utm[keys[i]] && utm[keys[i]] != params[keys[i]]) return false;
+    if (preview && preview.length > 0) {
+      logInfo([], 'Previewing web experiment [' + preview[0]['name'] + '] with variant [' + variant + ']');
+      this.applyTransforms_(preview[0]['name'], variant, preview[0]['variants'][variant]['transforms']);
     }
-    return true;
   }
 
   /**
    * @param {!Object} exp
-   * @param {string} variantName
+   * @param {string} variant
    * @private
    */
-  apply_(exp, variantName) {
-    const key = String(exp['id']);
-    if (this.applied_[key] === variantName) return;
-    this.applied_[key] = variantName;
-    if (variantName === 'control') return; // control leaves the page untouched
-    const transforms = (exp['variants'][variantName] || {})['transforms'] || [];
-    const sanitizer = this.ph_.config['web_experiments_html_sanitizer'];
-    transforms.forEach(function(t) {
-      if (!t || !t['selector'] || !doc) return;
-      let nodes;
-      try {
-        nodes = doc.querySelectorAll(t['selector']);
-      } catch (e) {
-        logger.warn('[WebExperiments] invalid selector', t['selector']);
+  applyVariantForFlag_(exp, variant) {
+    const v = exp['variants'][variant];
+    if (!WebExperiments.matchUrlConditions_(v, this.config_())) {
+      logInfo([], 'skipping variant ' + variant + ' of experiment ' + exp['name'] +
+          ' because this page does not match its url conditions');
+      return;
+    }
+    this.applyTransforms_(exp['name'], variant, v['transforms']);
+  }
+
+  /**
+   * @param {!Object} v
+   * @param {!Object} config
+   * @return {boolean}
+   * @private
+   */
+  static matchesTestVariant_(v, config) {
+    if (isNullish(v['conditions'])) return false;
+    return WebExperiments.matchUrlConditions_(v, config) && WebExperiments.matchUTMConditions_(v);
+  }
+
+  /**
+   * @param {!Object} v
+   * @param {!Object} config
+   * @return {boolean}
+   * @private
+   */
+  static matchUrlConditions_(v, config) {
+    const cond = v['conditions'];
+    if (isNullish(cond) || isNullish(cond['url'])) return true;
+    const location = win ? win.location : null;
+    if (location) {
+      let href = location.href;
+      const getUrl = config['get_current_url'];
+      if (isFunction(getUrl)) {
+        try {
+          const overridden = getUrl(href);
+          if (isString(overridden) && overridden) href = overridden;
+        } catch (e) {}
+      }
+      return cond['url'] ? webExperimentUrlValidationMap[cond['urlMatchType'] || 'icontains'](cond['url'], href) : true;
+    }
+    return false;
+  }
+
+  /**
+   * @param {!Object} v
+   * @return {boolean}
+   * @private
+   */
+  static matchUTMConditions_(v) {
+    const cond = v['conditions'];
+    if (isNullish(cond) || isNullish(cond['utm'])) return true;
+    const params = getCampaignParams(undefined);
+    if (params['utm_source']) {
+      const utm = cond['utm'];
+      const ok = function(k) {
+        return utm[k] ? utm[k] == params[k] : true;
+      };
+      return ok('utm_campaign') && ok('utm_medium') && ok('utm_term') && ok('utm_source');
+    }
+    return false;
+  }
+
+  /**
+   * @param {string} experiment
+   * @param {string} variant
+   * @param {!Array<!Object>} transforms
+   * @private
+   */
+  applyTransforms_(experiment, variant, transforms) {
+    if (this.isBot_()) {
+      logInfo([], BOT_REFUSE_MSG);
+      return;
+    }
+    if (variant === 'control') {
+      logInfo([], 'Control variants leave the page unmodified.');
+      return;
+    }
+    transforms.forEach(function(transform) {
+      if (!transform['selector']) return;
+      logInfo(transform, 'applying transform of variant ' + variant + ' for experiment ' + experiment + ' ');
+      const elements = doc ? doc.querySelectorAll(transform['selector']) : null;
+      if (!elements || !elements.length) {
+        logger.warn('[WebExperiments] no element on this page matches selector ' + transform['selector'] +
+            ' of variant ' + variant + ' for experiment ' + experiment, []);
         return;
       }
-      if (!nodes.length) {
-        logger.warn('[WebExperiments] no element matches ' + t['selector']);
-        return;
-      }
-      for (let i = 0; i < nodes.length; i++) {
-        const el = /** @type {!HTMLElement} */ (nodes[i]);
-        if (el.tagName.toLowerCase() === 'script') continue;
-        if (isString(t['text'])) el.textContent = t['text'];
-        if (isString(t['html'])) {
-          if (isFunction(sanitizer)) {
-            el.innerHTML = String(sanitizer(t['html']));
-          } else {
-            logger.warn('[WebExperiments] html transform skipped: set web_experiments_html_sanitizer to enable');
+      const sanitized = {};
+      for (let i = 0; i < elements.length; i++) {
+        const element = /** @type {!HTMLElement} */ (elements[i]);
+        if (String(element.localName).toLowerCase() === 'script') continue;
+        if (transform['html']) {
+          const encoding = element.namespaceURI === 'http://www.w3.org/1998/Math/MathML' &&
+              element.localName === 'annotation-xml' ? (element.getAttribute('encoding') || '').toLowerCase() : '';
+          const contextKey = JSON.stringify([element.namespaceURI, element.localName, encoding]);
+          let html = sanitized[contextKey];
+          if (isNullish(html)) {
+            html = sanitizeExperimentHtml(element, String(transform['html']));
+            sanitized[contextKey] = html;
           }
+          element.innerHTML = html;
         }
-        if (isString(t['css'])) el.setAttribute('style', t['css']);
-        if (isString(t['imgUrl']) && el.tagName.toLowerCase() === 'img' && /^https?:\/\//i.test(t['imgUrl'])) {
-          el.setAttribute('src', t['imgUrl']);
-        }
-        if (isArray(t['attributes'])) {
-          t['attributes'].forEach(function(a) {
-            const name = String(a['name'] || '').toLowerCase();
-            // Event-handler and javascript: attributes could execute code.
-            if (!name || name.indexOf('on') === 0) return;
-            const value = String(a['value']);
-            if ((name === 'href' || name === 'src' || name === 'action') && /^\s*javascript:/i.test(value)) return;
-            el.setAttribute(name, value);
-          });
-        }
+        if (transform['css']) element.setAttribute('style', transform['css']);
       }
     });
-    logger.info('[WebExperiments] applied variant ' + variantName + ' of ' + exp['name']);
+  }
+
+  /** @return {boolean} @private */
+  isBot_() {
+    return nav ? isLikelyBot(nav, this.config_()['custom_blocked_useragents']) : false;
   }
 }

@@ -29,7 +29,7 @@ try {
         ws.send(JSON.stringify({ id: myId, method, params }))
     })
     let out = 'pending'
-    for (let i = 0; i < 30 && out === 'pending'; i++) {
+    for (let i = 0; i < 50 && out === 'pending'; i++) {
         await sleep(200)
         const r = await call('Runtime.evaluate', { expression: "document.getElementById('out') ? document.getElementById('out').textContent : 'pending'" })
         out = r.result.value
@@ -37,7 +37,7 @@ try {
     ws.close()
     console.log(out)
     const res = JSON.parse(out)
-    const ok = res.errors.length === 0 && res.flag === 'test' && res.hero === 'New' && res.distinct &&
+    const ok = res.errors.length === 0 && res.flag === 'test' && res.hero === 'New' && !res.xss && res.distinct &&
         res.paths.some((p) => p.endsWith('/e/')) && res.paths.some((p) => p.endsWith('/flags/'))
     console.log(ok ? 'SMOKE OK' : 'SMOKE FAILED')
     process.exitCode = ok ? 0 : 1
