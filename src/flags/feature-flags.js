@@ -1253,6 +1253,28 @@ export class FeatureFlags {
     logger.warn('Invalid overrideOptions provided to overrideFeatureFlags', {'overrideOptions': overrideOptions});
   }
 
+  /**
+   * Deprecated upstream alias of overrideFeatureFlags.
+   * @param {*} flags
+   * @param {boolean=} suppressWarning
+   */
+  override(flags, suppressWarning) {
+    logger.warn('override is deprecated. Please use overrideFeatureFlags instead.');
+    this.overrideFeatureFlags({'flags': flags, 'suppressWarning': !!suppressWarning});
+  }
+
+  /** @param {function(!Array<string>, !Object<string, (string|boolean)>, ?Object=)} handler */
+  addFeatureFlagsHandler(handler) {
+    this.handlers_.push(handler);
+  }
+
+  /** @param {function(!Array<string>, !Object<string, (string|boolean)>, ?Object=)} handler */
+  removeFeatureFlagsHandler(handler) {
+    this.handlers_ = this.handlers_.filter(function(h) {
+      return h !== handler;
+    });
+  }
+
   /** @override */
   onFeatureFlags(callback) {
     this.handlers_.push(callback);

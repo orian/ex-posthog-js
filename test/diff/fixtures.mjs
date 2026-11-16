@@ -29,11 +29,41 @@ const REMOTE_CONFIG = {
     siteApps: [],
 }
 
+const WEB_EXPERIMENTS = {
+    experiments: [{
+        id: 3, name: 'Hero', feature_flag_key: 'multi',
+        variants: {
+            control: { transforms: [] },
+            test: { transforms: [
+                { selector: '#hero', css: 'color: red', html: 'New <b>hero</b><script>window.__xss=1</script><img src=x onerror="window.__xss=1"><a href="javascript:alert(1)" target="_blank">x</a>' },
+                { selector: '#link', html: '<svg><foreignObject><p id="cookie">p</p></foreignObject></svg>' },
+            ] },
+        },
+    }],
+}
+
+// The batch carrying 'first' is answered as quota limited, so later events are dropped client-side.
+const QUOTA = (entry) => (entry.body && entry.body.batch && entry.body.batch.some((e) => e.event === 'first')
+    ? { body: { status: 1, quota_limited: ['events'] } } : { body: { status: 1 } })
+
 export const RESPONSES = {
     default: {
+        '/api/web_experiments/': { body: WEB_EXPERIMENTS },
         '/flags/': { body: FLAGS_V2 },
         '/array/phc_diff/config': { body: REMOTE_CONFIG },
         '/array/phc_diff/config.js': { script: `(function(){window._POSTHOG_REMOTE_CONFIG = window._POSTHOG_REMOTE_CONFIG || {}; window._POSTHOG_REMOTE_CONFIG['phc_diff'] = {config: ${JSON.stringify(REMOTE_CONFIG)}, siteApps: []}})()` },
+    },
+    remote_config_failure: {
+        '/array/phc_diff/config.js': { status: 500, body: {} },
+        '/array/phc_diff/config': { status: 500, body: {} },
+    },
+    no_flags_config: {
+        // config.js loads but defines nothing, so the JSON fallback is used.
+        '/array/phc_diff/config.js': { script: '/* empty */' },
+        '/array/phc_diff/config': { body: { ...REMOTE_CONFIG, hasFeatureFlags: false } },
+    },
+    quota_limited: {
+        '/e/': QUOTA,
     },
 }
 

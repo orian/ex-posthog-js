@@ -45,6 +45,11 @@ function normalise(value, ids, key) {
             return ids.get(value)
         }
         if (ISO.test(value)) return '<iso>'
+        // UUIDs embedded in longer strings (e.g. a session id inside a message).
+        value = value.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, (u) => {
+            if (!ids.has(u)) ids.set(u, `<id${ids.size}>`)
+            return ids.get(u)
+        })
         return value.replace(/:\d{4,5}\//g, ':<port>/').replace(/:\d{4,5}$/, ':<port>').replace(/sdk=(official|ours)/g, 'sdk=<sdk>').replace(/&bundle=[^&]*/g, '')
     }
     if (Array.isArray(value)) return value.map((v) => normalise(v, ids))

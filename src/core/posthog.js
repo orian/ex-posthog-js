@@ -743,6 +743,8 @@ export class PostHog {
       ext = factory(this);
       this.extensions[name] = ext;
       this.extensionOrder_.push(name);
+      // Public handle, like upstream's posthog.featureFlags / posthog.experiments.
+      this[name] = ext;
     } catch (e) {
       logger.critical('failed to initialise extension ' + name, e);
       return;
@@ -1730,18 +1732,6 @@ export class PostHog {
     return f.onFeatureFlags(callback);
   }
 
-  /** @param {*} overrides */
-  overrideFeatureFlags(overrides) {
-    const f = this.flags_();
-    if (f) f.overrideFeatureFlags(overrides);
-  }
-
-  /** @return {!Object<string, (string|boolean)>} */
-  getFeatureFlags() {
-    const f = this.flags_();
-    return f ? f.getFlagVariants() : {};
-  }
-
   /** @return {boolean} */
   flagsEndpointWasHit() {
     const f = this.flags_();
@@ -2617,8 +2607,6 @@ export function exportPublicApi() {
   p['reloadFeatureFlags'] = p.reloadFeatureFlags;
   p['updateFlags'] = p.updateFlags;
   p['onFeatureFlags'] = p.onFeatureFlags;
-  p['overrideFeatureFlags'] = p.overrideFeatureFlags;
-  p['getFeatureFlags'] = p.getFeatureFlags;
   p['getEarlyAccessFeatures'] = p.getEarlyAccessFeatures;
   p['updateEarlyAccessFeatureEnrollment'] = p.updateEarlyAccessFeatureEnrollment;
   p['getPageViewId'] = p.getPageViewId;
