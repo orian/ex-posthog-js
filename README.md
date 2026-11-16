@@ -127,7 +127,12 @@ default 60), `--throttle R` (CPU throttling rate, default 4) or
 `--url URL`, `--journey site|generic`, `--token T`, `--config JSON` (remote
 config overrides), `--init JSON` (extra `posthog.init` options), `--out FILE`,
 `--dump-logs DIR` (each run's raw fake-server log with decoded bodies, for
-comparing what the SDKs sent).
+comparing what the SDKs sent), and the profiler options `--profile`,
+`--profile-interval US`, `--profile-window session|load`, `--profile-only`
+and `--save-profiles DIR` (see [CPU profile](#cpu-profile---profile)). The
+runner prints a note, and records it in the JSON, when other headless Chrome
+containers (`phc-diff-*`, e.g. diff tests in another worktree) were running
+during the measurement.
 
 **The demo app** (`test/bench/site/`, served at `/site/` by
 `test/diff/server.mjs`) is "Lumen AI", a plain-JS single page app in the style
@@ -260,12 +265,13 @@ How to read it:
 - **Most of the cost is session replay, and it is the same code.** About 4%
   of the main thread over the 60 s session goes to the SDK in both cases
   (+2.1-2.4 s of main-thread time at 4x throttling). rrweb (PostHog's fork, loaded at runtime by both) observes every
-  mutation of the streamed chat answer and every re-rendered catalogue card,
-  serialises them and compresses them; that dominates and is shared. Our ~11%
-  less script and task time has to come from the parts that differ: the
-  smaller main bundle (parse and eval, see [Speed](#speed)), init, our replay
-  logic (compiled in rather than loaded inside `lazy-recorder.js`),
-  autocapture and batching; this benchmark doesn't break it down further. The long tasks are the same
+  mutation of the streamed chat answer and every re-rendered catalogue card
+  and serialises them; the SDKs then size, batch and compress the events.
+  The [CPU profile](#cpu-profile---profile) below splits this up: rrweb
+  itself is the same in both and only about a fifth of the SDK time; most of
+  the rest is replay logic that both SDKs share by design (event size
+  estimates, compression), and our ~11% less script and task time comes
+  from that SDK-side code. The long tasks are the same
   ones in both (SDK and recorder evaluation, the full snapshot, serialising
   large route renders) and slightly shorter in ours.
 - **Interactions stay fast in both.** INP p75 is at the 16 ms floor with or
@@ -290,6 +296,195 @@ load (~30 more rrweb events). rrweb records programmatic input changes as
 at ~3.2 s while the official SDK, which started after those changes, waits for
 the first real mouse move (~8.7 s). Given the same events, both SDKs make the
 same decisions.
+
+#### CPU profile (`--profile`)
+
+Both SDKs record with the same rrweb build (ours loads `/static/1.450.0/recorder.js`,
+rrweb only; official loads `lazy-recorder.js`, rrweb plus upstream's replay
+logic), so the totals above mostly measure rrweb twice. `--profile` says where
+the time goes:
+
+```sh
+npm run bench:session -- --profile                        # plain runs + profiled runs
+npm run bench:session -- --profile-only --profile-window load --runs 3
+npm run bench:session -- --profile --save-profiles /tmp/profs   # keep .cpuprofile files
+node test/bench/profile.mjs /tmp/profs [--update results.json]  # re-attribute saved profiles
+```
+
+After each round of plain runs, every variant runs once more with the CDP
+sampling profiler (`Profiler.setSamplingInterval` 100 µs, same settings for
+every variant). The profiler starts before and stops after the metrics
+snapshots, so the plain runs and their tables are unaffected. Profiling
+added 2-4% to the profiled runs' task time. `--profile-window load` starts
+it before navigation, which adds SDK evaluation, `init` and the first full
+snapshot. `test/bench/profile.mjs` charges the self time of every sample to
+an original file and function, through the source maps (`node:module`
+`SourceMap`, no dependencies): `dist/*.js.map` for ours, and the `.map` files
+next to `array.js`, `lazy-recorder.js` and `recorder.js` for the official
+SDK. Names come from the maps' `names` (terser puts them on the name token,
+Closure on the `function` keyword), then from the original source line, and
+otherwise fall back to `file:line`. It also sorts the time into buckets:
+
+- the page;
+- the SDK bundle;
+- PostHog replay logic: `src/replay/*` in ours, and everything in
+  `lazy-recorder.js` that isn't rrweb;
+- rrweb and its plugins: rrweb-record, the console plugin and the network
+  plugin, in both recorder files;
+- other `/static/` scripts;
+- browser (natives with no JS caller), GC, `(program)` and `(idle)`.
+
+Native callees (`Blob`, `localStorage.setItem`, `closest`, ...) and unmapped
+babel helpers (`_objectSpread2` at the top of both recorder files) are charged
+to their closest JS caller and listed as `[native] X <- caller`. In
+`--profile-window load` profiles Chrome doesn't report natives as separate
+frames, so their time is in the caller's self time.
+
+rrweb sits in both bundles as one pre-built file
+(`rrweb/record/dist/rrweb-record.js`), and its own source map isn't published.
+To get from there to rrweb's TypeScript files, the profiler indexes the
+functions declared in `upstream/packages/rrweb` (same version as 1.450.0; in
+a worktree the profiler finds the main checkout's `upstream/`, or set
+`PH_UPSTREAM`). Every function definition in the bundle whose name is unique
+to one rrweb file anchors its `rrweb-record.js` line to that file. The modules
+come out as contiguous line ranges, e.g. `snapshot.ts` at 1364-2244 and
+`mutation.ts` at 2669-3291. An anonymous function takes the file of the anchor
+before it and is named after the closest definition, e.g.
+`(anonymous, after findStylesheet) rrweb-record.js:1805`, which is
+`serializeElementNode` (terser inlined it into `serializeNode`). rrweb time is
+reported in two ways:
+
+- **by code:** the rrweb file the sampled function lives in;
+- **by context:** the innermost rrweb frame on the stack that says what rrweb is
+  doing. For example, `serializeNodeWithId` under `pushAdd` counts as
+  mutations, and under `takeFullSnapshot` as the full snapshot.
+
+Our chunk builds have no source maps (`build.sh` maps the single-file bundles
+only), so a variant loading chunks would show `[unmapped]` SDK frames.
+`dist/lazy/posthog.js` (the `lazy` variant) and its `.map` are used when they
+exist. They didn't exist for these runs, so the variant was skipped.
+
+**Results** (5 rounds of plain + profiled runs, 60 s journeys, 4x
+throttling, medians, at c661e53; `--profile-window load` with 3 runs for the
+full snapshot). Other agents' Chrome diff tests (`phc-diff-344657`,
+`-369769` and `-391746`) were running on the machine during the measurement
+(load average up to 14 on 24 cores). One profiled official run took about twice
+as long as the others, and the medians absorb it. The plain-run table matched the one above:
+
+| | none | official | ours |
+|---|---|---|---|
+| Δ task / Δ script (plain runs) | - | +2,169 / +1,315 ms | +1,961 / +1,196 ms |
+
+Self time in the measured window, from the profiled runs:
+
+| | no SDK | official | ours |
+|---|---|---|---|
+| Page / app code | 248 ms | 244 ms | 247 ms |
+| SDK bundle (excl. replay logic) | - | 655 ms (36%) | 536 ms (33%) |
+| PostHog replay logic | - | 775 ms (43%) | 690 ms (43%) |
+| **SDK-only** (bundle + replay logic) | - | **1,430 ms** | **1,226 ms (-14%)** |
+| **rrweb** + recorder plugins | - | **379 ms (21%)** | **378 ms (24%)** |
+| SDK total (incl. rrweb) | - | 1,809 ms | 1,604 ms |
+| GC / (program) / natives without a JS caller, Δ vs no SDK | - | +61 / +486 / +76 ms | +57 / +587 / +60 ms |
+| Busy main thread (not idle) | 3.6 s | 6.0 s | 5.9 s |
+
+Percentages are shares of the SDK total. Time by SDK-side activity
+(function-level groups from the same profiles; they overlap the buckets
+above):
+
+| SDK-side activity | official | ours |
+|---|---|---|
+| Event size estimates (`estimateSize`: `JSON.stringify` + `new Blob([json]).size`, per rrweb event) | 309 ms | 296 ms |
+| Compression (`CompressionStream`, checking its output: header and trailer read back from the blob plus a CRC-32 of the input; `serializeForCompression`; fflate / our encoder) | 442 ms | 364 ms |
+| Persistence (`localStorage.setItem`, `document.cookie` reads) | 194 ms | 137 ms |
+| Autocapture, heatmaps, dead clicks | 86 ms | 89 ms |
+| Scroll manager | 56 ms | 55 ms |
+
+rrweb time:
+
+| rrweb by context | official | ours |
+|---|---|---|
+| Mutations (observer callback, `processMutations`, serialising added nodes, removes) | 276 ms (73%) | 266 ms (70%) |
+| Scroll observer (`getWindowScroll`, `emitScrollPosition`, per-target throttle) | 47 ms | 48 ms |
+| Input observer | 24 ms | 30 ms |
+| Helpers with no specific caller (throttle timers, `callbackWrapper`) | 23 ms | 25 ms |
+| Emit / buffering (`wrappedEmit`, record/index.ts) | 8 ms | 7 ms |
+| Mouse move, mouse interaction, selection, stylesheets | ~6 ms | ~7 ms |
+| Full snapshot (load window only: 1,450 nodes at 4x) | 54 ms | 53 ms |
+
+| rrweb by code (file) | official | ours |
+|---|---|---|
+| rrweb utils (`isBlocked`/`closest`, untainted DOM accessors, `throttle`, `getWindowScroll`) | 126 ms | 116 ms |
+| mutation.ts | 75 ms | 72 ms |
+| rrweb-snapshot snapshot.ts (serialisation) | 67 ms | 68 ms |
+| observer.ts | 51 ms | 62 ms |
+| rrweb-snapshot utils.ts (Mirror: `getId`, `add`, `removeNodeFromMap`) | 41 ms | 41 ms |
+| record/index.ts | 34 ms | 33 ms |
+
+Top rrweb functions, ours, measured window. Official is within a few ms of
+each. The full lists are in the console output and the JSON:
+
+- `serializeElementNode`: 27 ms;
+- `serializeNodeWithId`: 17 ms;
+- `processBufferedMutations`: 15 ms;
+- the `callbackWrapper` wrapper: 14 ms;
+- the removed-subtree walk in `genRemoves` (`rrweb-record.js:3273`, fills
+  `removesSubTreeCache`): 12 ms;
+- `pushAdd`: 12 ms;
+- the object-spread helper in the attribute path of `processMutation`: 9 ms;
+- `removeNodeFromMap`: 9 ms;
+- `isBlocked` + `closest`: 14 ms;
+- the untainted `childNodes` / `parentNode` accessors (`getUntaintedAccessor`,
+  `getUntaintedMethod`, native getters): about 20 ms;
+- `getWindowScroll` + `emitScrollPosition`: 14 ms.
+
+How to read it:
+
+- **rrweb is the same in both, so there is no parity gap there.** 379 vs
+  378 ms over the session, 438 vs 446 ms from navigation. The activity split
+  matches within noise, and so do the event counts: 684-686 rrweb events
+  with one full snapshot. The two SDKs pass the same record options.
+- **SDK-only, ours is about 14% cheaper:** 1,226 vs 1,430 ms in the window,
+  1,344 vs 1,550 ms from navigation. The SDK bundle is 18% cheaper (less
+  persistence work: 137 vs 194 ms in `localStorage` and cookie reads). The
+  replay logic is 11% cheaper (compression 364
+  vs 442 ms). This is where the ~11% difference in plain task and script
+  time comes from.
+- **rrweb is not the dominant cost.** It is about a fifth of the SDK's JS
+  time: 378 ms of a 5.9 s busy main thread (6%), or about 0.6% of the 60 s
+  session at 4x throttling. Two pieces of replay logic shared by both SDKs
+  each cost about as much as all of rrweb:
+  - the size estimate, mostly the `Blob` constructor: a `Blob` per rrweb event
+    only to read `.size`;
+  - compression.
+- **What optimising rrweb could gain.** On this app rrweb does mutation work:
+  the chat re-renders the whole answer on every streamed token. At best that
+  is a few hundred ms per minute at 4x, perhaps 100-200 ms (5-10% of the SDK
+  overhead) without changing what is recorded:
+  - *Addressable without changing the output:*
+    - caching `isBlocked`/`closest` per node within a mutation batch;
+    - avoiding the full removed-subtree walk in `genRemoves` and the recursive
+      `removeNodeFromMap` (both re-walk every removed answer subtree through
+      the untainted `childNodes` accessor);
+    - cheaper untainted accessors (the getter `.call` per node);
+    - the babel object-spread helper in the attribute path, which is in
+      `recorder.js` because it is transpiled;
+    - scroll handling: a `setTimeout` per throttled wheel event, plus a
+      `getWindowScroll` read per event.
+  - *Needs recording-semantics changes:* the bulk of mutation cost is
+    serialising the re-added nodes (`serializeElementNode`,
+    `serializeNodeWithId`, `_serializedNode`, Mirror `add`), and that is
+    proportional to what the page re-renders. Reducing it means recording
+    less: coalescing mutations across frames, diffing re-rendered subtrees
+    instead of re-adding them, or throttling high-frequency text mutations.
+    Each of these changes the event stream and the replay. The full snapshot
+    (~54 ms once) and stylesheet handling (<5 ms) aren't worth attacking
+    here.
+- **Bigger, simpler wins sit outside rrweb.** Replacing
+  `new Blob([json]).size` with a UTF-8 byte count gives the same number
+  without the blob allocation (the `Blob` constructor alone is 265-280 ms here; a byte-count loop would cost a fraction of that). Compression could check its
+  output more cheaply (two blob reads and a CRC-32 per compressed event). Both are in the shared replay logic, so
+  they would apply to either SDK, and neither changes what is sent.
 
 
 ## Layout
