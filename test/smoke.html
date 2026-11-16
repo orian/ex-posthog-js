@@ -1,0 +1,45 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>smoke</title></head>
+<body>
+<h1 id="hero">Old</h1>
+<pre id="out">pending</pre>
+<script>
+  // Stub the network: record requests, answer /flags/ and /api/web_experiments/.
+  var sent = [];
+  window.fetch = function (url, init) {
+    sent.push({url: url, method: (init && init.method) || 'GET'});
+    var body = /\/flags\//.test(url)
+      ? {flags: {f: {key: 'f', enabled: true, variant: 'test', metadata: {}}}}
+      : /web_experiments/.test(url)
+      ? {experiments: [{id: 1, name: 'x', feature_flag_key: 'f', variants: {test: {transforms: [{selector: '#hero', text: 'New'}]}}}]}
+      : {status: 1};
+    return Promise.resolve({status: 200, text: function () { return Promise.resolve(JSON.stringify(body)); }});
+  };
+  // headless-shell's UA says "HeadlessChrome", which the SDK (like upstream)
+  // treats as a bot. Pretend to be regular Chrome for this smoke test.
+  Object.defineProperty(navigator, 'userAgent', {get: function () {
+    return 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+  }});
+  Object.defineProperty(navigator, 'webdriver', {get: function () { return false; }});
+  var errors = [];
+  window.onerror = function (m) { errors.push(String(m)); };
+</script>
+<script src="../dist/chunks/core.js"></script>
+<script>
+  posthog.init('phc_smoke', {api_host: 'https://example.invalid', request_queue_config: {flush_interval_ms: 50}});
+  posthog.capture('smoke', {n: 1});
+</script>
+<script src="../dist/chunks/flags.js"></script>
+<script src="../dist/chunks/experiments.js"></script>
+<script>
+  setTimeout(function () {
+    document.getElementById('out').textContent = JSON.stringify({
+      errors: errors,
+      flag: posthog.getFeatureFlag('f'),
+      hero: document.getElementById('hero').textContent,
+      distinct: !!posthog.get_distinct_id(),
+      paths: sent.map(function (r) { return r.url.replace(/\?.*/, ''); }).sort()
+    });
+  }, 600);
+</script>
+</body></html>

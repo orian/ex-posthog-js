@@ -1,0 +1,15 @@
+{
+  "name": "posthog-js-closure",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PostHog browser SDK rewritten in plain JS for Google Closure Compiler (ADVANCED), with optional feature-flag and web-experiment modules.",
+  "type": "module",
+  "scripts": {
+    "build": "./scripts/build.sh",
+    "test": "node test/run.mjs",
+    "test:source": "node test/run.mjs source",
+    "test:compiled": "node test/run.mjs compiled",
+    "test:chrome": "node test/smoke-chrome.mjs"
+  },
+  "license": "MIT"
+}
