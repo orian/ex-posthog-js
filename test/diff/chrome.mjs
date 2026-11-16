@@ -70,6 +70,7 @@ export async function launchChrome() {
             await s('Network.enable')
             await s('Network.setUserAgentOverride', { userAgent })
             const consoleErrors = []
+            const handlers = {} // CDP event name -> [handler] (page.on)
             // Trusted input for scenarios: the page calls window.__cdpInput(JSON.stringify({id, method, params}))
             // with an Input.* CDP method; we run it and call back window.__cdpInputDone(id, error).
             await s('Runtime.addBinding', { name: '__cdpInput' })
@@ -86,6 +87,7 @@ export async function launchChrome() {
             }
             listeners.push((msg) => {
                 if (msg.sessionId !== sessionId) return
+                for (const h of handlers[msg.method] || []) h(msg.params)
                 if (msg.method === 'Runtime.exceptionThrown') {
                     consoleErrors.push(msg.params.exceptionDetails.exception?.description || msg.params.exceptionDetails.text)
                 }
@@ -98,6 +100,10 @@ export async function launchChrome() {
                 consoleErrors,
                 /** Raw CDP call on this page's session (e.g. Emulation.setCPUThrottlingRate). */
                 cdp: s,
+                /** Subscribes to a CDP event of this page's session (e.g. Fetch.requestPaused). */
+                on(event, handler) {
+                    (handlers[event] = handlers[event] || []).push(handler)
+                },
                 async goto(url, referrer) {
                     await s('Page.navigate', { url, referrer })
                 },

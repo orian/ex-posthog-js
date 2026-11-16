@@ -11,7 +11,13 @@ import { ROOT } from '../harness.mjs'
 export const OFFICIAL_VERSION = '1.450.0'
 const VENDOR = path.join(ROOT, 'test/diff/vendor', `posthog-js-${OFFICIAL_VERSION}`, 'dist')
 
-const TYPES = { '.js': 'application/javascript', '.html': 'text/html', '.json': 'application/json', '.map': 'application/json' }
+const TYPES = { '.js': 'application/javascript', '.html': 'text/html', '.json': 'application/json', '.map': 'application/json', '.css': 'text/css', '.svg': 'image/svg+xml' }
+
+// Static directory mounts: URL prefix -> directory. Paths without a file extension that
+// don't exist fall back to the mount's index.html (single page apps with pushState routes).
+const MOUNTS = {
+    '/site/': path.join(ROOT, 'test/bench/site'), // the session benchmark's demo app
+}
 
 /** Decodes a request body the way the PostHog ingestion server does. */
 function decodeBody(buf, url, contentType) {
@@ -50,6 +56,9 @@ export function startServer({ port = 0 } = {}) {
         const chunks = []
         req.on('data', (c) => chunks.push(c))
         req.on('end', () => {
+            // SDK bundles are also served from the API host: the session benchmark loads them from
+            // api_host when it injects an SDK into an arbitrary (possibly https) site.
+            if (url.pathname.startsWith('/sdk/')) return statics(res, url)
             if (host.startsWith('ph.')) return api(req, res, url, Buffer.concat(chunks))
             if (url.pathname === '/__echo') return echo(req, res, url, host, Buffer.concat(chunks))
             return statics(res, url)
@@ -84,6 +93,7 @@ export function startServer({ port = 0 } = {}) {
             query: Object.fromEntries(url.searchParams),
             contentType: req.headers['content-type'],
             bytes: body.length, // on-the-wire request body size (benchmarks)
+            at: Date.now(), // receive time (benchmarks)
             body: decodeBody(body, url, req.headers['content-type']),
         }
         state.log.push(entry)
@@ -108,6 +118,7 @@ export function startServer({ port = 0 } = {}) {
         let file
         if (url.pathname.startsWith('/sdk/official/')) file = path.join(VENDOR, path.basename(url.pathname))
         else if (url.pathname.startsWith('/sdk/ours/')) file = path.join(ROOT, 'dist', url.pathname.slice('/sdk/ours/'.length))
+        else if (mountFor(url.pathname)) file = mountFor(url.pathname)
         else file = path.join(ROOT, 'test/diff/pages', path.basename(url.pathname))
         sendFile(res, file)
     }
@@ -127,6 +138,16 @@ export function startServer({ port = 0 } = {}) {
         })
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
         res.end(JSON.stringify({ ok: true }))
+    }
+
+    function mountFor(pathname) {
+        const prefix = Object.keys(MOUNTS).find((p) => pathname === p.slice(0, -1) || pathname.startsWith(p))
+        if (!prefix) return null
+        const dir = MOUNTS[prefix]
+        const file = path.join(dir, path.normalize('/' + pathname.slice(prefix.length)))
+        if (!file.startsWith(dir)) return null
+        if (fs.existsSync(file) && fs.statSync(file).isFile()) return file
+        return path.extname(file) ? file : path.join(dir, 'index.html')
     }
 
     function sendFile(res, file) {

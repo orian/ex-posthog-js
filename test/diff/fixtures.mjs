@@ -196,3 +196,20 @@ Object.assign(RESPONSES, {
     // toolbar: the versioned script 404s, so the legacy `?v=&t=` URL is loaded (see server.mjs).
     toolbar_fallback: { versionedToolbar: { status: 404 } },
 })
+
+// ---- session benchmark (test/bench/session.mjs) ------------------------------------
+/**
+ * Responses for the session benchmark: the default fixtures plus a remote config with
+ * session replay and autocapture on, served for `token`. `overrides` is merged on top
+ * of the remote config (`sessionRecording` is merged into the recording config).
+ */
+export function benchResponses(token = 'phc_diff', overrides = {}) {
+    const { sessionRecording, ...rest } = overrides
+    const config = { ...REMOTE_CONFIG, token, ...rest,
+        sessionRecording: sessionRecording === false ? false : { ...RECORDING, ...(sessionRecording || {}) } }
+    return {
+        ...RESPONSES.default,
+        [`/array/${token}/config`]: { body: config },
+        [`/array/${token}/config.js`]: { script: `(function(){window._POSTHOG_REMOTE_CONFIG = window._POSTHOG_REMOTE_CONFIG || {}; window._POSTHOG_REMOTE_CONFIG[${JSON.stringify(token)}] = {config: ${JSON.stringify(config)}, siteApps: []}})()` },
+    }
+}
