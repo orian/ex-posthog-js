@@ -4,10 +4,11 @@
 #   dist/posthog.core.js        core only (no flags, no experiments)
 #   dist/posthog.core-flags.js  core + feature flags
 #   dist/posthog.full.js        core + feature flags + web experiments
-#   dist/chunks/{core,flags,experiments}.js
+#   dist/chunks/{core,flags,experiments,replay}.js
 #                               the same code split into Closure chunks:
 #                               load core.js, then optionally flags.js, then
 #                               optionally experiments.js (any time later).
+#                               replay.js (session replay) needs only core.js.
 #
 # Env: CLOSURE_IMAGE (default posthog-closure-compiler:v20261109),
 #      EXTRA_FLAGS (appended to every compile, e.g. "--debug --formatting=PRETTY_PRINT").
@@ -51,6 +52,12 @@ CORE_FILES=(
 )
 FLAGS_FILES=(src/flags/feature-flags.js src/flags/index.js)
 EXPERIMENTS_FILES=(src/experiments/sanitizer.js src/experiments/web-experiments.js src/experiments/index.js)
+# Session replay (needs only core; rrweb itself is loaded at runtime from /static/recorder.js).
+REPLAY_FILES=(
+  src/replay/constants.js src/replay/sampling.js src/replay/trigger-matching.js src/replay/recording-strategies.js
+  src/replay/utils.js src/replay/gzip-field.js src/replay/json-ld.js src/replay/recorder.js
+  src/replay/session-recording.js src/replay/index.js
+)
 
 WRAPPER='(function(){%output%}).call(this);'
 
@@ -69,22 +76,24 @@ bundle() { # name entry files...
 
 bundle posthog.core src/entry/core.js "${CORE_FILES[@]}"
 bundle posthog.core-flags src/entry/core-flags.js "${CORE_FILES[@]}" "${FLAGS_FILES[@]}" src/entry/core-flags.js
-bundle posthog.full src/entry/full.js "${CORE_FILES[@]}" "${FLAGS_FILES[@]}" "${EXPERIMENTS_FILES[@]}" src/entry/full.js
+bundle posthog.full src/entry/full.js "${CORE_FILES[@]}" "${FLAGS_FILES[@]}" "${EXPERIMENTS_FILES[@]}" "${REPLAY_FILES[@]}" src/entry/full.js
 
 # Chunked build. Chunks share renamed symbols through the global `__phc`
 # namespace object, so later chunks can be loaded on demand.
 CHUNK_WRAPPER='(function(){%s}).call(this);'
-echo "-> dist/chunks/{core,flags,experiments}.js"
+echo "-> dist/chunks/{core,flags,experiments,replay}.js"
 args=()
-for f in "${CORE_FILES[@]}" "${FLAGS_FILES[@]}" "${EXPERIMENTS_FILES[@]}"; do args+=(--js "$f"); done
+for f in "${CORE_FILES[@]}" "${FLAGS_FILES[@]}" "${EXPERIMENTS_FILES[@]}" "${REPLAY_FILES[@]}"; do args+=(--js "$f"); done
 closure "${args[@]}" \
   --rename_prefix_namespace __phc \
   --chunk "core:${#CORE_FILES[@]}" \
   --chunk "flags:${#FLAGS_FILES[@]}:core" \
   --chunk "experiments:${#EXPERIMENTS_FILES[@]}:flags" \
+  --chunk "replay:${#REPLAY_FILES[@]}:core" \
   --chunk_wrapper "core:var __phc=window.__phc=window.__phc||{};${CHUNK_WRAPPER}" \
   --chunk_wrapper "flags:${CHUNK_WRAPPER}" \
   --chunk_wrapper "experiments:${CHUNK_WRAPPER}" \
+  --chunk_wrapper "replay:${CHUNK_WRAPPER}" \
   --chunk_output_path_prefix dist/chunks/
 
 echo

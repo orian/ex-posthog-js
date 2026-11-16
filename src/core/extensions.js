@@ -200,3 +200,27 @@ export class FeatureFlagsApi {
    */
   updateEarlyAccessFeatureEnrollment(key, isEnrolled, stage) {}
 }
+
+/**
+ * Contract the core relies on for the session replay module (upstream's
+ * `posthog.sessionRecording` calls in posthog-core.ts). Implemented by
+ * src/replay/session-recording.js.
+ * @record
+ * @extends {Extension}
+ */
+export class SessionRecordingApi {
+  constructor() {}
+  /** @return {boolean} */
+  isStarted() {}
+  /** @param {string=} startReason */
+  startIfEnabledOrStop(startReason) {}
+  /** @param {boolean=} discardBufferedEvents */
+  disposeRecording(discardBufferedEvents) {}
+  /** @return {!Object} */
+  getSdkDebugProperties() {}
+  flushBeforeIdentityReset() {}
+  overrideSampling() {}
+  overrideLinkedFlag() {}
+  /** @param {string} triggerType */
+  overrideTrigger(triggerType) {}
+}
