@@ -18,20 +18,41 @@ not ported yet.
 
 ## Size and performance vs the official SDK
 
-Measured against official posthog-js 1.450.0 (`array.js`, the CDN bundle) on the
-same page in headless Chrome with 4x CPU throttling, medians of 7 runs
-(`./scripts/build.sh && node test/diff/bench.mjs`). Absolute times vary with
-machine load; the ratios were stable across runs.
+Measured against official posthog-js 1.450.0 on the same page in headless
+Chrome with 4x CPU throttling (roughly a mid-range phone), medians of 7 runs
+(`./scripts/build.sh && node test/diff/bench.mjs`), on main at beabc10.
+Absolute times vary with machine load; the ratios were stable across runs.
+
+### Speed
 
 | | official `array.js` | ours `posthog.full.js` | ours `posthog.core.js` |
 |---|---|---|---|
-| SDK script, gzip | 122 KB | 88.9 KB | 35.0 KB |
-| SDK script, raw | 372 KB | 248 KB | 94 KB |
-| Script download + parse + eval | 1x | ~0.55-0.7x | ~0.35-0.6x |
-| `posthog.init()` | 1x | ~0.55-0.7x | ~0.3-0.5x |
-| 1000 `capture()` calls (incl. client rate limiting) | 1x | ~0.45-0.5x | ~0.25-0.5x |
-| Extra scripts at startup | `surveys.js` | none | none |
-| Extra scripts with replay on | `surveys.js`, `lazy-recorder.js` (72.5 KB gzip) | `recorder.js` (46.5 KB gzip) | n/a (no replay module) |
+| Script download + parse + eval | 36.5-40.4 ms (1x) | 21.5-22.5 ms (~0.55-0.6x) | 17.6-18.4 ms (~0.45x) |
+| `posthog.init()` | 26.3-27.2 ms (1x) | 16.3-17.7 ms (~0.6-0.67x) | 11.7-12.7 ms (~0.45x) |
+| 1000 `capture()` calls (incl. client rate limiting) | 513-553 ms (1x) | ~261 ms (~0.5x) | 255-268 ms (~0.5x) |
+| Long tasks during the test | 1 (558-599 ms) | 1 (283-288 ms) | 1 (273-290 ms) |
+
+### Size (gzip)
+
+Upstream's CDN `array.js` is the core plus every module's *shell*; the heavy
+parts are lazy-loaded from `/static/` when a feature turns on (`array.full.js`
+bundles most of them). Our `posthog.full.js` has everything we ported compiled
+in; only PostHog's rrweb fork (`recorder.js`) is downloaded, when replay is on.
+
+| | official | ours |
+|---|---|---|
+| Core only | `module.slim` 54.0 KB (npm build) | `posthog.core.js` 35.2 KB |
+| Main CDN script | `array.js` 122.4 KB | `posthog.full.js` 110.8 KB (309.5 KB raw vs 372 KB) |
+| Downloaded at startup, default setup | `array.js` + `surveys.js` (48.7 KB, fetched even with surveys off) = 171 KB | 110.8 KB |
+| With replay, exceptions, dead clicks, web vitals, tracing headers and logs on | ~271 KB (adds `lazy-recorder.js` 72.5, `exception-autocapture.js` 6.5, `dead-clicks-autocapture.js` 8.5, `web-vitals-with-attribution.js` 7.0, `tracing-headers.js` 2.6, `logs.js` 2.8) | ~157 KB (adds `recorder.js` 46.5) |
+| Single file with replay included | `array.full.js` 231 KB (also includes surveys) | none |
+
+The main-script gap is smaller than the download gap because about 50-55 KB of
+`posthog.full.js` (replay logic 23.3, exceptions 8.4, logs/metrics/otlp 13.5,
+web vitals 7.8, tracing headers 2.7) is code `array.js` only fetches when the
+feature is on. Per-module chunk sizes are in the Build section; core + flags
+alone is about 44 KB. Surveys, product tours and conversations are not ported,
+so part of upstream's size has no counterpart here.
 
 Other differences besides size and speed:
 
