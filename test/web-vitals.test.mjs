@@ -61,8 +61,7 @@ function fakePostHog(config = {}, { cookieless = false, persisted = {} } = {}) {
 
 function start(config, opts) {
     const ph = fakePostHog(config, opts)
-    const wv = new WebVitalsAutocapture(ph)
-    wv.onInit()
+    const wv = new WebVitalsAutocapture(ph) // starts from its constructor, like upstream
     return { ph, wv }
 }
 const webVitalsEvents = (ph) => ph.captured.filter((c) => c.event === '$web_vitals')

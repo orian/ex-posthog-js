@@ -23,7 +23,10 @@ import {isLikelyBot} from './user-agent.js';
 import {uuidv7} from './uuid.js';
 import {logger} from './logger.js';
 import {localStore, sessionStore} from './storage.js';
-import {ExceptionsApi, Extension, FeatureFlagsApi, SessionRecordingApi, attachAllExtensions, findExtensionFactory} from './extensions.js';
+import {
+  ExceptionsApi, Extension, FeatureFlagsApi, SessionRecordingApi, UPSTREAM_CREATE_ORDER, UPSTREAM_INIT_ORDER,
+  UPSTREAM_REMOTE_CONFIG_ORDER, attachAllExtensions, findExtensionFactory, inUpstreamOrder,
+} from './extensions.js';
 import {LogsApi, MetricsApi, ToolbarApi} from './extensions.js';
 import {
   addEventListener, assign, copyAndTruncateStrings, doc, each, extend, getCookieValue, getPersonPropertiesHash,
@@ -754,10 +757,43 @@ export class PostHog {
    * @param {function(?): !Extension} factory
    */
   attachExtension(name, factory) {
-    if (this.extensions[name]) return;
+    if (this.createExtension_(name, factory)) this.initExtension_(name);
+  }
+
+  /**
+   * Attaches the modules registered before init, like upstream's
+   * `_initExtensions`: all are created first, then initialised, each phase in
+   * upstream's order (see UPSTREAM_CREATE_ORDER), so features start, and
+   * request their lazily loaded parts, in the same order as upstream's.
+   * @param {!Array<{name: string, factory: function(?): !Extension}>} list in registration order
+   */
+  attachExtensions(list) {
+    const factories = {};
+    list.forEach(function(f) {
+      factories[f.name] = f.factory;
+    });
+    const self = this;
+    const created = inUpstreamOrder(list.map(function(f) {
+      return f.name;
+    }), UPSTREAM_CREATE_ORDER).filter(function(name) {
+      return self.createExtension_(name, factories[name]);
+    });
+    inUpstreamOrder(created, UPSTREAM_INIT_ORDER).forEach(function(name) {
+      self.initExtension_(name);
+    });
+  }
+
+  /**
+   * @param {string} name
+   * @param {function(?): !Extension} factory
+   * @return {boolean} whether it was created
+   * @private
+   */
+  createExtension_(name, factory) {
+    if (this.extensions[name]) return false;
     // Like upstream, session replay is not created in cookieless mode (it is
     // created when opting in from cookieless `on_reject` mode).
-    if (name === 'sessionRecording' && !this.sessionManager) return;
+    if (name === 'sessionRecording' && !this.sessionManager) return false;
     let ext;
     try {
       ext = factory(this);
@@ -767,7 +803,7 @@ export class PostHog {
       this[name] = ext;
     } catch (e) {
       logger.critical('failed to initialise extension ' + name, e);
-      return;
+      return false;
     }
     const self = this;
     if (name === 'featureFlags') {
@@ -776,6 +812,17 @@ export class PostHog {
         self.emitter_.emit('featureFlagsReloading', true);
       });
     }
+    return true;
+  }
+
+  /**
+   * onInit, then the last remote config for a module attached after it arrived.
+   * @param {string} name
+   * @private
+   */
+  initExtension_(name) {
+    const ext = this.extensions[name];
+    if (!ext) return;
     try {
       if (ext.onInit) ext.onInit();
     } catch (e) {
@@ -858,7 +905,7 @@ export class PostHog {
     });
     this.emitter_.emit('extensionsRemoteConfig', config);
     const self = this;
-    this.extensionOrder_.forEach(function(name) {
+    inUpstreamOrder(this.extensionOrder_, UPSTREAM_REMOTE_CONFIG_ORDER).forEach(function(name) {
       const ext = self.extensions[name];
       if (ext && ext.onRemoteConfig) {
         try {

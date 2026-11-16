@@ -96,8 +96,52 @@ export function findExtensionFactory(name) {
  */
 export function attachAllExtensions(instance) {
   if (liveInstances.indexOf(instance) === -1) liveInstances.push(instance);
-  factories.slice().forEach(function(f) {
-    instance.attachExtension(f.name, f.factory);
+  instance.attachExtensions(factories.slice());
+}
+
+/**
+ * Upstream `_initExtensions` creates the extensions in this order (some start
+ * from their constructor, e.g. web vitals, exception autocapture, dead
+ * clicks)...
+ * @const {!Array<string>}
+ */
+export const UPSTREAM_CREATE_ORDER = ['exceptions', 'tracingHeaders', 'sessionRecording', 'autocapture', 'logs',
+  'metrics', 'heatmaps', 'webVitalsAutocapture', 'exceptionObserver', 'deadClicksAutocapture', 'toolbar',
+  'experiments'];
+
+/**
+ * ...then runs its init tasks: the shared extensions' setup (autocapture,
+ * logs), then every other extension's initialize(), in creation order...
+ * @const {!Array<string>}
+ */
+export const UPSTREAM_INIT_ORDER = ['autocapture', 'logs', 'exceptions', 'tracingHeaders', 'sessionRecording',
+  'metrics', 'heatmaps', 'webVitalsAutocapture', 'exceptionObserver', 'deadClicksAutocapture', 'toolbar',
+  'experiments'];
+
+/**
+ * ...and hands the remote config to those extensions in creation order.
+ * @const {!Array<string>}
+ */
+export const UPSTREAM_REMOTE_CONFIG_ORDER = ['exceptions', 'tracingHeaders', 'sessionRecording', 'metrics', 'heatmaps',
+  'webVitalsAutocapture', 'exceptionObserver', 'deadClicksAutocapture', 'toolbar', 'experiments'];
+
+/**
+ * Reorders the names that appear in `order` among themselves to follow it;
+ * other names keep their places. Upstream's order decides when each lazily
+ * loaded part is requested, so the lazy build must follow it.
+ * @param {!Array<string>} names
+ * @param {!Array<string>} order
+ * @return {!Array<string>}
+ */
+export function inUpstreamOrder(names, order) {
+  const listed = names.filter(function(n) {
+    return order.indexOf(n) !== -1;
+  }).sort(function(a, b) {
+    return order.indexOf(a) - order.indexOf(b);
+  });
+  let next = 0;
+  return names.map(function(n) {
+    return order.indexOf(n) !== -1 ? listed[next++] : n;
   });
 }
 

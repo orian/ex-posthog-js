@@ -170,10 +170,8 @@ export class WebVitalsAutocapture {
     this.addToBuffer = function(metric) {
       self.add_(metric);
     };
-  }
-
-  /** Upstream starts from the constructor. */
-  onInit() {
+    // Like upstream, from the constructor: before the extensions created after
+    // it are initialised (this is when the lazy build requests its chunk).
     this.startIfEnabled();
   }
 
