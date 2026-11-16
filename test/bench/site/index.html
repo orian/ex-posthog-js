@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lumen AI: the assistant for your whole team</title>
+  <meta name="description" content="Lumen AI demo app (benchmark fixture). Deterministic, self-contained, no external assets.">
+  <link rel="stylesheet" href="/site/app.css">
+</head>
+<body>
+  <!-- Benchmark fixture: a plain-JS single page app in the style of an "AI SaaS" product.
+       It knows nothing about analytics: test/bench/session.mjs injects the SDK under test. -->
+  <header class="topbar">
+    <div class="container topbar-inner">
+      <a class="logo" href="/site/" data-link><svg viewBox="0 0 32 32"><defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7c5cff"/><stop offset="1" stop-color="#29d3a3"/></linearGradient></defs><rect width="32" height="32" rx="8" fill="url(#lg)"/><path d="M9 22V10h3v9.5h7V22z" fill="#fff"/></svg>Lumen AI</a>
+      <nav class="nav" id="nav">
+        <a href="/site/" data-link data-route="home">Product</a>
+        <a href="/site/chat" data-link data-route="chat">Chat</a>
+        <a href="/site/pricing" data-link data-route="pricing">Pricing</a>
+        <div class="nav-menu" id="resources-menu">
+          <button type="button">Resources</button>
+          <div class="menu" id="resources-list"></div>
+        </div>
+        <a href="/site/settings" data-link data-route="settings">Settings</a>
+      </nav>
+      <div class="topbar-actions">
+        <a class="btn btn-ghost btn-sm" href="/site/signup" data-link id="signin">Sign in</a>
+        <a class="btn btn-primary btn-sm" href="/site/signup" data-link id="get-started">Get started</a>
+        <div class="avatar" title="Ada Lovelace">AL</div>
+      </div>
+    </div>
+  </header>
+  <main id="app"></main>
+  <footer class="footer" id="footer"></footer>
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+  <div id="modal-root"></div>
+  <script src="/site/app.js"></script>
+</body>
+</html>
