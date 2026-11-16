@@ -51,6 +51,7 @@ export function startServer({ port = 0 } = {}) {
         req.on('data', (c) => chunks.push(c))
         req.on('end', () => {
             if (host.startsWith('ph.')) return api(req, res, url, Buffer.concat(chunks))
+            if (url.pathname === '/__echo') return echo(req, res, url, host, Buffer.concat(chunks))
             return statics(res, url)
         })
     })
@@ -98,6 +99,23 @@ export function startServer({ port = 0 } = {}) {
         else if (url.pathname.startsWith('/sdk/ours/')) file = path.join(ROOT, 'dist', url.pathname.slice('/sdk/ours/'.length))
         else file = path.join(ROOT, 'test/diff/pages', path.basename(url.pathname))
         sendFile(res, file)
+    }
+
+    // Any non-PostHog host: /__echo records the page's request (host, method,
+    // query, every request header and the body) in the log, so scenarios can
+    // compare what the SDKs added to the app's own requests (e.g. tracing headers).
+    function echo(req, res, url, host, body) {
+        const headers = {}
+        for (const k of Object.keys(req.headers).sort()) headers[k] = req.headers[k]
+        state.log.push({
+            method: req.method,
+            path: url.pathname,
+            query: Object.fromEntries(url.searchParams),
+            contentType: req.headers['content-type'],
+            body: { host, headers, body: body.length ? body.toString('utf8') : undefined },
+        })
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+        res.end(JSON.stringify({ ok: true }))
     }
 
     function sendFile(res, file) {

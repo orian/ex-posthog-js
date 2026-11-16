@@ -618,6 +618,57 @@ Object.assign(scenarios, {
     },
 })
 
+// ---- Web vitals and tracing headers ----------------------------------------------
+Object.assign(scenarios, {
+    'web vitals and tracing headers: remote switch persisted, fetch patched': {
+        builds: ['full'],
+        async run(load) {
+            const { b, ph } = await load()
+            ph.init(TOKEN, { ...FAST, capture_pageview: false, tracing_headers: ['api.example.com'] })
+            assert.equal(ph.webVitalsAutocapture.isEnabled, false, 'waits for the remote config')
+            await sleep(100)
+            assert.equal(ph.webVitalsAutocapture.isEnabled, false, 'capturePerformance: false')
+            assert.deepEqual(ph.webVitalsAutocapture.allowedMetrics, ['CLS', 'FCP', 'INP', 'LCP'])
+            await b.window.fetch('https://api.example.com/x')
+            await b.window.fetch('https://other.example.com/y')
+            ph.capture('x')
+            await sleep(FLUSH)
+            const p = events(b).find((e) => e.event === 'x').properties
+            assert.equal(p.$web_vitals_enabled_server_side, false)
+            const [api, other] = ['/x', '/y'].map((path) => b.requests.find((r) => r.path === path))
+            assert.equal(new Headers(api.headers).get('X-POSTHOG-SESSION-ID'), p.$session_id)
+            assert.equal(new Headers(api.headers).get('X-POSTHOG-WINDOW-ID'), p.$window_id)
+            assert.equal(new Headers(api.headers).get('X-POSTHOG-DISTINCT-ID'), p.distinct_id)
+            assert.equal(other.headers, undefined)
+        },
+    },
+
+    'chunks: web vitals and tracing headers can be loaded after init': {
+        builds: ['chunks'],
+        async run() {
+            const b = createBrowser({ respond: defaultRouter })
+            b.loadScript('dist/chunks/core.js')
+            const ph = b.window.posthog
+            ph.init(TOKEN, { ...FAST, capture_pageview: false, addTracingHeaders: ['api.example.com'] })
+            await sleep(100)
+            assert.equal(ph.webVitalsAutocapture, undefined)
+            const nativeFetch = b.window.fetch
+            b.loadScript('dist/chunks/webvitals.js')
+            b.loadScript('dist/chunks/tracingheaders.js')
+            // The late modules got the remote config and the config straight away.
+            assert.equal(ph.webVitalsAutocapture.isEnabled, false)
+            assert.notEqual(b.window.fetch, nativeFetch)
+            ph.capture('after')
+            await sleep(FLUSH)
+            assert.equal(events(b).find((e) => e.event === 'after').properties.$web_vitals_enabled_server_side, false)
+            ph.set_config({ addTracingHeaders: [] })
+            assert.equal(b.window.fetch, nativeFetch, 'patches removed')
+            // Web vitals are compiled in: no /static/web-vitals*.js request.
+            assert.ok(!b.requests.some((r) => /web-vitals|tracing-headers/.test(r.path)))
+        },
+    },
+})
+
 /** Build name -> how to load it. */
 export const BUILDS = {
     core: { file: 'dist/posthog.core.js', source: 'src/entry/core.js' },

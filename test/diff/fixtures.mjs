@@ -93,7 +93,6 @@ Object.assign(RESPONSES, {
 /** Paths (regex on the diff location) whose differences are expected. Keep this short and justified. */
 export const ALLOWED = [
     /\.properties\.\$lib_version$/, // different SDK
-    /\.properties\.\$web_vitals_enabled_server_side$/, // TODO(module): web vitals (persisted from remote config)
 ]
 
 // ---- Autocapture, heatmaps and dead clicks scenarios -------------------------
@@ -173,4 +172,18 @@ Object.assign(RESPONSES, {
             { id: 'g-never', name: 'Never', sampleRate: 0, conditions: { matchType: 'all', urls: [{ url: '/never', matching: 'regex' }] } },
         ],
     }),
+})
+
+// ---- web vitals and tracing headers ------------------------------------------------
+const WEB_VITALS_ON = remoteConfig({ ...REMOTE_CONFIG, capturePerformance: { network_timing: false, web_vitals: true } })
+Object.assign(RESPONSES, {
+    wv_remote_on: WEB_VITALS_ON,
+    wv_remote_off: remoteConfig({ ...REMOTE_CONFIG, capturePerformance: { network_timing: true, web_vitals: false } }),
+    wv_allowed_metrics: remoteConfig({ ...REMOTE_CONFIG,
+        capturePerformance: { web_vitals: true, web_vitals_allowed_metrics: ['FCP', 'LCP'] } }),
+    wv_client_config: RESPONSES.remote_config_failure,
+    wv_real_metrics: WEB_VITALS_ON,
+    wv_flush_unload: WEB_VITALS_ON,
+    wv_flush_timer: WEB_VITALS_ON,
+    wv_external_loading_disabled: WEB_VITALS_ON,
 })

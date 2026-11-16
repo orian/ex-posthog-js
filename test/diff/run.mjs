@@ -125,7 +125,27 @@ function normaliseUrls(value) {
 // response `date` header and Chrome's navigation `confidence` (system load).
 const NETWORK_VOLATILE = /(Start|End|Time|duration|timeOrigin|Size|Complete|Interactive)$/
 
-function normalise(value, ids, key, inNetwork) {
+// Web vitals: metric values (`value`, `delta`, `$web_vitals_<metric>_value`) and
+// attribution timings are measured by the browser for each page load; the
+// metric `id` is `v6-<Date.now()>-<random>`. FCP happens while the page is
+// loading, so its attribution `loadState` (FCP time vs the DOM milestones of
+// this load) is a timing too. Presence is still compared, and so are names,
+// ratings, navigation fields, URLs, targets and the other load states.
+const WEB_VITALS_VOLATILE = new Set(['value', 'delta', 'id', 'inputDelay', 'processingDuration', 'presentationDelay',
+    'timeToFirstByte', 'resourceLoadDelay', 'resourceLoadDuration', 'elementRenderDelay', 'largestShiftTime',
+    'largestShiftValue', 'firstByteToFCP'])
+const WEB_VITALS_EVENT = /^\$web_vitals_(LCP|CLS|FCP|INP)_event$/
+const WEB_VITALS_VALUE = /^\$web_vitals_(LCP|CLS|FCP|INP)_value$/
+// A W3C traceparent is a fresh random trace and span id per request: only its format is compared.
+const TRACEPARENT = /^00-(?!0{32})[0-9a-f]{32}-(?!0{16})[0-9a-f]{16}-01$/
+
+function normalise(value, ids, key, inNetwork, inWebVitals) {
+    if (inWebVitals && WEB_VITALS_VOLATILE.has(key) && typeof value === 'number') return '<volatile>'
+    if (inWebVitals && key === 'id' && typeof value === 'string' && /^v6-\d+-\d+$/.test(value)) return '<v6-id>'
+    if (inWebVitals === 'FCP' && key === 'loadState' && typeof value === 'string') return '<volatile>'
+    if (WEB_VITALS_VALUE.test(key || '') && typeof value === 'number') return '<volatile>'
+    if (key === 'traceparent' && typeof value === 'string' && TRACEPARENT.test(value) &&
+        value !== '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01') return '<traceparent>'
     if (inNetwork && NETWORK_VOLATILE.test(key || '') && typeof value === 'number') return '<volatile>'
     if (inNetwork && (key === 'date' || key === 'confidence') && value !== undefined) return '<volatile>'
     if (REPLAY_VOLATILE_KEYS.has(key) && value !== undefined && value !== null) return '<volatile>'
@@ -143,12 +163,14 @@ function normalise(value, ids, key, inNetwork) {
         })
         return normaliseUrls(value).replace(/:\d{4,5}\//g, ':<port>/').replace(/:\d{4,5}$/, ':<port>').replace(/sdk=(official|ours)/g, 'sdk=<sdk>').replace(/&bundle=[^&]*/g, '')
     }
-    if (Array.isArray(value)) return value.map((v) => normalise(v, ids, undefined, inNetwork))
+    if (Array.isArray(value)) return value.map((v) => normalise(v, ids, undefined, inNetwork, inWebVitals))
     if (value && typeof value === 'object') {
         const out = {}
         // Keys can be URLs too (e.g. $heatmap_data is keyed by page URL).
         const net = inNetwork || value.plugin === 'rrweb/network@1'
-        for (const k of Object.keys(value).sort()) out[k.includes('://') ? normalise(k, ids) : k] = normalise(value[k], ids, k, net)
+        const wvMatch = WEB_VITALS_EVENT.exec(key || '')
+        const wv = inWebVitals || (wvMatch ? wvMatch[1] : undefined)
+        for (const k of Object.keys(value).sort()) out[k.includes('://') ? normalise(k, ids) : k] = normalise(value[k], ids, k, net, wv)
         return out
     }
     return value
@@ -245,6 +267,8 @@ function compare(official, ours) {
     if (missing.length) out.push(`ours requested missing assets (404): ${missing.join(' ')}`)
     const pageErrors = ours.pageErrors.filter((e) => !/diff-?expected/i.test(e))
     if (pageErrors.length) out.push(`page errors (ours): ${pageErrors.join(' | ')}`)
+    // Web vitals are compiled into our SDK: it must never fetch upstream's web-vitals scripts.
+    for (const r of ours.log) if (/^\/static\/(?:[\w.-]+\/)?web-vitals/.test(r.path)) out.push(`ours requested ${r.path}`)
     return out
 }
 

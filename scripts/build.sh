@@ -17,6 +17,10 @@
 #                               needs deadclicks.js.
 #   dist/chunks/replay.js        session replay (needs only core.js); also part of
 #                               posthog.full.js. rrweb is loaded at runtime.
+#   dist/chunks/webvitals.js     web vitals with Google's web-vitals 6.2.1 compiled in
+#                               (needs only core.js); also part of posthog.full.js.
+#   dist/chunks/tracingheaders.js tracing headers (needs only core.js); also part of
+#                               posthog.full.js.
 #
 # Env: CLOSURE_IMAGE (default posthog-closure-compiler:v20261109),
 #      EXTRA_FLAGS (appended to every compile, e.g. "--debug --formatting=PRETTY_PRINT").
@@ -46,6 +50,7 @@ closure() {
     --jscomp_error strictMissingProperties \
     --jscomp_off lintChecks \
     --externs externs/browser.js \
+    --externs externs/web-vitals.js \
     ${EXTRA_FLAGS:-} \
     "$@"
 }
@@ -74,6 +79,11 @@ REPLAY_FILES=(
   src/replay/utils.js src/replay/gzip-field.js src/replay/json-ld.js src/replay/recorder.js
   src/replay/session-recording.js src/replay/index.js
 )
+# Web vitals (Google's web-vitals, ported in third_party/web-vitals) and tracing headers.
+WEBVITALS_FILES=(third_party/web-vitals/lib.js third_party/web-vitals/metrics.js third_party/web-vitals/attribution.js
+  src/web-vitals/web-vitals.js src/web-vitals/index.js)
+TRACINGHEADERS_FILES=(src/tracing-headers/patch.js src/tracing-headers/patch-fns.js src/tracing-headers/tracing-headers.js
+  src/tracing-headers/index.js)
 
 WRAPPER='(function(){%output%}).call(this);'
 
@@ -93,14 +103,16 @@ bundle() { # name entry files...
 bundle posthog.core src/entry/core.js "${CORE_FILES[@]}"
 bundle posthog.core-flags src/entry/core-flags.js "${CORE_FILES[@]}" "${FLAGS_FILES[@]}" src/entry/core-flags.js
 bundle posthog.full src/entry/full.js "${CORE_FILES[@]}" "${FLAGS_FILES[@]}" "${EXPERIMENTS_FILES[@]}" \
-  "${EXCEPTIONS_FILES[@]}" "${DOM_MODULE_FILES[@]}" "${REPLAY_FILES[@]}" src/entry/full.js
+  "${EXCEPTIONS_FILES[@]}" "${DOM_MODULE_FILES[@]}" "${REPLAY_FILES[@]}" \
+  "${WEBVITALS_FILES[@]}" "${TRACINGHEADERS_FILES[@]}" src/entry/full.js
 
 # Chunked build. Chunks share renamed symbols through the global `__phc`
 # namespace object, so later chunks can be loaded on demand.
 CHUNK_WRAPPER='(function(){%s}).call(this);'
-echo "-> dist/chunks/{core,flags,experiments,exceptions,dom,autocapture,deadclicks,heatmaps,replay}.js"
+echo "-> dist/chunks/{core,flags,experiments,exceptions,dom,autocapture,deadclicks,heatmaps,replay,webvitals,tracingheaders}.js"
 args=()
-for f in "${CORE_FILES[@]}" "${FLAGS_FILES[@]}" "${EXPERIMENTS_FILES[@]}" "${EXCEPTIONS_FILES[@]}" "${DOM_MODULE_FILES[@]}" "${REPLAY_FILES[@]}"; do args+=(--js "$f"); done
+for f in "${CORE_FILES[@]}" "${FLAGS_FILES[@]}" "${EXPERIMENTS_FILES[@]}" "${EXCEPTIONS_FILES[@]}" "${DOM_MODULE_FILES[@]}" "${REPLAY_FILES[@]}" \
+  "${WEBVITALS_FILES[@]}" "${TRACINGHEADERS_FILES[@]}"; do args+=(--js "$f"); done
 closure "${args[@]}" \
   --rename_prefix_namespace __phc \
   --chunk "core:${#CORE_FILES[@]}" \
@@ -121,6 +133,10 @@ closure "${args[@]}" \
   --chunk_wrapper "heatmaps:${CHUNK_WRAPPER}" \
   --chunk "replay:${#REPLAY_FILES[@]}:core" \
   --chunk_wrapper "replay:${CHUNK_WRAPPER}" \
+  --chunk "webvitals:${#WEBVITALS_FILES[@]}:core" \
+  --chunk_wrapper "webvitals:${CHUNK_WRAPPER}" \
+  --chunk "tracingheaders:${#TRACINGHEADERS_FILES[@]}:core" \
+  --chunk_wrapper "tracingheaders:${CHUNK_WRAPPER}" \
   --chunk_output_path_prefix dist/chunks/
 
 echo

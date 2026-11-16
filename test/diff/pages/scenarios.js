@@ -1219,3 +1219,218 @@
     },
   })
 })()
+
+// ---- web vitals and tracing headers ---------------------------------------------------
+// Web vitals: the remote config (fixtures.mjs) or `capture_performance` turns
+// them on. Metric values and timings are browser-measured (normalised by the
+// runner); which metrics are buffered together, the event shape, flush timing
+// and URLs are compared. Trusted input (CDP) finalises LCP and produces INP.
+// Tracing headers: the page calls the fake server's /__echo on other hosts,
+// which records the request headers.
+;(function () {
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms) }) }
+  var READY_MS = 700
+
+  function cfg(h, extra) {
+    var c = { autocapture: false, capture_pageview: false, disable_surveys: true }
+    for (var k in extra || {}) c[k] = extra[k]
+    return h.config(c)
+  }
+  // A button whose click handler blocks the main thread: a > 40ms interaction (INP).
+  function slowButton() {
+    var b = document.createElement('button')
+    b.id = 'wv-slow'
+    b.textContent = 'Slow'
+    b.addEventListener('click', function () {
+      var end = performance.now() + 150
+      while (performance.now() < end) { /* busy */ }
+    })
+    document.body.insertBefore(b, document.body.firstChild)
+    return b
+  }
+  // An empty block inserted above the content: a layout shift (CLS) without recent input.
+  function shiftLayout() {
+    var d = document.createElement('div')
+    d.id = 'wv-shift'
+    d.style.height = '240px'
+    document.body.insertBefore(d, document.getElementById('hero'))
+  }
+  function state(ph) {
+    var w = ph.webVitalsAutocapture
+    return w ? { enabled: w.isEnabled, allowed: w.allowedMetrics, attribution: w.attributionMetrics,
+      flushMs: w.flushToCaptureTimeoutMs, softNavs: w.useSoftNavs } : null
+  }
+
+  function echoUrl(host, n) { return 'http://' + host + ':' + location.port + '/__echo?n=' + n }
+  function xhr(method, url, headers) {
+    return new Promise(function (resolve) {
+      var x = new XMLHttpRequest()
+      x.open(method, url)
+      for (var k in headers || {}) x.setRequestHeader(k, headers[k])
+      x.onloadend = function () { resolve(x.status) }
+      x.send(method === 'POST' ? '{"x":1}' : null)
+    })
+  }
+  // fetch(url), fetch(url, init with headers), fetch(Request) and XHR, to `host`.
+  async function requests(host, n) {
+    await (await fetch(echoUrl(host, n + '-get'))).text()
+    await (await fetch(echoUrl(host, n + '-post'), { method: 'POST', headers: { 'X-App': 'kept' }, body: '{"q":1}' })).text()
+    await (await fetch(new Request(echoUrl(host, n + '-request'), { headers: { 'X-App': 'req' } }))).text()
+    await xhr('GET', echoUrl(host, n + '-xhr'))
+    await xhr('POST', echoUrl(host, n + '-xhr-post'), { 'X-App': 'xhr', traceparent: '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01' })
+  }
+
+  Object.assign(window.SCENARIOS, {
+    wv_remote_on: async function (ph, h) {
+      ph.init(h.token, cfg(h))
+      await sleep(READY_MS)
+      await h.click('#buy') // finalises LCP
+      await sleep(400)
+      ph.capture('after-click')
+      await sleep(600)
+      window.__flagResults = state(ph)
+    },
+
+    wv_remote_off: async function (ph, h) {
+      ph.init(h.token, cfg(h))
+      await sleep(READY_MS)
+      await h.click('#buy')
+      await sleep(400)
+      ph.capture('no-web-vitals')
+      await sleep(600)
+      window.__flagResults = state(ph)
+    },
+
+    wv_allowed_metrics: async function (ph, h) {
+      // Remote allow list FCP + LCP: the buffer is complete (and sent) once LCP is finalised.
+      ph.init(h.token, cfg(h))
+      await sleep(READY_MS)
+      await h.click('#buy')
+      await sleep(600)
+      ph.capture('after-flush')
+      await sleep(600)
+      window.__flagResults = state(ph)
+    },
+
+    wv_client_config: async function (ph, h) {
+      // Enabled by the client config alone: FCP only, no attribution. The remote
+      // config fails and first-load flags are off, so whether FCP arrives before
+      // them (an async script load upstream) cannot change the traffic.
+      ph.init(h.token, cfg(h, { advanced_disable_feature_flags_on_first_load: true, capture_performance: { web_vitals: true, web_vitals_allowed_metrics: ['FCP'], web_vitals_attribution: false, __web_vitals_max_value: 30000 } }))
+      await sleep(READY_MS)
+      ph.capture('after-fcp')
+      await sleep(600)
+      window.__flagResults = state(ph)
+    },
+
+    wv_real_metrics: async function (ph, h) {
+      // LCP (finalised by the first click), CLS (a layout shift without recent
+      // input), INP (a slow click handler) and FCP, every metric attributed,
+      // with personal data masked in the URLs. LCP/FCP are buffered first; CLS
+      // and INP arrive when the page is hidden on unload, completing the buffer.
+      var b = slowButton()
+      ph.init(h.token, cfg(h, { mask_personal_data_properties: true, custom_personal_data_properties: ['utm_source'], capture_performance: { web_vitals_attribution: true } }))
+      await sleep(READY_MS)
+      shiftLayout()
+      await sleep(700)
+      await h.click(b)
+      await sleep(300)
+      await h.click(b)
+      await sleep(500)
+      window.__flagResults = state(ph)
+    },
+
+    wv_flush_unload: async function (ph, h) {
+      // No input: LCP and CLS are only reported when the page is hidden on
+      // unload, and the incomplete buffer (no INP) is sent by beacon. The URL is
+      // the navigation's (the hard navigation entry), not the pushState one.
+      ph.init(h.token, cfg(h))
+      await sleep(1200)
+      history.pushState({}, '', '/wv/other?step=2#hash')
+      window.__flagResults = state(ph)
+    },
+
+    wv_flush_timer: async function (ph, h) {
+      // A 1s delayed flush: FCP alone is sent by the timer, the rest on unload.
+      ph.init(h.token, cfg(h, { capture_performance: { web_vitals_delayed_flush_ms: 1000 } }))
+      await sleep(2200)
+      ph.capture('after-timer')
+      await sleep(400)
+      window.__flagResults = state(ph)
+    },
+
+    wv_external_loading_disabled: async function (ph, h) {
+      // Upstream cannot load its web-vitals script: nothing is captured. Ours
+      // refuses to start the same way.
+      ph.init(h.token, cfg(h, { disable_external_dependency_loading: true }))
+      await sleep(READY_MS)
+      await h.click('#buy')
+      await sleep(600)
+      ph.capture('no-web-vitals')
+      await sleep(400)
+      window.__flagResults = state(ph)
+    },
+
+    th_fetch_xhr: async function (ph, h) {
+      ph.init(h.token, cfg(h, { tracing_headers: ['api.example.test'], trace_propagation_targets: ['api.example.test', 'http://other.example.test:' + location.port] }))
+      await sleep(READY_MS)
+      await requests('api.example.test', 'allowed')
+      await requests('other.example.test', 'other')
+      await requests('third.example.test', 'none')
+      ph.identify('traced-user')
+      await requests('api.example.test', 'identified')
+      ph.capture('after-requests')
+      await sleep(600)
+      window.__flagResults = { patched: !!window.fetch.__posthog_wrapped__ }
+    },
+
+    th_not_configured: async function (ph, h) {
+      ph.init(h.token, cfg(h))
+      await sleep(READY_MS)
+      await requests('api.example.test', 'plain')
+      ph.capture('after-requests')
+      await sleep(600)
+      window.__flagResults = { patched: !!window.fetch.__posthog_wrapped__ }
+    },
+
+    th_alias_add_tracing_headers: async function (ph, h) {
+      ph.init(h.token, cfg(h, { addTracingHeaders: ['api.example.test'] }))
+      await sleep(READY_MS)
+      await requests('api.example.test', 'alias')
+      await requests('other.example.test', 'other')
+      ph.capture('after-requests')
+      await sleep(600)
+    },
+
+    th_alias_legacy_true: async function (ph, h) {
+      // The earliest preview option: `true` adds the headers to every host.
+      ph.init(h.token, cfg(h, { __add_tracing_headers: true }))
+      await sleep(READY_MS)
+      await requests('api.example.test', 'legacy')
+      await requests('other.example.test', 'legacy-other')
+      ph.capture('after-requests')
+      await sleep(600)
+    },
+
+    th_set_config: async function (ph, h) {
+      // tracing_headers wins over the aliases; set_config re-checks: hostnames
+      // change in place, then the headers stop while traceparent continues,
+      // then everything stops (patches removed).
+      ph.init(h.token, cfg(h, { tracing_headers: ['api.example.test'], addTracingHeaders: ['other.example.test'], trace_propagation_targets: ['api.example.test'] }))
+      await sleep(READY_MS)
+      await requests('api.example.test', 'first')
+      await requests('other.example.test', 'first-other')
+      ph.set_config({ tracing_headers: ['other.example.test'] })
+      await requests('api.example.test', 'moved')
+      await requests('other.example.test', 'moved-other')
+      ph.set_config({ tracing_headers: [], addTracingHeaders: [] })
+      await requests('api.example.test', 'traceparent-only')
+      var stillPatched = !!window.fetch.__posthog_wrapped__
+      ph.set_config({ trace_propagation_targets: [] })
+      await requests('api.example.test', 'stopped')
+      ph.capture('after-requests')
+      await sleep(600)
+      window.__flagResults = { stillPatched: stillPatched, patched: !!window.fetch.__posthog_wrapped__ }
+    },
+  })
+})()

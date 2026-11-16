@@ -10,7 +10,8 @@ It speaks the same wire protocol and uses the same storage format as upstream
 when a site switches between this SDK and upstream.
 
 It is a faithful port of upstream posthog-js **1.450.0** for the core, feature
-flags, web experiments, exception capture, autocapture (with rageclicks), heatmaps, dead clicks and session replay. `test/diff` runs the same scenarios against the
+flags, web experiments, exception capture, autocapture (with rageclicks), heatmaps, dead clicks, session replay,
+web vitals and tracing headers. `test/diff` runs the same scenarios against the
 official bundle and this SDK in headless Chrome and diffs the traffic; all
 scenarios are identical (see [Test](#test)). See [Scope](#scope) for what is
 not ported yet.
@@ -69,6 +70,9 @@ src/autocapture/   optional: $autocapture, $rageclick, $copy_autocapture (needs 
 src/dead-clicks/   optional: $dead_click / $dead_swipe (needs dom)
 src/heatmaps/      optional: $$heatmap (needs dom + dead-clicks)
 src/replay/        optional: session replay (rrweb is loaded at runtime from /static/recorder.js)
+src/web-vitals/    optional: $web_vitals (Google's web-vitals compiled in from third_party/)
+src/tracing-headers/ optional: tracing headers / traceparent on the app's fetch and XHR
+third_party/web-vitals/ Google web-vitals 6.2.1 (Apache-2.0), ported to JSDoc; see its README
 src/entry/         bundle entry points (core, core-flags, full)
 docker/closure-compiler/Dockerfile   Closure Compiler v20261109 (official Maven jar, JRE 21)
 scripts/build.sh   builds every bundle in Docker
@@ -87,7 +91,7 @@ upstream/          shallow clone of PostHog/posthog-js, kept for reference only 
 |---|---|---|
 | `dist/posthog.core.js` | core only | ~35.0 KB |
 | `dist/posthog.core-flags.js` | core + feature flags | ~41.7 KB |
-| `dist/posthog.full.js` | everything: core + flags + experiments + exceptions + autocapture, dead clicks, heatmaps + session replay | ~88.9 KB |
+| `dist/posthog.full.js` | everything: core + flags + experiments + exceptions + autocapture, dead clicks, heatmaps + session replay + web vitals + tracing headers | ~98.2 KB |
 | `dist/chunks/core.js` | core chunk | ~36.4 KB |
 | `dist/chunks/flags.js` | flags chunk (needs core) | ~7.4 KB |
 | `dist/chunks/experiments.js` | experiments chunk (needs flags) | ~6.5 KB |
@@ -97,11 +101,19 @@ upstream/          shallow clone of PostHog/posthog-js, kept for reference only 
 | `dist/chunks/deadclicks.js` | dead clicks chunk (needs dom) | ~4.5 KB |
 | `dist/chunks/heatmaps.js` | heatmaps chunk (needs deadclicks) | ~1.5 KB |
 | `dist/chunks/replay.js` | session replay chunk (needs core) | ~23.3 KB |
+| `dist/chunks/webvitals.js` | web vitals chunk, web-vitals library included (needs core) | ~7.8 KB |
+| `dist/chunks/tracingheaders.js` | tracing headers chunk (needs core) | ~2.7 KB |
 
 Session replay also loads upstream's `recorder.js` (rrweb and its console and
 network plugins, ~46.5 KB gzip) from the assets host when recording starts.
 Upstream loads `lazy-recorder.js` instead (~72.5 KB: rrweb plus the replay
 logic that is compiled into our bundle).
+
+Web vitals load nothing at runtime: Google's web-vitals library (6.2.1, the
+release upstream pins) is compiled into the chunk. Upstream loads
+`web-vitals-with-attribution.js` by default (~7.1 KB; `web-vitals.js`, ~4.0 KB,
+without attribution) once web vitals are enabled. Tracing headers likewise
+compile in the fetch/XHR patches upstream loads as `tracing-headers.js` (~2.6 KB).
 
 Most of the core is the user-agent tables (a faithful port of upstream's UA
 and bot detection). The experiments chunk includes the html sanitiser (~5 KB).
@@ -139,6 +151,8 @@ module out:
 <script src="chunks/deadclicks.js"></script>
 <script src="chunks/heatmaps.js"></script>
 <script src="chunks/replay.js"></script>  <!-- needs only core.js -->
+<script src="chunks/webvitals.js"></script>  <!-- needs only core.js -->
+<script src="chunks/tracingheaders.js"></script>  <!-- needs only core.js -->
 ```
 
 The DOM helpers shared by autocapture, dead clicks and heatmaps (element
@@ -163,8 +177,12 @@ slim bundle. Attached modules are published like upstream:
 `posthog.autocapture` (`isEnabled`, `startIfEnabled()`,
 `setElementSelectors()`, `getElementSelectors()`, `rageclicks`),
 `posthog.heatmaps` (`isEnabled`, `startIfEnabled()`, `getAndClearBuffer()`,
-`flushIntervalMilliseconds`) and `posthog.deadClicksAutocapture`
-(`startIfEnabledOrStop()`, `stop()`, `lazyLoadedDeadClicksAutocapture`).
+`flushIntervalMilliseconds`), `posthog.deadClicksAutocapture`
+(`startIfEnabledOrStop()`, `stop()`, `lazyLoadedDeadClicksAutocapture`),
+`posthog.webVitalsAutocapture` (`isEnabled`, `allowedMetrics`,
+`flushToCaptureTimeoutMs`, `attributionMetrics`, `useAttribution`,
+`useSoftNavs`, `startIfEnabled()`) and `posthog.tracingHeaders`
+(`startIfEnabledOrStop()`).
 
 Exception capture works the same way. `captureException`, `addExceptionStep`,
 `startExceptionAutocapture` and `stopExceptionAutocapture` are core methods, as
@@ -301,6 +319,8 @@ node --test test/replay.test.mjs # session replay: status, triggers, sampling, b
 ./scripts/build.sh && node test/diff/run.mjs [scenario ...]   # differential test vs official 1.450.0
 node test/sanitizer-chrome.mjs   # html sanitiser vs real DOMPurify 3.4.13 (needs it in /tmp/dp, see the file)
 node --test test/exceptions.test.mjs   # upstream's stack parser / coercer / builder unit tests, ported
+node --test test/web-vitals.test.mjs   # upstream's web vitals tests, ported, + the web-vitals port
+node --test test/tracing-headers.test.mjs   # upstream's tracing headers and patch tests, ported
 ```
 
 The differential test serves the official `array.js` and our
@@ -312,8 +332,7 @@ values: only their presence is compared). Scenarios drive real input through
 CDP: the page calls `h.click(selector)`, `h.move(x, y)`, `h.type(text)` or
 `h.cdp('Input.…', params)`, which `test/diff/chrome.mjs` runs as trusted
 `Input.*` events via a `__cdpInput` binding. `ALLOWED` in `test/diff/fixtures.mjs` lists the
-accepted differences: `$lib_version`, and properties owned by modules that do
-not exist yet (`TODO(module)`).
+accepted differences: only `$lib_version`.
 
 Exception scenarios (`exc_*`) compare `$exception_list` frames as reported by
 Chrome for the shared test page, so filenames, lines and columns are real. Only
@@ -335,6 +354,18 @@ recorded DOM are normalised; `$snapshot_bytes` is checked against the payload
 (it must equal upstream's size estimate) because sizes include those URLs.
 The replay scenarios set `disable_surveys` because upstream injects
 `surveys.js` (not ported) into the recorded DOM otherwise.
+
+Web vitals scenarios (`wv_*`) use real LCP, CLS, FCP and INP from the test
+page and CDP input. Metric values, deltas, attribution timings and the
+`v6-<time>-<random>` metric ids are browser-measured or random and are
+normalised (presence still compared), as is FCP's attribution `loadState`
+(FCP time against this load's DOM milestones); names, ratings, navigation
+fields, URLs, targets and which metrics travel together are compared. The
+runner fails any scenario in which our SDK requests `/static/web-vitals*.js`.
+Tracing headers scenarios (`th_*`) call `/__echo` on other hosts
+(`api.`/`other.`/`third.example.test`), which the fake server answers on any
+non-PostHog host by recording the request's host, method, query, headers and
+body; a random `traceparent` is normalised after its format is checked.
 
 The Node harness cannot execute injected scripts, so remote config always goes
 through the JSON fallback there.
@@ -405,9 +436,27 @@ through the JSON fallback there.
   (`?v=`, `strict_script_versioning`, `asset_host`), unless
   `window.__PosthogExtensions__.rrweb.record` already exists.
 
+- Web vitals (`extensions/web-vitals/index.ts` and the four `web-vitals*`
+  entrypoints): `capture_performance` (`true`/`false` or `web_vitals`,
+  `web_vitals_allowed_metrics`, `web_vitals_attribution`,
+  `web_vitals_delayed_flush_ms`, `__web_vitals_max_value`,
+  `__preview_web_vitals_soft_navs`), the remote `capturePerformance.web_vitals`
+  and `web_vitals_allowed_metrics` (persisted as `$web_vitals_enabled_server_side`
+  and `$web_vitals_allowed_metrics`), flavour selection (attributed INP/LCP by
+  default), buffering per navigation, the `$web_vitals` event shape, flush when
+  complete / after the delay / on navigation change / by beacon on hidden or
+  pagehide, the attribution allowlist, URL masking and the max-value rule.
+  The observers are Google's web-vitals 6.2.1, ported in `third_party/web-vitals`.
+- Tracing headers (`extensions/tracing-headers.ts`, `entrypoints/tracing-headers.ts`,
+  `browser-common/utils/patch.ts`): `X-POSTHOG-SESSION-ID` / `-WINDOW-ID` /
+  `-DISTINCT-ID` on fetch, `fetch(Request)` and XHR for `tracing_headers`
+  hostnames (deprecated `addTracingHeaders`, `__add_tracing_headers`, whose
+  `true` means every host), a fresh W3C `traceparent` for
+  `trace_propagation_targets`, live updates through `set_config`, and the
+  spliceable patch layers shared with replay's network plugin.
+
 **Not yet implemented** (upstream modules to add as extensions): surveys, product tours,
-web vitals, logs/metrics, conversations, the toolbar,
-site apps, tracing headers.
+logs/metrics, conversations, the toolbar, site apps.
 
 **Known differences from upstream**
 
@@ -430,6 +479,28 @@ site apps, tracing headers.
   (upstream wraps them once that script has loaded). The legacy globals that
   script defines for old SDK versions (`posthogErrorWrappingFunctions`,
   `extendPostHogWithExceptionAutocapture`) are not provided.
+- Web vitals: upstream lazy-loads `/static/web-vitals*.js` when web vitals
+  start (at init with the client config, else when the remote config enables
+  them) and registers the observers once it has loaded; here Google's library
+  is compiled in and the observers are registered synchronously. They use
+  `buffered` PerformanceObservers, so the same entries are seen; what changes
+  is timing: a trusted click or keypress before upstream's script has loaded
+  does not finalise LCP there but does here, and metrics may be reported (and
+  `$web_vitals` sent) a few milliseconds earlier. As upstream, nothing starts
+  while `disable_external_dependency_loading` is set, and callbacks already on
+  `__PosthogExtensions__.postHogWebVitalsCallbacksByFlavor` (or the legacy
+  `postHogWebVitalsCallbacks`) are used first. Our module does not publish its
+  callbacks there, and it does not install upstream's `Array.prototype.at` /
+  `findLast` polyfills (the port does not need them). Upstream builds each
+  flavour as a separate script with its own module state; here the flavours
+  share one copy (only one is used per page).
+- Tracing headers: the fetch/XHR patches are compiled in instead of being
+  lazy-loaded from `/static/tracing-headers.js`, so they are installed
+  synchronously during init (upstream patches once that script has loaded;
+  requests made in between carry no headers there). As upstream, nothing is
+  patched while `disable_external_dependency_loading` is set (until the
+  patches have "loaded" once). Patch functions on
+  `__PosthogExtensions__.tracingHeadersPatchFns` are not used or defined.
 - Session replay always loads `recorder.js`: the `scriptConfig.script` remote
   setting (which selects another upstream recorder bundle) is ignored. When
   the native CompressionStream is missing or fails, and when compressions are
