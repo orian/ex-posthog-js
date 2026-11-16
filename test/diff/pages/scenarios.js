@@ -130,16 +130,24 @@
     },
 
     capture_options: async function (ph, h) {
-      ph.init(h.token, h.config({ autocapture: false, capture_pageview: false, properties_string_max_length: 10 }))
-      ph.capture('opts', { long: 'abcdefghijklmnopqrstuvwxyz', $set: { fromProps: 1 } }, {
+      // max length 40 keeps UUIDs (36 chars) intact so they can be normalised.
+      var long = new Array(60).join('x')
+      ph.init(h.token, h.config({ autocapture: false, capture_pageview: false, properties_string_max_length: 40 }))
+      ph.capture('opts', { long: long, $set: { fromProps: 1 } }, {
         $set: { s: 1 }, $set_once: { so: 1 }, $unset: ['u'],
         timestamp: new Date('2024-01-02T03:04:05.000Z'), uuid: '0190f5b8-0000-7000-8000-000000000123',
       })
-      ph.capture('instant', { long: 'abcdefghijklmnopqrstuvwxyz' }, { send_instantly: true })
-      ph.capture('batched-key', {}, { _batchKey: 'custom' })
-      ph.capture('no-truncate', { long: 'abcdefghijklmnopqrstuvwxyz' }, { _noTruncate: true })
+      // Unbatched sends race each other on the network: space them out.
+      await sleep(80)
+      ph.capture('instant', { long: long }, { send_instantly: true })
+      await sleep(80)
+      ph.capture('batched-key-with-a-very-long-event-name-that-gets-truncated', {}, { _batchKey: 'custom' })
+      ph.capture('no-truncate', { long: long }, { _noTruncate: true })
+      await sleep(80)
       ph.capture('xhr', {}, { transport: 'XHR' })
+      await sleep(80)
       ph.capture('custom-url', {}, { _url: 'http://ph.example.test:' + location.port + '/custom/' })
+      await sleep(80)
       ph.capture('skip-rl', {}, { skip_client_rate_limiting: true })
       ph.capture('plain')
       await sleep(700)
