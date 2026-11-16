@@ -8,6 +8,8 @@
 #                               the same code split into Closure chunks:
 #                               load core.js, then optionally flags.js, then
 #                               optionally experiments.js (any time later).
+#   dist/chunks/exceptions.js   exception capture + autocapture (needs core only);
+#                               also part of posthog.full.js.
 #
 # Env: CLOSURE_IMAGE (default posthog-closure-compiler:v20261109),
 #      EXTRA_FLAGS (appended to every compile, e.g. "--debug --formatting=PRETTY_PRINT").
@@ -51,6 +53,8 @@ CORE_FILES=(
 )
 FLAGS_FILES=(src/flags/feature-flags.js src/flags/index.js)
 EXPERIMENTS_FILES=(src/experiments/sanitizer.js src/experiments/web-experiments.js src/experiments/index.js)
+EXCEPTIONS_FILES=(src/exceptions/stack-parser.js src/exceptions/error-tracking.js src/exceptions/bucketed-rate-limiter.js
+  src/exceptions/exceptions.js src/exceptions/autocapture.js src/exceptions/index.js)
 
 WRAPPER='(function(){%output%}).call(this);'
 
@@ -69,22 +73,25 @@ bundle() { # name entry files...
 
 bundle posthog.core src/entry/core.js "${CORE_FILES[@]}"
 bundle posthog.core-flags src/entry/core-flags.js "${CORE_FILES[@]}" "${FLAGS_FILES[@]}" src/entry/core-flags.js
-bundle posthog.full src/entry/full.js "${CORE_FILES[@]}" "${FLAGS_FILES[@]}" "${EXPERIMENTS_FILES[@]}" src/entry/full.js
+bundle posthog.full src/entry/full.js "${CORE_FILES[@]}" "${FLAGS_FILES[@]}" "${EXPERIMENTS_FILES[@]}" \
+  "${EXCEPTIONS_FILES[@]}" src/entry/full.js
 
 # Chunked build. Chunks share renamed symbols through the global `__phc`
 # namespace object, so later chunks can be loaded on demand.
 CHUNK_WRAPPER='(function(){%s}).call(this);'
-echo "-> dist/chunks/{core,flags,experiments}.js"
+echo "-> dist/chunks/{core,flags,experiments,exceptions}.js"
 args=()
-for f in "${CORE_FILES[@]}" "${FLAGS_FILES[@]}" "${EXPERIMENTS_FILES[@]}"; do args+=(--js "$f"); done
+for f in "${CORE_FILES[@]}" "${FLAGS_FILES[@]}" "${EXPERIMENTS_FILES[@]}" "${EXCEPTIONS_FILES[@]}"; do args+=(--js "$f"); done
 closure "${args[@]}" \
   --rename_prefix_namespace __phc \
   --chunk "core:${#CORE_FILES[@]}" \
   --chunk "flags:${#FLAGS_FILES[@]}:core" \
   --chunk "experiments:${#EXPERIMENTS_FILES[@]}:flags" \
+  --chunk "exceptions:${#EXCEPTIONS_FILES[@]}:core" \
   --chunk_wrapper "core:var __phc=window.__phc=window.__phc||{};${CHUNK_WRAPPER}" \
   --chunk_wrapper "flags:${CHUNK_WRAPPER}" \
   --chunk_wrapper "experiments:${CHUNK_WRAPPER}" \
+  --chunk_wrapper "exceptions:${CHUNK_WRAPPER}" \
   --chunk_output_path_prefix dist/chunks/
 
 echo

@@ -73,6 +73,5 @@ export const ALLOWED = [
     /\.properties\.\$recording_status$/, // TODO(module): session replay
     /\.properties\.\$autocapture_disabled_server_side$/, // TODO(module): autocapture (persisted from remote config)
     /\.properties\.\$dead_clicks_enabled_server_side$/, // TODO(module): dead clicks (persisted from remote config)
-    /\.properties\.\$exception_capture_enabled_server_side$/, // TODO(module): exception autocapture (persisted from remote config)
     /\.properties\.\$web_vitals_enabled_server_side$/, // TODO(module): web vitals (persisted from remote config)
 ]
