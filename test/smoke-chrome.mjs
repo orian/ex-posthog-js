@@ -1,18 +1,19 @@
-// Real-browser smoke test: loads test/smoke.html (compiled chunks) in
-// headless Chrome (chromedp/headless-shell) and reads the result over CDP.
+// Real-browser smoke test: loads test/smoke.html (compiled chunks) and
+// test/smoke-lazy.html (the lazy build) in headless Chrome
+// (chromedp/headless-shell) and reads the results over CDP.
 // Usage: node test/smoke-chrome.mjs
 import { execFileSync } from 'node:child_process'
 import { ROOT, sleep } from './harness.mjs'
 
 const PORT = 9333
 const name = 'phc-smoke-' + process.pid
-execFileSync('docker', ['run', '-d', '--rm', '--name', name, '-p', `127.0.0.1:${PORT}:9222`,
-    '-v', `${ROOT}:/work:ro`, 'chromedp/headless-shell:latest'])
-try {
+
+/** Opens test/<file> in a new tab and returns the JSON the page writes to #out. */
+async function runPage(file) {
     let target
     for (let i = 0; i < 50 && !target; i++) {
         try {
-            const res = await fetch(`http://127.0.0.1:${PORT}/json/new?file:///work/test/smoke.html`, { method: 'PUT' })
+            const res = await fetch(`http://127.0.0.1:${PORT}/json/new?file:///work/test/${file}`, { method: 'PUT' })
             target = await res.json()
         } catch { await sleep(200) }
     }
@@ -36,7 +37,13 @@ try {
     }
     ws.close()
     console.log(out)
-    const res = JSON.parse(out)
+    return JSON.parse(out)
+}
+
+execFileSync('docker', ['run', '-d', '--rm', '--name', name, '-p', `127.0.0.1:${PORT}:9222`,
+    '-v', `${ROOT}:/work:ro`, 'chromedp/headless-shell:latest'])
+try {
+    const res = await runPage('smoke.html')
     const ok = res.errors.length === 0 && res.flag === 'test' && res.hero === 'New' && !res.xss && res.distinct && res.exception &&
         res.modules.every(Boolean) &&
         res.paths.some((p) => p.endsWith('/e/')) && res.paths.some((p) => p.endsWith('/flags/')) &&
@@ -46,8 +53,17 @@ try {
         res.optIn.modules.every(Boolean) && res.optIn.toolbarParamsless === false &&
         res.optIn.loggerKeys === 'debug,error,fatal,info,trace,warn' &&
         res.paths.some((p) => p.endsWith('/i/v1/logs')) && res.paths.some((p) => p.endsWith('/i/v1/metrics'))
+    // The lazy build: chunks load from the directory of posthog.js once their feature turns on.
+    const lazy = await runPage('smoke-lazy.html')
+    const lazyOk = lazy.errors.length === 0 && lazy.flag === 'test' && lazy.distinct && lazy.exception &&
+        !lazy.early.wrapped && !lazy.early.fetchPatched && !lazy.early.detector &&
+        lazy.wrapped && lazy.detector && lazy.traced === true &&
+        lazy.chunks.join() === 'dead-clicks-autocapture.js?v=0.1.0-closure,exception-autocapture.js?v=0.1.0-closure,logs.js?v=0.1.0-closure,tracing-headers.js?v=0.1.0-closure' &&
+        lazy.namespaces.join() === 'object,undefined' &&
+        lazy.paths.some((p) => p.endsWith('/e/')) && lazy.paths.some((p) => p.endsWith('/i/v1/logs'))
     console.log(ok ? 'SMOKE OK' : 'SMOKE FAILED')
-    process.exitCode = ok ? 0 : 1
+    console.log(lazyOk ? 'SMOKE (lazy) OK' : 'SMOKE (lazy) FAILED')
+    process.exitCode = ok && lazyOk ? 0 : 1
 } finally {
     execFileSync('docker', ['rm', '-f', name], { stdio: 'ignore' })
 }

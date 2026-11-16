@@ -1,0 +1,63 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>smoke (lazy build)</title></head>
+<body>
+<h1 id="hero">Old</h1>
+<button id="dead">Dead</button>
+<pre id="out">pending</pre>
+<script>
+  // Stub the network: record requests, answer /flags/.
+  var sent = [];
+  window.fetch = function (url, init) {
+    var headers = init && init.headers ? new Headers(init.headers) : null;
+    sent.push({url: url, method: (init && init.method) || 'GET', traced: !!(headers && headers.get('X-POSTHOG-SESSION-ID'))});
+    var body = /\/flags\//.test(url) ? {flags: {f: {key: 'f', enabled: true, variant: 'test', metadata: {}}}} : {status: 1};
+    return Promise.resolve({status: 200, text: function () { return Promise.resolve(JSON.stringify(body)); }});
+  };
+  // headless-shell's UA says "HeadlessChrome", which the SDK (like upstream) treats as a bot.
+  Object.defineProperty(navigator, 'userAgent', {get: function () {
+    return 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+  }});
+  Object.defineProperty(navigator, 'webdriver', {get: function () { return false; }});
+  var errors = [];
+  window.onerror = function (m) { errors.push(String(m)); };
+  var original = {onerror: window.onerror, fetch: window.fetch};
+</script>
+<!-- The lazy build: posthog.js loads its chunks from its own directory when a feature turns on. -->
+<script src="../dist/lazy/posthog.js"></script>
+<script>
+  posthog.init('phc_smoke', {api_host: 'https://example.invalid', request_queue_config: {flush_interval_ms: 250},
+    capture_exceptions: true, capture_dead_clicks: true, tracing_headers: ['api.example.invalid'],
+    logs: {captureConsoleLogs: true},
+    // Chunks are file:// URLs here; drop the crossorigin attribute, which file:// can't satisfy.
+    prepare_external_dependency_script: function (s) { s.removeAttribute('crossorigin'); return s; }});
+  posthog.capture('smoke', {n: 1});
+  // Before the chunks have loaded nothing lazy is installed yet (like upstream before its scripts load).
+  window.__early = {wrapped: window.onerror !== original.onerror, fetchPatched: window.fetch !== original.fetch,
+    detector: !!posthog.deadClicksAutocapture.lazyLoadedDeadClicksAutocapture};
+</script>
+<script>
+  setTimeout(function () {
+    console.log('smoke console log');
+    posthog.logs.flush();
+    var chunks = Array.prototype.map.call(document.querySelectorAll('script[src]'), function (s) {
+      return s.getAttribute('src').replace(/^.*\//, '');
+    }).filter(function (s) { return !/^(posthog|config)\.js/.test(s); }).sort();
+    var traced = fetch('https://api.example.invalid/t') && sent[sent.length - 1].traced;
+    setTimeout(function () {
+      document.getElementById('out').textContent = JSON.stringify({
+        errors: errors,
+        early: window.__early,
+        flag: posthog.getFeatureFlag('f'),
+        distinct: !!posthog.get_distinct_id(),
+        exception: !!posthog.captureException(new Error('smoke')),
+        wrapped: !!(window.onerror && window.onerror.__POSTHOG_INSTRUMENTED__),
+        detector: !!posthog.deadClicksAutocapture.lazyLoadedDeadClicksAutocapture,
+        traced: traced,
+        chunks: chunks,
+        namespaces: [typeof window.__phl, typeof window.__phc],
+        paths: sent.map(function (r) { return r.url.replace(/\?.*/, ''); }).sort()
+      });
+    }, 600);
+  }, 1200);
+</script>
+</body></html>

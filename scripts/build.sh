@@ -26,6 +26,13 @@
 #                               core), then logs.js and/or metrics.js; toolbar.js
 #                               (the toolbar loader) needs only core. All are also
 #                               part of posthog.full.js.
+#   dist/lazy/posthog.js        the lazy build, split like upstream's array.js: core + flags +
+#                               experiments + exceptions + autocapture/heatmaps + metrics + toolbar
+#                               + the shell of every lazily loaded extension. The shells load
+#                               dist/lazy/<kind>.js (replay, exception-autocapture,
+#                               dead-clicks-autocapture, web-vitals, tracing-headers, logs) where
+#                               upstream loads /static/<kind>.js. Its own namespace (__phl), so it
+#                               can share a page with the chunk build (__phc).
 #
 # Env: CLOSURE_IMAGE (default posthog-closure-compiler:v20261109),
 #      EXTRA_FLAGS (appended to every compile, e.g. "--debug --formatting=PRETTY_PRINT").
@@ -40,7 +47,7 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   docker build -t "$IMAGE" docker/closure-compiler
 fi
 
-rm -rf dist && mkdir -p dist/chunks
+rm -rf dist && mkdir -p dist/chunks dist/lazy
 
 closure() {
   docker run --rm -u "$(id -u):$(id -g)" -v "$ROOT:/work" "$IMAGE" \
@@ -173,8 +180,44 @@ closure "${args[@]}" \
   --chunk_wrapper "toolbar:${CHUNK_WRAPPER}" \
   --chunk_output_path_prefix dist/chunks/
 
+# Lazy build: like upstream's array.js plus its /static/<kind>.js scripts. The
+# root chunk is posthog.js; each lazy chunk is named after the upstream kind it
+# replaces (replay.js stands for lazy-recorder.js minus rrweb, web-vitals.js for
+# every web-vitals flavour). Its own namespace object, `__phl`.
+echo "-> dist/lazy/{posthog,replay,exception-autocapture,dead-clicks-autocapture,web-vitals,tracing-headers,logs}.js"
+# The chunk loader goes before src/entry/core.js (the last core file), which may init from the snippet.
+LAZY_ROOT_FILES=("${CORE_FILES[@]:0:${#CORE_FILES[@]}-1}" src/core/lazy-chunks.js src/entry/core.js
+  "${FLAGS_FILES[@]}" "${EXPERIMENTS_FILES[@]}"
+  "${EXCEPTIONS_SHELL_FILES[@]}" src/exceptions/shell.js
+  "${DOM_FILES[@]}" "${AUTOCAPTURE_FILES[@]}" "${DEADCLICKS_SHELL_FILES[@]}" src/dead-clicks/shell.js "${HEATMAPS_FILES[@]}"
+  "${REPLAY_SHELL_FILES[@]}" src/replay/shell.js
+  "${WEBVITALS_SHELL_FILES[@]}" src/web-vitals/shell.js
+  "${TRACINGHEADERS_SHELL_FILES[@]}" src/tracing-headers/shell.js
+  "${OTLP_FILES[@]}" "${LOGS_SHELL_FILES[@]}" src/logs/shell.js "${METRICS_FILES[@]}" "${TOOLBAR_FILES[@]}"
+  src/entry/lazy.js)
+args=()
+for f in "${LAZY_ROOT_FILES[@]}" "${REPLAY_LAZY_FILES[@]}" "${EXCEPTIONS_LAZY_FILES[@]}" "${DEADCLICKS_LAZY_FILES[@]}" \
+  "${WEBVITALS_LAZY_FILES[@]}" "${TRACINGHEADERS_LAZY_FILES[@]}" "${LOGS_LAZY_FILES[@]}"; do args+=(--js "$f"); done
+closure "${args[@]}" \
+  --rename_prefix_namespace __phl \
+  --chunk "posthog:${#LAZY_ROOT_FILES[@]}" \
+  --chunk "replay:${#REPLAY_LAZY_FILES[@]}:posthog" \
+  --chunk "exception-autocapture:${#EXCEPTIONS_LAZY_FILES[@]}:posthog" \
+  --chunk "dead-clicks-autocapture:${#DEADCLICKS_LAZY_FILES[@]}:posthog" \
+  --chunk "web-vitals:${#WEBVITALS_LAZY_FILES[@]}:posthog" \
+  --chunk "tracing-headers:${#TRACINGHEADERS_LAZY_FILES[@]}:posthog" \
+  --chunk "logs:${#LOGS_LAZY_FILES[@]}:posthog" \
+  --chunk_wrapper "posthog:var __phl=window.__phl=window.__phl||{};${CHUNK_WRAPPER}" \
+  --chunk_wrapper "replay:${CHUNK_WRAPPER}" \
+  --chunk_wrapper "exception-autocapture:${CHUNK_WRAPPER}" \
+  --chunk_wrapper "dead-clicks-autocapture:${CHUNK_WRAPPER}" \
+  --chunk_wrapper "web-vitals:${CHUNK_WRAPPER}" \
+  --chunk_wrapper "tracing-headers:${CHUNK_WRAPPER}" \
+  --chunk_wrapper "logs:${CHUNK_WRAPPER}" \
+  --chunk_output_path_prefix dist/lazy/
+
 echo
-ls -l dist dist/chunks | grep '\.js$' | awk '{printf "%8d  %s\n", $5, $NF}'
+ls -l dist dist/chunks dist/lazy | grep '\.js$' | awk '{printf "%8d  %s\n", $5, $NF}'
 echo
 echo "gzip sizes:"
-for f in dist/*.js dist/chunks/*.js; do printf "%8d  %s\n" "$(gzip -9c "$f" | wc -c)" "$f"; done
+for f in dist/*.js dist/chunks/*.js dist/lazy/*.js; do printf "%8d  %s\n" "$(gzip -9c "$f" | wc -c)" "$f"; done
