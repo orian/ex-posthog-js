@@ -1715,3 +1715,24 @@
     },
   })
 })()
+
+// ---- Every lazily loaded part at once ----------------------------------------------------
+// Upstream requests its /static/ scripts in the order its extensions start; the lazy build
+// must request its chunks in the same order (checked by the runner for DIFF_BUNDLE=lazy/...).
+;(function () {
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms) }) }
+  window.SCENARIOS.lazy_all_features = async function (ph, h) {
+    ph.init(h.token, h.config({ autocapture: false, capture_pageview: false, disable_surveys: true,
+      capture_exceptions: true, capture_dead_clicks: true, capture_performance: { web_vitals: true },
+      tracing_headers: ['api.example.test'], logs: { captureConsoleLogs: true } }))
+    await sleep(800)
+    console.log('all features on')
+    ph.capture('after-start')
+    await sleep(600)
+    window.__flagResults = {
+      wrapped: !!(window.onerror && window.onerror.__POSTHOG_INSTRUMENTED__),
+      detector: !!ph.deadClicksAutocapture.lazyLoadedDeadClicksAutocapture,
+      patched: !!window.fetch.__posthog_wrapped__,
+    }
+  }
+})()

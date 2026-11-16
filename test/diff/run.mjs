@@ -373,7 +373,12 @@ function lazyLoads(official, ours) {
 
 // ---- main ----------------------------------------------------------------------
 
+// Lazy-build only: every lazily loaded part at once, to check the order of the chunk requests.
+// Compiled in, our web vitals report earlier than upstream's (see README), which reorders
+// the $web_vitals batches against the logs flush there.
+const LAZY_ONLY = new Set(['lazy_all_features'])
 const all = Object.keys((await import('./scenario-list.mjs')).SCENARIO_NAMES.reduce((a, n) => ({ ...a, [n]: 1 }), {}))
+    .filter((n) => LAZY_BUNDLE || !LAZY_ONLY.has(n))
 const selected = process.argv.slice(2).length ? process.argv.slice(2) : all
 const srv = await startServer()
 const chrome = await launchChrome()
@@ -385,6 +390,7 @@ try {
         const ours = await runScenario(chrome, srv, scenario, 'ours')
         const diffs = compare(official, ours)
         report[scenario] = { diffs, official: digest(official.log), ours: digest(ours.log) }
+        if (LAZY_BUNDLE) report[scenario].lazyLoads = lazyLoads(official, ours)
         if (diffs.length) failures++
         console.log(`${diffs.length ? 'DIFF' : 'same'}  ${scenario}${diffs.length ? ` (${diffs.length})` : ''}`)
         for (const d of diffs.slice(0, 60)) console.log('      ' + d)
