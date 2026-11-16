@@ -70,10 +70,28 @@ export async function launchChrome() {
             await s('Network.enable')
             await s('Network.setUserAgentOverride', { userAgent })
             const consoleErrors = []
+            // Trusted input for scenarios: the page calls window.__cdpInput(JSON.stringify({id, method, params}))
+            // with an Input.* CDP method; we run it and call back window.__cdpInputDone(id, error).
+            await s('Runtime.addBinding', { name: '__cdpInput' })
+            let inputChain = Promise.resolve()
+            const runInput = async ({ id, method, params }) => {
+                let error = null
+                try {
+                    if (!/^Input\./.test(method)) throw new Error('only Input.* methods are allowed: ' + method)
+                    await s(method, params || {})
+                } catch (e) {
+                    error = String(e && e.message || e)
+                }
+                await s('Runtime.evaluate', { expression: `window.__cdpInputDone && window.__cdpInputDone(${JSON.stringify(id)}, ${JSON.stringify(error)})` }).catch(() => {})
+            }
             listeners.push((msg) => {
                 if (msg.sessionId !== sessionId) return
                 if (msg.method === 'Runtime.exceptionThrown') {
                     consoleErrors.push(msg.params.exceptionDetails.exception?.description || msg.params.exceptionDetails.text)
+                }
+                if (msg.method === 'Runtime.bindingCalled' && msg.params.name === '__cdpInput') {
+                    const req = JSON.parse(msg.params.payload)
+                    inputChain = inputChain.then(() => runInput(req))
                 }
             })
             return {

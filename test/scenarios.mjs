@@ -564,6 +564,60 @@ Object.assign(scenarios, {
     },
 })
 
+// ---- Autocapture, heatmaps and dead clicks -------------------------------------
+Object.assign(scenarios, {
+    'autocapture, heatmaps, dead clicks: remote config switches are persisted like upstream': {
+        builds: ['full'],
+        async run(load) {
+            const { b, ph } = await load()
+            ph.init(TOKEN, { ...FAST, capture_pageview: false })
+            assert.equal(ph.autocapture.isEnabled, false, 'waits for the remote config')
+            await sleep(100)
+            assert.equal(ph.autocapture.isEnabled, true)
+            assert.equal(ph.heatmaps.isEnabled, false)
+            assert.equal(ph.heatmaps.flushIntervalMilliseconds, 5000)
+            assert.equal(ph.deadClicksAutocapture.lazyLoadedDeadClicksAutocapture, undefined)
+            ph.capture('x')
+            await sleep(FLUSH)
+            const p = events(b).find((e) => e.event === 'x').properties
+            assert.equal(p.$autocapture_disabled_server_side, false)
+            assert.equal(p.$dead_clicks_enabled_server_side, false)
+            assert.equal(p.$heatmaps_enabled_server_side, undefined, 'hidden persistence key')
+            const stored = JSON.parse(b.window.localStorage.getItem('ph_phc_test_posthog'))
+            assert.equal(stored.$heatmaps_enabled_server_side, false)
+            ph.set_config({ autocapture: false, capture_heatmaps: true })
+            assert.equal(ph.autocapture.isEnabled, false)
+            assert.equal(ph.heatmaps.isEnabled, true)
+        },
+    },
+
+    'chunks: dom, autocapture, dead clicks and heatmaps can be loaded after init': {
+        builds: ['chunks'],
+        async run() {
+            const config = { ...REMOTE_CONFIG, autocapture_opt_out: true, heatmaps: true }
+            const b = createBrowser({ respond: (r) => (r.path === '/array/' + TOKEN + '/config'
+                ? { status: 200, body: config } : defaultRouter(r)) })
+            b.loadScript('dist/chunks/core.js')
+            const ph = b.window.posthog
+            ph.init(TOKEN, { ...FAST, capture_pageview: false })
+            await sleep(100)
+            assert.equal(ph.autocapture, undefined)
+            b.loadScript('dist/chunks/dom.js')
+            b.loadScript('dist/chunks/autocapture.js')
+            b.loadScript('dist/chunks/deadclicks.js')
+            b.loadScript('dist/chunks/heatmaps.js')
+            // The late modules got the remote config straight away.
+            assert.equal(ph.autocapture.isEnabled, false, 'autocapture_opt_out')
+            assert.equal(ph.heatmaps.isEnabled, true)
+            ph.capture('after')
+            await sleep(FLUSH)
+            const p = events(b).find((e) => e.event === 'after').properties
+            assert.equal(p.$autocapture_disabled_server_side, true)
+            assert.equal(p.$dead_clicks_enabled_server_side, false)
+        },
+    },
+})
+
 /** Build name -> how to load it. */
 export const BUILDS = {
     core: { file: 'dist/posthog.core.js', source: 'src/entry/core.js' },

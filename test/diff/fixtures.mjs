@@ -94,7 +94,21 @@ Object.assign(RESPONSES, {
 export const ALLOWED = [
     /\.properties\.\$lib_version$/, // different SDK
     /\.properties\.\$recording_status$/, // TODO(module): session replay
-    /\.properties\.\$autocapture_disabled_server_side$/, // TODO(module): autocapture (persisted from remote config)
-    /\.properties\.\$dead_clicks_enabled_server_side$/, // TODO(module): dead clicks (persisted from remote config)
     /\.properties\.\$web_vitals_enabled_server_side$/, // TODO(module): web vitals (persisted from remote config)
 ]
+
+// ---- Autocapture, heatmaps and dead clicks scenarios -------------------------
+/** Serves `config` both as config.js and as the JSON fallback. */
+const remoteConfig = (config) => ({
+    '/array/phc_diff/config': { body: config },
+    '/array/phc_diff/config.js': { script: `(function(){window._POSTHOG_REMOTE_CONFIG = window._POSTHOG_REMOTE_CONFIG || {}; window._POSTHOG_REMOTE_CONFIG['phc_diff'] = {config: ${JSON.stringify(config)}, siteApps: []}})()` },
+})
+const withoutKey = (obj, key) => { const o = { ...obj }; delete o[key]; return o }
+Object.assign(RESPONSES, {
+    ac_opt_out: remoteConfig({ ...REMOTE_CONFIG, autocapture_opt_out: true }),
+    ac_remote_config_failure: RESPONSES.remote_config_failure,
+    ac_persisted_opt_out: remoteConfig(withoutKey(REMOTE_CONFIG, 'autocapture_opt_out')),
+    ac_elements_chain_off: remoteConfig({ ...REMOTE_CONFIG, elementsChainAsString: false }),
+    heatmaps_remote: remoteConfig({ ...REMOTE_CONFIG, heatmaps: true }),
+    dead_clicks_remote: remoteConfig({ ...REMOTE_CONFIG, captureDeadClicks: true, heatmaps: true }),
+})

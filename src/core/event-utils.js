@@ -28,7 +28,7 @@ const URL_REGEX_PREFIX = 'https?://(.*)';
  * @param {!Array<string>|undefined} custom
  * @return {!Array<string>}
  */
-function paramsToMask(mask, custom) {
+export function paramsToMask(mask, custom) {
   return mask ? PERSONAL_DATA_CAMPAIGN_PARAMS.concat(custom || []) : [];
 }
 

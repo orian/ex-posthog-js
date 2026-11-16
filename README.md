@@ -10,7 +10,7 @@ It speaks the same wire protocol and uses the same storage format as upstream
 when a site switches between this SDK and upstream.
 
 It is a faithful port of upstream posthog-js **1.450.0** for the core, feature
-flags, web experiments and exception capture. `test/diff` runs the same scenarios against the
+flags, web experiments, exception capture, autocapture (with rageclicks), heatmaps and dead clicks. `test/diff` runs the same scenarios against the
 official bundle and this SDK in headless Chrome and diffs the traffic; all
 scenarios are identical (see [Test](#test)). See [Scope](#scope) for what is
 not ported yet.
@@ -25,6 +25,11 @@ src/flags/         optional: feature flags (/flags/?v=2)
 src/experiments/   optional: no-code web experiments (needs flags)
 src/exceptions/    optional: exception capture + autocapture (posthog.exceptions,
                    posthog.exceptionObserver)
+src/dom/           shared DOM helpers for the three modules below (element
+                   properties, $elements_chain, sensitivity rules, ignorelists)
+src/autocapture/   optional: $autocapture, $rageclick, $copy_autocapture (needs dom)
+src/dead-clicks/   optional: $dead_click / $dead_swipe (needs dom)
+src/heatmaps/      optional: $$heatmap (needs dom + dead-clicks)
 src/entry/         bundle entry points (core, core-flags, full)
 docker/closure-compiler/Dockerfile   Closure Compiler v20261109 (official Maven jar, JRE 21)
 scripts/build.sh   builds every bundle in Docker
@@ -43,11 +48,15 @@ upstream/          shallow clone of PostHog/posthog-js, kept for reference only 
 |---|---|---|
 | `dist/posthog.core.js` | core only | ~34.2 KB |
 | `dist/posthog.core-flags.js` | core + feature flags | ~40.9 KB |
-| `dist/posthog.full.js` | core + flags + web experiments + exceptions | ~55.2 KB |
+| `dist/posthog.full.js` | core + flags + web experiments + exceptions + autocapture, dead clicks, heatmaps | ~66.0 KB |
 | `dist/chunks/core.js` | core chunk | ~35.7 KB |
 | `dist/chunks/flags.js` | flags chunk (needs core) | ~7.4 KB |
 | `dist/chunks/experiments.js` | experiments chunk (needs flags) | ~6.5 KB |
 | `dist/chunks/exceptions.js` | exception capture chunk (needs core) | ~8.4 KB |
+| `dist/chunks/dom.js` | shared DOM helpers (needs core) | ~3.9 KB |
+| `dist/chunks/autocapture.js` | autocapture chunk (needs dom) | ~3.5 KB |
+| `dist/chunks/deadclicks.js` | dead clicks chunk (needs dom) | ~4.5 KB |
+| `dist/chunks/heatmaps.js` | heatmaps chunk (needs deadclicks) | ~1.5 KB |
 
 Most of the core is the user-agent tables (a faithful port of upstream's UA
 and bot detection). The experiments chunk includes the html sanitiser (~5 KB).
@@ -79,14 +88,36 @@ module out:
 <script src="chunks/flags.js"></script>
 <script src="chunks/experiments.js"></script>
 <script src="chunks/exceptions.js"></script>
+<!-- autocapture, dead clicks, heatmaps: dom.js first; heatmaps.js needs deadclicks.js -->
+<script src="chunks/dom.js"></script>
+<script src="chunks/autocapture.js"></script>
+<script src="chunks/deadclicks.js"></script>
+<script src="chunks/heatmaps.js"></script>
 ```
+
+The DOM helpers shared by autocapture, dead clicks and heatmaps (element
+properties and `$elements_chain`, the sensitivity rules, the rageclick and
+dead click ignorelists) are their own `dom` chunk rather than part of the
+autocapture chunk: each of the three modules can be used without the others
+(heatmaps without autocapture is a common setup), and they stay out of the
+core. Heatmaps depend on the dead clicks chunk because, like upstream, they
+run their own dead click detector for `deadclick` points; loading it also
+registers `posthog.deadClicksAutocapture`, which only starts when
+`capture_dead_clicks` or the remote `captureDeadClicks` enables it. The
+`RageClick` detector lives in the core (both autocapture and heatmaps use it,
+and the date-gated `rageclick` default needs its keyword list).
 
 Flag methods (`getFeatureFlag`, `isFeatureEnabled`, `onFeatureFlags`, ...) are
 always present on `posthog`. Without the flags module they return `undefined`
 (and `onFeatureFlags` calls back with `errorsLoading: true`), like upstream's
 slim bundle. Attached modules are published like upstream:
 `posthog.featureFlags` (with upstream's methods, e.g.
-`posthog.featureFlags.overrideFeatureFlags(...)`) and `posthog.experiments`.
+`posthog.featureFlags.overrideFeatureFlags(...)`), `posthog.experiments`,
+`posthog.autocapture` (`isEnabled`, `startIfEnabled()`,
+`setElementSelectors()`, `getElementSelectors()`, `rageclicks`),
+`posthog.heatmaps` (`isEnabled`, `startIfEnabled()`, `getAndClearBuffer()`,
+`flushIntervalMilliseconds`) and `posthog.deadClicksAutocapture`
+(`startIfEnabledOrStop()`, `stop()`, `lazyLoadedDeadClicksAutocapture`).
 
 Exception capture works the same way. `captureException`, `addExceptionStep`,
 `startExceptionAutocapture` and `stopExceptionAutocapture` are core methods, as
@@ -126,7 +157,7 @@ first.
 
 ## Writing an extension
 
-Future modules (autocapture, heatmaps, exception autocapture, session replay,
+Optional modules (autocapture, heatmaps, exception autocapture, session replay,
 ...) are built as Closure modules/chunks on top of these core APIs. They are
 compiled together with the core, so they use dotted (renamed) access to
 internal APIs and quoted access to public/wire data.
@@ -161,7 +192,8 @@ upstream name (`autocapture`, `heatmaps`, `sessionRecording`, `exceptions`...).
 - `onConfigChange(partialConfig)`: called by `set_config()` (including the one in
   `init` and the one the remote config triggers) after the config, persistence,
   flags and history autocapture were updated, in attach order. Upstream's
-  `onConfigChange()` / `startIfEnabledOrStop()` calls map to it.
+  `onConfigChange()` / `startIfEnabled()` / `startIfEnabledOrStop()` calls map to
+  it; extensions that only re-check their state ignore the argument.
 
 **Core APIs for extensions** (on the `PostHog` instance):
 
@@ -190,6 +222,7 @@ upstream name (`autocapture`, `heatmaps`, `sessionRecording`, `exceptions`...).
 - `on('eventCaptured', cb)` (every captured event, after `before_send`),
   `rateLimiter`, `consent`, `persistence` (`register`, `get_property`, ...),
   `config` (public, quoted keys), `isPageUnloading`.
+- `RageClick` and the rageclick keyword lists in `src/core/rageclick.js`.
 - `loadScript(config, url, callback)` in `src/core/script-loader.js` (upstream's
   external script loader: `prepare_external_dependency_script`,
   `disable_external_dependency_loading`, `external_scripts_inject_target`).
@@ -200,6 +233,7 @@ upstream name (`autocapture`, `heatmaps`, `sessionRecording`, `exceptions`...).
 npm test                         # Node fake browser: raw sources + every compiled bundle + chunks
 npm run test:chrome              # loads the chunks in real headless Chrome (chromedp/headless-shell)
 node --test test/user-agent.test.mjs
+node --test test/autocapture.test.mjs   # $elements_chain, value scrubbing, RageClick
 ./scripts/build.sh && node test/diff/run.mjs [scenario ...]   # differential test vs official 1.450.0
 node test/sanitizer-chrome.mjs   # html sanitiser vs real DOMPurify 3.4.13 (needs it in /tmp/dp, see the file)
 node --test test/exceptions.test.mjs   # upstream's stack parser / coercer / builder unit tests, ported
@@ -209,7 +243,11 @@ The differential test serves the official `array.js` and our
 `dist/posthog.full.js` (or `DIFF_BUNDLE=<file>`) from a fake PostHog that also
 answers the remote config (`config.js` and JSON). It compares every request
 (method, path, query, content type, event names) and every event/body after
-normalising ids and timestamps. `ALLOWED` in `test/diff/fixtures.mjs` lists the
+normalising ids and timestamps (dead click timestamps and delays are timing
+values: only their presence is compared). Scenarios drive real input through
+CDP: the page calls `h.click(selector)`, `h.move(x, y)`, `h.type(text)` or
+`h.cdp('Input.…', params)`, which `test/diff/chrome.mjs` runs as trusted
+`Input.*` events via a `__cdpInput` binding. `ALLOWED` in `test/diff/fixtures.mjs` lists the
 accepted differences: `$lib_version`, and properties owned by modules that do
 not exist yet (`TODO(module)`).
 
@@ -252,9 +290,31 @@ through the JSON fallback there.
   extension / injected-script / SDK-error filters, `capture_exceptions` vs the
   `autocaptureExceptions` remote flag (`$exception_capture_enabled_server_side`,
   `$error_tracking_suppression_rules`, `$error_tracking_capture_extension_exceptions`).
+- Autocapture (`browser-common/autocapture.ts`, `autocapture-utils.ts`,
+  `browser-autocapture.ts`): `$autocapture` for click/change/submit with
+  `$elements_chain` (and `$elements` when the remote `elementsChainAsString`
+  is off), the sensitivity rules, `ph-no-capture` / `ph-sensitive` /
+  `ph-include`, `data-ph-capture-attribute-*`, `$input_value` for
+  `capture_value_css_selector_allowlist` (default `[data-ph-capture-value]`),
+  SVG icon clicks attributed to their button/link, pointer-target recovery,
+  shadow DOM, `$external_click_url`, the `autocapture` options (url/element/
+  css allow and ignore lists, `dom_event_allowlist`,
+  `element_attribute_ignorelist`, `capture_copied_text` for
+  `$copy_autocapture`), `$rageclick` with thresholds, `css_selector_ignorelist`,
+  `content_ignorelist` and `ignore_text_selection` (and their `defaults`-dated
+  defaults), and `autocapture_opt_out` persisted as
+  `$autocapture_disabled_server_side`.
+- Heatmaps (`heatmaps.ts`): click / rageclick / deadclick / debounced mousemove
+  points with scroll offsets unless the target is fixed or sticky, buffered per
+  (masked) URL, flushed as `$$heatmap` every `flush_interval_milliseconds`
+  while visible and on beforeunload; `capture_heatmaps` / `enable_heatmaps` /
+  remote `heatmaps` (`$heatmaps_enabled_server_side`).
+- Dead clicks (`dead-clicks-autocapture.ts` and its lazy entrypoint):
+  `$dead_click` and `$dead_swipe` with the mutation/scroll/selection/
+  visibility/focus rules, `capture_dead_clicks` options and the remote
+  `captureDeadClicks` (`$dead_clicks_enabled_server_side`).
 
-**Not yet implemented** (upstream modules to add as extensions): autocapture,
-heatmaps, rageclicks/dead clicks, session replay, surveys, product tours,
+**Not yet implemented** (upstream modules to add as extensions): session replay, surveys, product tours,
 web vitals, logs/metrics, conversations, the toolbar,
 site apps, tracing headers.
 
@@ -267,6 +327,10 @@ site apps, tracing headers.
 - Sync gzip (beacons, `send_instantly`, no CompressionStream) uses a compact
   LZ77 + fixed-Huffman encoder instead of fflate: same decoded payload,
   somewhat larger bodies.
+- Dead clicks: upstream lazy-loads the detector from `/static/`; here it is
+  compiled in, so it starts synchronously instead of after the script load.
+  As upstream, it never starts while `disable_external_dependency_loading` is
+  set (until the detector has "loaded" once).
 - Hook names of extensions are renamed by Closure, so extensions must be
   compiled with the core (as bundles or chunks).
 - Exception autocapture's wrapping functions are compiled into the module

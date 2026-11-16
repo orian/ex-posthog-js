@@ -41,8 +41,9 @@ export class Extension {
     this.onReset;
     /**
      * Called by set_config() after the config was updated (upstream calls
-     * each extension's onConfigChange / startIfEnabledOrStop there). Receives
-     * the partial config that was passed to set_config.
+     * each extension's onConfigChange / startIfEnabled(OrStop) there), in
+     * attach order. Receives the partial config passed to set_config;
+     * extensions that only need to re-check their state may ignore it.
      * @type {(function(!Object): void)|undefined}
      */
     this.onConfigChange;

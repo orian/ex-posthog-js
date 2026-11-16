@@ -32,6 +32,10 @@
 <script src="../dist/chunks/flags.js"></script>
 <script src="../dist/chunks/experiments.js"></script>
 <script src="../dist/chunks/exceptions.js"></script>
+<script src="../dist/chunks/dom.js"></script>
+<script src="../dist/chunks/autocapture.js"></script>
+<script src="../dist/chunks/deadclicks.js"></script>
+<script src="../dist/chunks/heatmaps.js"></script>
 <script>
   setTimeout(function () {
     document.getElementById('out').textContent = JSON.stringify({
@@ -41,6 +45,7 @@
       xss: !!window.__xss,
       distinct: !!posthog.get_distinct_id(),
       exception: !!posthog.captureException(new Error('smoke')),
+      modules: [!!posthog.autocapture, !!posthog.heatmaps, !!posthog.deadClicksAutocapture],
       paths: sent.map(function (r) { return r.url.replace(/\?.*/, ''); }).sort()
     });
   }, 1200);
