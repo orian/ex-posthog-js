@@ -15,6 +15,7 @@ import {RequestRouter, RequestRouterRegion} from './request-router.js';
 import {ConsentManager, ConsentStatus} from './consent.js';
 import {RemoteConfigLoader, RemoteConfigHost, shouldLoadFlagsAfterRemoteConfig} from './remote-config.js';
 import {HistoryAutocapture} from './history-autocapture.js';
+import {DEFAULT_CONTENT_IGNORELIST_WITH_STEPPERS} from './rageclick.js';
 import {DEFAULT_FLUSH_INTERVAL_MS, RequestQueue, RetryQueue} from './request-queue.js';
 import {COMPRESSION_BASE64, COMPRESSION_GZIP_JS, RequestOptions, SUPPORTS_REQUEST, TransportCallback, request} from './request.js';
 import {getEventProperties} from './event-utils.js';
@@ -56,11 +57,6 @@ const FBCLID_PATTERN = /^[A-Za-z0-9_-]{1,400}$/;
 const FBC_PATTERN = /^fb\.[0-9]+\.[0-9]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?$/;
 const FBP_PATTERN = /^fb\.[0-9]+\.[0-9]+\.[0-9]+$/;
 const LATEST_DEFAULTS_DATE = CONFIG_DEFAULTS_DATES.slice().sort()[CONFIG_DEFAULTS_DATES.length - 1];
-
-/** Upstream DEFAULT_CONTENT_IGNORELIST_WITH_STEPPERS (autocapture-utils). */
-const DEFAULT_CONTENT_IGNORELIST_WITH_STEPPERS = [
-  'next', 'previous', 'prev', '>', '<', '+', '-', '−', '–', 'increment', 'decrement', 'increase', 'decrease',
-];
 
 /** Requests are queued until the DOM is loaded when no transport exists (upstream ENQUEUE_REQUESTS). */
 let enqueueRequests = !SUPPORTS_REQUEST && userAgent.indexOf('MSIE') === -1 && userAgent.indexOf('Mozilla') === -1;
@@ -2142,6 +2138,17 @@ export class PostHog {
     }
     const flags = this.flags_();
     if (flags) flags.updateConfig(this.config, this.shouldDisableFlags_());
+    const self = this;
+    this.extensionOrder_.forEach(function(name) {
+      const ext = self.extensions[name];
+      if (ext && ext.onConfigChange) {
+        try {
+          ext.onConfigChange();
+        } catch (e) {
+          logger.error('extension ' + name + ' onConfigChange failed', e);
+        }
+      }
+    });
     if (this.historyAutocapture && ('capture_pageview' in config || 'disable_capture_url_hashes' in config)) {
       this.historyAutocapture.startIfEnabledOrStop();
     }

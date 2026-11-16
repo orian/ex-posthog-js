@@ -39,6 +39,12 @@ export class Extension {
      * @type {(function(): void)|undefined}
      */
     this.onReset;
+    /**
+     * Called by set_config() after the config was updated (upstream's
+     * startIfEnabled/startIfEnabledOrStop calls there).
+     * @type {(function(): void)|undefined}
+     */
+    this.onConfigChange;
   }
 }
 
