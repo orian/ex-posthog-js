@@ -1,13 +1,7 @@
 /**
- * @fileoverview Registers the session replay module under upstream's name
- * `sessionRecording` (published as `posthog.sessionRecording`). rrweb itself
- * is loaded at runtime from `/static/recorder.js` on the assets host.
+ * @fileoverview Session replay with the recorder logic compiled in (it
+ * registers first, so the extension finds it when it starts). rrweb itself is
+ * loaded at runtime from `/static/recorder.js` on the assets host.
  */
-import {registerExtension} from '../core/extensions.js';
-import {SessionRecording, exportSessionRecordingApi} from './session-recording.js';
-
-exportSessionRecordingApi();
-
-registerExtension('sessionRecording', function(instance) {
-  return new SessionRecording(instance);
-});
+import './recorder.js';
+import './shell.js';

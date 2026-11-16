@@ -2,15 +2,15 @@
  * @fileoverview Console log capture. Port of upstream
  * browser-common/src/console-logs.ts (what upstream's lazy `logs.js` entrypoint
  * runs: the `console.*` wrappers and the replay of the main bundle's pre-load
- * buffer) and utils/console-original.ts.
+ * buffer): the lazy part `logs`, registered with provideLazy.
  */
 import {isArray, isBoolean, isFunction, isNumber, isObject} from '../core/utils.js';
 import {LogSdkContext} from './logs-core.js';
 import {patch} from '../otlp/otlp.js';
-
-/** The console methods recorded and captured, in upstream's order. */
-/** @const {!Array<string>} */
-export const BUFFERED_CONSOLE_LEVELS = ['debug', 'log', 'warn', 'error', 'info'];
+import {provideLazy} from '../core/lazy.js';
+import {
+  BufferedConsoleEntry, ConsoleLogsHost, ConsoleLogsPart, LOGS_KIND, originalConsoleMethod,
+} from './console-types.js';
 
 /** @const {!Object<string, string>} */
 const LEVEL_MAP = {'debug': 'debug', 'log': 'info', 'warn': 'warn', 'error': 'error', 'info': 'info'};
@@ -18,42 +18,6 @@ const LEVEL_MAP = {'debug': 'debug', 'log': 'info', 'warn': 'warn', 'error': 'er
 const LOG_BODY_SIZE_LIMIT = 10000;
 const LOG_ATTRIBUTES_LIMIT = 50;
 
-/**
- * A console call recorded before capture took over (upstream BufferedConsoleEntry).
- * @typedef {{level: string, args: !Array<*>, occurredAtMs: number, context: !LogSdkContext}}
- */
-export let BufferedConsoleEntry;
-
-/**
- * Where captured console records go (upstream ConsoleLogsSink).
- * @record
- */
-export class ConsoleLogsSink {
-  constructor() {}
-  /** @param {!Object} options */
-  captureConsoleLog(options) {}
-  /**
-   * @param {!Object} options
-   * @param {!LogSdkContext} context
-   * @param {number} occurredAtMs
-   */
-  captureBufferedConsoleLog(options, context, occurredAtMs) {}
-}
-
-/**
- * @typedef {{console: !Object, hostname: string, getCapturingLogs: function(): ?ConsoleLogsSink}}
- */
-export let ConsoleLogsHost;
-
-/**
- * Walks `__rrweb_original__` markers to the real console method.
- * @param {*} method
- * @return {*}
- */
-export function originalConsoleMethod(method) {
-  while (method && method['__rrweb_original__']) method = method['__rrweb_original__'];
-  return method;
-}
 
 // ---- argument serialisation -----------------------------------------------------------
 
@@ -416,3 +380,8 @@ export function replayConsoleBuffer(host, entries) {
     }
   }
 }
+
+provideLazy(LOGS_KIND, /** @type {!ConsoleLogsPart} */ ({
+  initializeLogs: initializeLogs,
+  replayConsoleBuffer: replayConsoleBuffer,
+}));

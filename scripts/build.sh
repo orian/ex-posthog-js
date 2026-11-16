@@ -26,6 +26,13 @@
 #                               core), then logs.js and/or metrics.js; toolbar.js
 #                               (the toolbar loader) needs only core. All are also
 #                               part of posthog.full.js.
+#   dist/lazy/posthog.js        the lazy build, split like upstream's array.js: core + flags +
+#                               experiments + exceptions + autocapture/heatmaps + metrics + toolbar
+#                               + the shell of every lazily loaded extension. The shells load
+#                               dist/lazy/<kind>.js (replay, exception-autocapture,
+#                               dead-clicks-autocapture, web-vitals, tracing-headers, logs) where
+#                               upstream loads /static/<kind>.js. Its own namespace (__phl), so it
+#                               can share a page with the chunk build (__phc).
 #
 # Env: CLOSURE_IMAGE (default posthog-closure-compiler:v20261109),
 #      EXTRA_FLAGS (appended to every compile, e.g. "--debug --formatting=PRETTY_PRINT").
@@ -40,7 +47,7 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   docker build -t "$IMAGE" docker/closure-compiler
 fi
 
-rm -rf dist && mkdir -p dist/chunks
+rm -rf dist && mkdir -p dist/chunks dist/lazy
 
 closure() {
   docker run --rm -u "$(id -u):$(id -g)" -v "$ROOT:/work" "$IMAGE" \
@@ -66,28 +73,40 @@ CORE_FILES=(
   src/core/session-props.js src/core/scroll-manager.js src/core/page-view.js src/core/gzip.js
   src/core/request.js src/core/request-queue.js src/core/rate-limiter.js src/core/request-router.js
   src/core/consent.js src/core/script-loader.js src/core/remote-config.js src/core/history-autocapture.js
-  src/core/rageclick.js src/core/extensions.js src/core/posthog.js src/entry/core.js
+  src/core/rageclick.js src/core/lazy.js src/core/extensions.js src/core/posthog.js src/entry/core.js
 )
 FLAGS_FILES=(src/flags/feature-flags.js src/flags/index.js)
 EXPERIMENTS_FILES=(src/experiments/sanitizer.js src/experiments/web-experiments.js src/experiments/index.js)
-EXCEPTIONS_FILES=(src/exceptions/stack-parser.js src/exceptions/error-tracking.js src/exceptions/bucketed-rate-limiter.js
-  src/exceptions/exceptions.js src/exceptions/autocapture.js src/exceptions/index.js)
+# Modules with a lazy part (upstream's loadExternalDependency kinds) list it as *_LAZY_FILES:
+# compiled in everywhere except the lazy build, where it is its own chunk. Chunks keep the
+# input order, so the lazy part comes before shell.js (which registers the extension).
+EXCEPTIONS_SHELL_FILES=(src/exceptions/stack-parser.js src/exceptions/error-tracking.js
+  src/exceptions/bucketed-rate-limiter.js src/exceptions/exceptions.js src/exceptions/autocapture.js)
+EXCEPTIONS_LAZY_FILES=(src/exceptions/wrappers.js)
+EXCEPTIONS_FILES=("${EXCEPTIONS_SHELL_FILES[@]}" "${EXCEPTIONS_LAZY_FILES[@]}" src/exceptions/shell.js src/exceptions/index.js)
 # Autocapture, dead clicks and heatmaps share the DOM helpers in src/dom/.
 DOM_FILES=(src/dom/autocapture-utils.js)
 AUTOCAPTURE_FILES=(src/autocapture/autocapture.js src/autocapture/index.js)
-DEADCLICKS_FILES=(src/dead-clicks/dead-clicks.js src/dead-clicks/index.js)
+DEADCLICKS_SHELL_FILES=(src/dead-clicks/dead-clicks.js)
+DEADCLICKS_LAZY_FILES=(src/dead-clicks/detector.js)
+DEADCLICKS_FILES=("${DEADCLICKS_SHELL_FILES[@]}" "${DEADCLICKS_LAZY_FILES[@]}" src/dead-clicks/shell.js src/dead-clicks/index.js)
 HEATMAPS_FILES=(src/heatmaps/heatmaps.js src/heatmaps/index.js)
 DOM_MODULE_FILES=("${DOM_FILES[@]}" "${AUTOCAPTURE_FILES[@]}" "${DEADCLICKS_FILES[@]}" "${HEATMAPS_FILES[@]}")
 # Session replay (needs only core; rrweb itself is loaded at runtime from /static/recorder.js).
-REPLAY_FILES=(
-  src/replay/constants.js src/replay/sampling.js src/replay/trigger-matching.js src/replay/recording-strategies.js
+REPLAY_SHELL_FILES=(src/replay/constants.js src/replay/session-recording.js)
+REPLAY_LAZY_FILES=(
+  src/replay/sampling.js src/replay/trigger-matching.js src/replay/recording-strategies.js
   src/replay/utils.js src/replay/gzip-field.js src/replay/json-ld.js src/replay/recorder.js
-  src/replay/session-recording.js src/replay/index.js
 )
+REPLAY_FILES=("${REPLAY_SHELL_FILES[@]}" "${REPLAY_LAZY_FILES[@]}" src/replay/shell.js src/replay/index.js)
 # Web vitals (Google's web-vitals, ported in third_party/web-vitals) and tracing headers.
-WEBVITALS_FILES=(third_party/web-vitals/lib.js third_party/web-vitals/metrics.js third_party/web-vitals/attribution.js
-  src/web-vitals/web-vitals.js src/web-vitals/index.js)
-TRACINGHEADERS_FILES=(src/tracing-headers/patch.js src/tracing-headers/patch-fns.js src/tracing-headers/tracing-headers.js
+WEBVITALS_SHELL_FILES=(src/web-vitals/web-vitals.js)
+WEBVITALS_LAZY_FILES=(third_party/web-vitals/lib.js third_party/web-vitals/metrics.js third_party/web-vitals/attribution.js
+  src/web-vitals/lazy.js)
+WEBVITALS_FILES=("${WEBVITALS_SHELL_FILES[@]}" "${WEBVITALS_LAZY_FILES[@]}" src/web-vitals/shell.js src/web-vitals/index.js)
+TRACINGHEADERS_SHELL_FILES=(src/tracing-headers/types.js src/tracing-headers/tracing-headers.js)
+TRACINGHEADERS_LAZY_FILES=(src/tracing-headers/patch.js src/tracing-headers/patch-fns.js src/tracing-headers/lazy.js)
+TRACINGHEADERS_FILES=("${TRACINGHEADERS_SHELL_FILES[@]}" "${TRACINGHEADERS_LAZY_FILES[@]}" src/tracing-headers/shell.js
   src/tracing-headers/index.js)
 
 WRAPPER='(function(){%output%}).call(this);'
@@ -107,7 +126,9 @@ bundle() { # name entry files...
 
 # Logs and metrics share the OTLP helpers in src/otlp/; the toolbar loader needs only core.
 OTLP_FILES=(src/otlp/otlp.js)
-LOGS_FILES=(src/logs/logs-core.js src/logs/console-logs.js src/logs/logs.js src/logs/index.js)
+LOGS_SHELL_FILES=(src/logs/logs-core.js src/logs/console-types.js src/logs/logs.js)
+LOGS_LAZY_FILES=(src/logs/console-logs.js)
+LOGS_FILES=("${LOGS_SHELL_FILES[@]}" "${LOGS_LAZY_FILES[@]}" src/logs/shell.js src/logs/index.js)
 METRICS_FILES=(src/metrics/metrics-core.js src/metrics/network-metrics.js src/metrics/metrics.js src/metrics/index.js)
 TOOLBAR_FILES=(src/toolbar/toolbar.js src/toolbar/index.js)
 OPT_IN_FILES=("${OTLP_FILES[@]}" "${LOGS_FILES[@]}" "${METRICS_FILES[@]}" "${TOOLBAR_FILES[@]}")
@@ -159,8 +180,44 @@ closure "${args[@]}" \
   --chunk_wrapper "toolbar:${CHUNK_WRAPPER}" \
   --chunk_output_path_prefix dist/chunks/
 
+# Lazy build: like upstream's array.js plus its /static/<kind>.js scripts. The
+# root chunk is posthog.js; each lazy chunk is named after the upstream kind it
+# replaces (replay.js stands for lazy-recorder.js minus rrweb, web-vitals.js for
+# every web-vitals flavour). Its own namespace object, `__phl`.
+echo "-> dist/lazy/{posthog,replay,exception-autocapture,dead-clicks-autocapture,web-vitals,tracing-headers,logs}.js"
+# The chunk loader goes before src/entry/core.js (the last core file), which may init from the snippet.
+LAZY_ROOT_FILES=("${CORE_FILES[@]:0:${#CORE_FILES[@]}-1}" src/core/lazy-chunks.js src/entry/core.js
+  "${FLAGS_FILES[@]}" "${EXPERIMENTS_FILES[@]}"
+  "${EXCEPTIONS_SHELL_FILES[@]}" src/exceptions/shell.js
+  "${DOM_FILES[@]}" "${AUTOCAPTURE_FILES[@]}" "${DEADCLICKS_SHELL_FILES[@]}" src/dead-clicks/shell.js "${HEATMAPS_FILES[@]}"
+  "${REPLAY_SHELL_FILES[@]}" src/replay/shell.js
+  "${WEBVITALS_SHELL_FILES[@]}" src/web-vitals/shell.js
+  "${TRACINGHEADERS_SHELL_FILES[@]}" src/tracing-headers/shell.js
+  "${OTLP_FILES[@]}" "${LOGS_SHELL_FILES[@]}" src/logs/shell.js "${METRICS_FILES[@]}" "${TOOLBAR_FILES[@]}"
+  src/entry/lazy.js)
+args=()
+for f in "${LAZY_ROOT_FILES[@]}" "${REPLAY_LAZY_FILES[@]}" "${EXCEPTIONS_LAZY_FILES[@]}" "${DEADCLICKS_LAZY_FILES[@]}" \
+  "${WEBVITALS_LAZY_FILES[@]}" "${TRACINGHEADERS_LAZY_FILES[@]}" "${LOGS_LAZY_FILES[@]}"; do args+=(--js "$f"); done
+closure "${args[@]}" \
+  --rename_prefix_namespace __phl \
+  --chunk "posthog:${#LAZY_ROOT_FILES[@]}" \
+  --chunk "replay:${#REPLAY_LAZY_FILES[@]}:posthog" \
+  --chunk "exception-autocapture:${#EXCEPTIONS_LAZY_FILES[@]}:posthog" \
+  --chunk "dead-clicks-autocapture:${#DEADCLICKS_LAZY_FILES[@]}:posthog" \
+  --chunk "web-vitals:${#WEBVITALS_LAZY_FILES[@]}:posthog" \
+  --chunk "tracing-headers:${#TRACINGHEADERS_LAZY_FILES[@]}:posthog" \
+  --chunk "logs:${#LOGS_LAZY_FILES[@]}:posthog" \
+  --chunk_wrapper "posthog:var __phl=window.__phl=window.__phl||{};${CHUNK_WRAPPER}" \
+  --chunk_wrapper "replay:${CHUNK_WRAPPER}" \
+  --chunk_wrapper "exception-autocapture:${CHUNK_WRAPPER}" \
+  --chunk_wrapper "dead-clicks-autocapture:${CHUNK_WRAPPER}" \
+  --chunk_wrapper "web-vitals:${CHUNK_WRAPPER}" \
+  --chunk_wrapper "tracing-headers:${CHUNK_WRAPPER}" \
+  --chunk_wrapper "logs:${CHUNK_WRAPPER}" \
+  --chunk_output_path_prefix dist/lazy/
+
 echo
-ls -l dist dist/chunks | grep '\.js$' | awk '{printf "%8d  %s\n", $5, $NF}'
+ls -l dist dist/chunks dist/lazy | grep '\.js$' | awk '{printf "%8d  %s\n", $5, $NF}'
 echo
 echo "gzip sizes:"
-for f in dist/*.js dist/chunks/*.js; do printf "%8d  %s\n" "$(gzip -9c "$f" | wc -c)" "$f"; done
+for f in dist/*.js dist/chunks/*.js dist/lazy/*.js; do printf "%8d  %s\n" "$(gzip -9c "$f" | wc -c)" "$f"; done

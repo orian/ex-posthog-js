@@ -10,10 +10,13 @@ import { ROOT } from '../harness.mjs'
 import { RESPONSES, ALLOWED } from './fixtures.mjs'
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+// DIFF_BUNDLE=lazy/posthog.js: the lazy build, which loads its lazy parts where upstream does.
+const LAZY_BUNDLE = /^lazy\//.test(process.env.DIFF_BUNDLE || '')
 const REFERRER = 'https://www.google.com/search?q=posthog'
 
 async function runScenario(chrome, srv, scenario, sdk) {
     srv.state.log = []
+    srv.state.sdkLog = []
     srv.state.responses = { ...RESPONSES.default, ...(RESPONSES[scenario] || {}) }
     const page = await chrome.newPage()
     const bundle = process.env.DIFF_BUNDLE ? `&bundle=${process.env.DIFF_BUNDLE}` : ''
@@ -26,7 +29,7 @@ async function runScenario(chrome, srv, scenario, sdk) {
     await page.goto('about:blank') // real unload: pagehide / beforeunload
     await sleep(700)
     await page.close()
-    return { log: srv.state.log.slice(), error, results, pageErrors: page.consoleErrors.slice() }
+    return { log: srv.state.log.slice(), sdkLog: srv.state.sdkLog.slice(), error, results, pageErrors: page.consoleErrors.slice() }
 }
 
 // ---- normalisation -----------------------------------------------------------
@@ -39,6 +42,11 @@ const VOLATILE_KEYS = new Set(['$time', '$insert_id', 'sent_at', 'timestamp', '$
     '$timezone_offset', '$time_since_page_load'])
 // Dead click/swipe timing: wall-clock timestamps and measured delays (presence still compared).
 const VOLATILE_KEY_PATTERN = /^\$dead_(click|swipe)_(.*_timestamp|.*_delay_ms)$/
+// Compiled-in builds only: their dead click detector starts synchronously at init, so it sees
+// the SDK's own config.js <script> being inserted, which upstream's detector (started once
+// /static/dead-clicks-autocapture.js has loaded) does not: whether a mutation was seen before
+// the click (`last_mutation_timestamp`) differs. The lazy build starts it where upstream does.
+const COMPILED_IN_ONLY = /^\$dead_(click|swipe)_last_mutation_timestamp$/
 
 // ---- session replay ($snapshot) --------------------------------------------------
 // Replay payloads are made comparable without hiding structure:
@@ -103,6 +111,17 @@ function estimateCompressedEventSize(value) {
     }
 }
 
+// The lazy build's replay chunk is half of upstream's lazy-recorder.js (the other half is
+// PostHog's recorder.js, which both load): its resource entry in the network plugin's initial
+// capture has no upstream counterpart. (Its <script> is removed once it has run.)
+const OUR_REPLAY_CHUNK = /\/sdk\/ours\/lazy\/replay\.js(\?|$)/
+function dropReplayChunkEntry(e) {
+    const payload = e && e.type === 6 && e.data && e.data.plugin === 'rrweb/network@1' && e.data.payload
+    if (!payload || !Array.isArray(payload.requests)) return e
+    const requests = payload.requests.filter((r) => !OUR_REPLAY_CHUNK.test(r.name || ''))
+    return { ...e, data: { ...e.data, payload: { ...payload, requests } } }
+}
+
 function expandSnapshot(e) {
     const p = e.properties
     if (!p || !Array.isArray(p.$snapshot_data)) return e
@@ -112,7 +131,7 @@ function expandSnapshot(e) {
     // before it is sent (e.g. `$posthog_config` holds the live config) is off by
     // the same delta in both SDKs.
     const bytes = p.$snapshot_bytes === expected ? '<consistent>' : `<inconsistent by ${p.$snapshot_bytes - expected}>`
-    return { ...e, properties: { ...p, $snapshot_bytes: bytes, $snapshot_data: p.$snapshot_data.map(decompressReplayEvent) } }
+    return { ...e, properties: { ...p, $snapshot_bytes: bytes, $snapshot_data: p.$snapshot_data.map(decompressReplayEvent).map(dropReplayChunkEntry) } }
 }
 
 function normaliseUrls(value) {
@@ -140,6 +159,7 @@ const WEB_VITALS_VALUE = /^\$web_vitals_(LCP|CLS|FCP|INP)_value$/
 const TRACEPARENT = /^00-(?!0{32})[0-9a-f]{32}-(?!0{16})[0-9a-f]{16}-01$/
 
 function normalise(value, ids, key, inNetwork, inWebVitals) {
+    if (!LAZY_BUNDLE && COMPILED_IN_ONLY.test(key || '')) return undefined
     if (inWebVitals && WEB_VITALS_VOLATILE.has(key) && typeof value === 'number') return '<volatile>'
     if (inWebVitals && key === 'id' && typeof value === 'string' && /^v6-\d+-\d+$/.test(value)) return '<v6-id>'
     if (inWebVitals === 'FCP' && key === 'loadState' && typeof value === 'string') return '<volatile>'
@@ -305,12 +325,60 @@ function compare(official, ours) {
     if (pageErrors.length) out.push(`page errors (ours): ${pageErrors.join(' | ')}`)
     // Web vitals are compiled into our SDK: it must never fetch upstream's web-vitals scripts.
     for (const r of ours.log) if (/^\/static\/(?:[\w.-]+\/)?web-vitals/.test(r.path)) out.push(`ours requested ${r.path}`)
+    if (LAZY_BUNDLE) {
+        const { theirs, mine } = lazyLoads(official, ours)
+        if (theirs.join() !== mine.join()) out.push(`lazy loads: official=[${theirs}] ours=[${mine}]`)
+    }
     return out
+}
+
+// ---- lazy chunks (DIFF_BUNDLE=lazy/posthog.js) ----------------------------------------
+// The lazy build loads its chunks where upstream calls loadExternalDependency(posthog, kind):
+// both SDKs must load the same kinds, in the same order, under the same conditions.
+// Upstream kind -> what our lazy build loads instead (from /sdk/ours/lazy/<chunk>.js, or
+// PostHog's recorder.js for rrweb). Kinds that are not lazy-loaded parts of ours are left out:
+// PostHog-hosted toolbar.js (its requests are compared above) and the modules we don't port
+// (surveys, product tours, conversations, site apps).
+const LAZY_KINDS = {
+    'lazy-recorder': 'replay', // our replay chunk + PostHog's recorder.js (rrweb)
+    'exception-autocapture': 'exception-autocapture',
+    'dead-clicks-autocapture': 'dead-clicks-autocapture',
+    // One chunk serves every web vitals flavour; the flavour picks its callbacks.
+    'web-vitals': 'web-vitals',
+    'web-vitals-with-attribution': 'web-vitals',
+    'web-vitals-soft-navs': 'web-vitals',
+    'web-vitals-with-attribution-soft-navs': 'web-vitals',
+    'tracing-headers': 'tracing-headers',
+    logs: 'logs',
+}
+const staticKind = (p) => (/^\/static\/(?:[\w.-]+\/)?([\w.-]+)\.js$/.exec(p) || [])[1]
+
+function lazyLoads(official, ours) {
+    const theirs = official.log.map((r) => LAZY_KINDS[staticKind(r.path)]).filter(Boolean)
+    // Ours: chunk requests and recorder.js, in request order. Upstream's lazy-recorder.js is our
+    // replay chunk plus recorder.js, requested together; either alone when the other is present.
+    const events = [
+        ...ours.sdkLog.filter((r) => /^\/sdk\/ours\/lazy\//.test(r.path) && !/\/posthog\.js$/.test(r.path))
+            .map((r) => ({ seq: r.seq, kind: path.basename(r.path, '.js') })),
+        ...ours.log.filter((r) => staticKind(r.path) === 'recorder').map((r) => ({ seq: r.seq, kind: 'recorder' })),
+    ].sort((a, b) => a.seq - b.seq).map((e) => e.kind)
+    const mine = []
+    for (let i = 0; i < events.length; i++) {
+        const pair = (events[i] === 'replay' && events[i + 1] === 'recorder') || (events[i] === 'recorder' && events[i + 1] === 'replay')
+        if (pair) i++
+        mine.push(events[i] === 'recorder' ? 'replay' : events[i])
+    }
+    return { theirs, mine }
 }
 
 // ---- main ----------------------------------------------------------------------
 
+// Lazy-build only: every lazily loaded part at once, to check the order of the chunk requests.
+// Compiled in, our web vitals report earlier than upstream's (see README), which reorders
+// the $web_vitals batches against the logs flush there.
+const LAZY_ONLY = new Set(['lazy_all_features'])
 const all = Object.keys((await import('./scenario-list.mjs')).SCENARIO_NAMES.reduce((a, n) => ({ ...a, [n]: 1 }), {}))
+    .filter((n) => LAZY_BUNDLE || !LAZY_ONLY.has(n))
 const selected = process.argv.slice(2).length ? process.argv.slice(2) : all
 const srv = await startServer()
 const chrome = await launchChrome()
@@ -322,6 +390,7 @@ try {
         const ours = await runScenario(chrome, srv, scenario, 'ours')
         const diffs = compare(official, ours)
         report[scenario] = { diffs, official: digest(official.log), ours: digest(ours.log) }
+        if (LAZY_BUNDLE) report[scenario].lazyLoads = lazyLoads(official, ours)
         if (diffs.length) failures++
         console.log(`${diffs.length ? 'DIFF' : 'same'}  ${scenario}${diffs.length ? ` (${diffs.length})` : ''}`)
         for (const d of diffs.slice(0, 60)) console.log('      ' + d)

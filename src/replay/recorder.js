@@ -1,6 +1,8 @@
 /**
  * @fileoverview Port of upstream replay/external/lazy-loaded-session-recorder.ts
- * (the PostHog logic upstream ships in lazy-recorder.js). rrweb itself comes
+ * (the PostHog logic upstream ships in lazy-recorder.js): the lazy part
+ * `replay`, registered with provideLazy for SessionRecording
+ * (session-recording.js), compiled in except in the lazy build. rrweb itself comes
  * from the recorder.js script (`window.__PosthogExtensions__.rrweb.record`
  * and `.rrwebPlugins`), always accessed with quoted names. rrweb events,
  * custom-event payloads, the buffer and persisted values use quoted keys.
@@ -37,6 +39,10 @@ import {
   gzipField, gzipFieldAsync, gzipToString, gzipToStringAsync, isGzipSupported, isNativeAsyncGzipError,
 } from './gzip-field.js';
 import {JSON_LD_EVENT_TAG, startJsonLdCapture} from './json-ld.js';
+import {provideLazy} from '../core/lazy.js';
+import {
+  LazyLoadedSessionRecordingApi, REPLAY_KIND, SessionRecordingFactory, getRRWeb, getRRWebRecord,
+} from './session-recording.js';
 
 const BASE_ENDPOINT = '/s/';
 const DEFAULT_CANVAS_QUALITY = 0.4;
@@ -94,18 +100,6 @@ let CompressedEventResult;
  */
 function newQueuedEvent(rrwebMethod) {
   return {rrwebMethod: rrwebMethod, enqueuedAt: Date.now(), attempt: 1};
-}
-
-/** @return {?} `__PosthogExtensions__.rrweb` from recorder.js */
-export function getRRWeb() {
-  const ext = win ? win['__PosthogExtensions__'] : undefined;
-  return ext ? ext['rrweb'] : undefined;
-}
-
-/** @return {?} the rrweb `record` function */
-export function getRRWebRecord() {
-  const rrweb = getRRWeb();
-  return rrweb ? rrweb['record'] : undefined;
 }
 
 /** @return {?} `__PosthogExtensions__.rrwebPlugins` */
@@ -339,7 +333,7 @@ function cancelHandoff(cancellation) {
   if (cancellation) cancellation.cancel();
 }
 
-
+/** @implements {LazyLoadedSessionRecordingApi} */
 export class LazyLoadedSessionRecording {
   /**
    * @param {!PostHog} instance
@@ -2472,3 +2466,7 @@ export class SessionManagerLike {
    */
   onForcedIdleReset(cb) {}
 }
+
+provideLazy(REPLAY_KIND, /** @type {!SessionRecordingFactory} */ (function(instance, documentWasEverVisible) {
+  return new LazyLoadedSessionRecording(instance, documentWasEverVisible);
+}));

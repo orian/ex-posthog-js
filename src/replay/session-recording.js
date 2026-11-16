@@ -4,16 +4,20 @@
  * rrweb (recorder.js) and drives the recorder (recorder.js in this folder,
  * upstream's lazy-loaded-session-recorder.ts).
  *
- * Difference from upstream: upstream lazy-loads `lazy-recorder.js` (rrweb +
- * the recorder logic); we compile the recorder logic in and only load
- * `recorder.js` (rrweb + its plugins). The `scriptConfig.script` remote
- * override (which picks another upstream bundle) is therefore ignored.
+ * Upstream lazy-loads `lazy-recorder.js` (rrweb + the recorder logic). Here
+ * the recorder logic is the lazy part `replay` (recorder.js) and rrweb comes
+ * from PostHog's `recorder.js` (rrweb + its plugins). In the bundles and chunks
+ * the recorder logic is compiled in and only `recorder.js` is loaded; the lazy
+ * build loads the `replay` chunk and `recorder.js` together where upstream
+ * loads `lazy-recorder.js`. The `scriptConfig.script` remote override (which
+ * picks another upstream bundle) is ignored.
  */
 import {PostHog} from '../core/posthog.js';
 import {Extension} from '../core/extensions.js';
 import {logger as baseLogger} from '../core/logger.js';
 import {Config, UPSTREAM_VERSION} from '../core/constants.js';
 import {loadScript} from '../core/script-loader.js';
+import {lazyPart, loadLazy} from '../core/lazy.js';
 import {addEventListener, doc, isNullish, isNumber, isObject, isUndefined, win} from '../core/utils.js';
 import {
   AWAITING_CONFIG, DISABLED, LAZY_LOADING, MISSING_CONFIG, RECORDING_REMOTE_CONFIG_TTL_MS,
@@ -25,7 +29,70 @@ import {
   SESSION_RECORDING_OVERRIDE_SAMPLING, SESSION_RECORDING_OVERRIDE_URL_TRIGGER, SESSION_RECORDING_REMOTE_CONFIG,
   SESSION_RECORDING_SAMPLE_RATE,
 } from './constants.js';
-import {LazyLoadedSessionRecording, getRRWebRecord} from './recorder.js';
+
+/** @const {string} the lazy part (upstream kind `lazy-recorder`, without rrweb) */
+export const REPLAY_KIND = 'replay';
+
+/**
+ * The recorder (upstream LazyLoadedSessionRecordingInterface), recorder.js.
+ * @record
+ */
+export class LazyLoadedSessionRecordingApi {
+  constructor() {
+    /** @type {boolean} */
+    this.forceAllowLocalhostNetworkCapture;
+  }
+  /** @return {boolean} */
+  isStarted() {}
+  /** @return {string} */
+  status() {}
+  /** @param {boolean} documentWasEverVisible */
+  setDocumentWasEverVisible(documentWasEverVisible) {}
+  /** @param {string=} startReason */
+  start(startReason) {}
+  /** @param {boolean=} preserveStyleRuleSourceHandoff */
+  stop(preserveStyleRuleSourceHandoff) {}
+  /** @param {boolean=} discardProducerEvents */
+  discard(discardProducerEvents) {}
+  /**
+   * @param {string} message
+   * @param {string=} level
+   */
+  log(message, level) {}
+  /** @param {*} rawEvent */
+  onRRwebEmit(rawEvent) {}
+  overrideLinkedFlag() {}
+  overrideSampling() {}
+  /** @param {string} triggerType */
+  overrideTrigger(triggerType) {}
+  /** @return {!Object} */
+  sdkDebugProperties() {}
+  /**
+   * @param {string} tag
+   * @param {*} payload
+   * @return {boolean}
+   */
+  tryAddCustomEvent(tag, payload) {}
+  flushBeforeIdentityReset() {}
+}
+
+/**
+ * Upstream `__PosthogExtensions__.initSessionRecording(posthog, documentWasEverVisible)`.
+ * @typedef {function(!PostHog, boolean=): !LazyLoadedSessionRecordingApi}
+ */
+export let SessionRecordingFactory;
+
+/** @return {?} `__PosthogExtensions__.rrweb` from recorder.js */
+export function getRRWeb() {
+  const ext = win ? win['__PosthogExtensions__'] : undefined;
+  return ext ? ext['rrweb'] : undefined;
+}
+
+/** @return {?} the rrweb `record` function */
+export function getRRWebRecord() {
+  const rrweb = getRRWeb();
+  return rrweb ? rrweb['record'] : undefined;
+}
 
 const LOGGER_PREFIX = '[SessionRecording]';
 const logger = baseLogger.createLogger(LOGGER_PREFIX);
@@ -153,7 +220,7 @@ export class SessionRecording {
     this.recordingStatus_ = DISABLED;
     /** @private {(function()|undefined)} */
     this.persistFlagsOnSessionListener_ = undefined;
-    /** @private {?LazyLoadedSessionRecording} */
+    /** @private {?LazyLoadedSessionRecordingApi} */
     this.lazyLoadedSessionRecording_ = null;
     /** @private {boolean} */
     this.sessionRecordingDisposed_ = false;
@@ -244,11 +311,24 @@ export class SessionRecording {
     if (this.recordingStatus_ !== AWAITING_CONFIG && this.recordingStatus_ !== MISSING_CONFIG) {
       this.recordingStatus_ = LAZY_LOADING;
     }
-    // Only rrweb is loaded at runtime; the recorder logic is compiled in.
-    if (!getRRWebRecord()) {
+    // Upstream loads lazy-recorder.js unless both rrweb and the recorder logic
+    // are present. The recorder logic is compiled in (or, in the lazy build, our
+    // `replay` chunk, loaded next to PostHog's recorder.js with rrweb).
+    const needsRecorderLogic = !lazyPart(REPLAY_KIND);
+    const needsRRWeb = !getRRWebRecord();
+    if (needsRecorderLogic || needsRRWeb) {
       const sessionManager = this.instance_.sessionManager;
       const self = this;
-      loadExternalDependency(this.instance_, RECORDER_SCRIPT, function(err) {
+      let pending = (needsRecorderLogic ? 1 : 0) + (needsRRWeb ? 1 : 0);
+      /** @type {(string|!Event|undefined)} */
+      let firstError = undefined;
+      /** @param {(string|!Event)=} err */
+      const loaded = function(err) {
+        if (err && !firstError) firstError = err;
+        if (--pending > 0) return;
+        onLoaded(firstError);
+      };
+      const onLoaded = function(err) {
         if (self.sessionRecordingDisposed_ || !self.isRecordingEnabled_() ||
             self.instance_.sessionManager !== sessionManager) {
           self.recordingStatus_ = DISABLED;
@@ -260,7 +340,9 @@ export class SessionRecording {
           return;
         }
         self.onScriptLoaded_(startReason);
-      });
+      };
+      if (needsRecorderLogic) loadLazy(this.instance_, REPLAY_KIND, loaded);
+      if (needsRRWeb) loadExternalDependency(this.instance_, RECORDER_SCRIPT, loaded);
     } else {
       this.onScriptLoaded_(startReason);
     }
@@ -413,13 +495,14 @@ export class SessionRecording {
       this.recordingStatus_ = DISABLED;
       return;
     }
-    if (!getRRWebRecord()) {
+    const factory = /** @type {!SessionRecordingFactory|undefined} */ (lazyPart(REPLAY_KIND));
+    if (!getRRWebRecord() || !factory) {
       logger.warn('Called on script loaded before session recording is available. This can be caused by adblockers.');
       this.instance_.register_for_session({[SDK_DEBUG_RECORDING_SCRIPT_NOT_LOADED]: true});
       return;
     }
     if (!this.lazyLoadedSessionRecording_) {
-      this.lazyLoadedSessionRecording_ = new LazyLoadedSessionRecording(this.instance_, this.documentWasEverVisible_);
+      this.lazyLoadedSessionRecording_ = factory(this.instance_, this.documentWasEverVisible_);
       this.lazyLoadedSessionRecording_.forceAllowLocalhostNetworkCapture =
           !!this.forceAllowLocalhostNetworkCapture;
     }

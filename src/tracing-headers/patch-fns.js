@@ -4,12 +4,14 @@
  * `X-POSTHOG-WINDOW-ID` and `X-POSTHOG-DISTINCT-ID` to requests for the
  * configured hostnames, and a fresh W3C `traceparent` to requests for
  * `trace_propagation_targets`. Upstream lazy-loads these from
- * `/static/tracing-headers.js`; here they are compiled into the module.
+ * `/static/tracing-headers.js`: they are the lazy part `tracing-headers`
+ * (registered by lazy.js), compiled in except in the lazy build.
  */
 import {SessionManager} from '../core/session.js';
 import {COOKIELESS_SENTINEL_VALUE} from '../core/constants.js';
 import {isArray, isFunction, isNull, isString, isUndefined, win} from '../core/utils.js';
 import {patch} from './patch.js';
+import {TraceparentTargets, TracingHeadersHostnames} from './types.js';
 
 const SESSION_ID_HEADER = 'X-POSTHOG-SESSION-ID';
 const WINDOW_ID_HEADER = 'X-POSTHOG-WINDOW-ID';
@@ -22,18 +24,6 @@ const REQUEST_INIT_KEYS = [
   'keepalive', 'method', 'mode', 'priority', 'redirect', 'referrer', 'referrerPolicy', 'signal', 'window',
 ];
 
-/**
- * Hostnames (or `true` for every host, the legacy `__add_tracing_headers`
- * boolean), mutated in place on config changes.
- * @typedef {!Array<string>|boolean|undefined}
- */
-export let TracingHeadersHostnames;
-
-/**
- * Targets that may receive `traceparent`, mutated in place on config changes.
- * @typedef {!Array<string>|undefined}
- */
-export let TraceparentTargets;
 
 /**
  * @param {!Object} value

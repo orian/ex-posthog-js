@@ -1,12 +1,6 @@
 /**
- * @fileoverview Registers the tracing headers module, published as
- * `posthog.tracingHeaders` like upstream. Needs only the core chunk.
+ * @fileoverview Tracing headers with the fetch/XHR patches compiled in (they
+ * register first, so the extension finds them when it starts).
  */
-import {registerExtension} from '../core/extensions.js';
-import {TracingHeaders} from './tracing-headers.js';
-
-TracingHeaders.prototype['startIfEnabledOrStop'] = TracingHeaders.prototype.startIfEnabledOrStop;
-
-registerExtension('tracingHeaders', function(instance) {
-  return new TracingHeaders(instance);
-});
+import './lazy.js';
+import './shell.js';

@@ -27,3 +27,5 @@ SCENARIO_NAMES.push('logs_api', 'logs_before_send', 'logs_batching', 'logs_batch
     'logs_opt_out', 'logs_console_config', 'logs_console_remote', 'logs_console_persisted', 'logs_console_remote_off',
     'metrics_api', 'metrics_batching', 'toolbar_hash', 'toolbar_hash_legacy', 'toolbar_load', 'toolbar_persisted',
     'toolbar_fallback', 'toolbar_none')
+// Every lazily loaded part at once (pages/scenarios.js, last block).
+SCENARIO_NAMES.push('lazy_all_features')

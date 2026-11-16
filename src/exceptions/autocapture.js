@@ -5,200 +5,42 @@
  * of browser/src/entrypoints/exception-autocapture.ts (`window.onerror`,
  * `window.onunhandledrejection`, `console.error`).
  *
- * Upstream lazy-loads the wrapping functions as `/static/exception-autocapture.js`;
- * here they are compiled into the module, so capturing starts synchronously.
+ * The wrapping functions are the lazy part `exception-autocapture`
+ * (wrappers.js; upstream `/static/exception-autocapture.js`). In the bundles
+ * and chunks they are compiled in, so capturing starts synchronously; the
+ * lazy build loads them as their own chunk at upstream's trigger point.
  */
 import {PostHog} from '../core/posthog.js';
 import {Extension} from '../core/extensions.js';
 import {logger as baseLogger} from '../core/logger.js';
-import {isFunction, isObject, isString, isUndefined, win} from '../core/utils.js';
-import {buildErrorPropertiesBuilder} from './error-tracking.js';
+import {lazyPart, loadLazy} from '../core/lazy.js';
+import {isObject, isUndefined, win} from '../core/utils.js';
 import {BucketedRateLimiter, resolveExceptionRateLimiterConfig} from './bucketed-rate-limiter.js';
 import {PostHogExceptions} from './exceptions.js';
 
 const logger = baseLogger.createLogger('[ExceptionAutocapture]');
 
 export const EXCEPTION_CAPTURE_ENABLED_SERVER_SIDE = '$exception_capture_enabled_server_side';
-const INSTRUMENTED = '__POSTHOG_INSTRUMENTED__';
 
-const errorPropertiesBuilder = buildErrorPropertiesBuilder();
+/** @const {string} the lazy part (upstream kind) */
+export const EXCEPTION_AUTOCAPTURE_KIND = 'exception-autocapture';
 
 /** @typedef {function(!Object)} */
-let CaptureFn;
+export let CaptureFn;
 
-// Exception autocapture must never throw into customer code. Do not log in the
-// catch because console.error may be instrumented and would re-enter it.
 /**
- * @param {function(): T} fn
- * @param {T} fallback
- * @return {T}
- * @template T
+ * Upstream `__PosthogExtensions__.errorWrappingFunctions`; each returns its unwrap function.
+ * @record
  */
-function safely(fn, fallback) {
-  try {
-    return fn();
-  } catch (e) {
-    return fallback;
+export class ErrorWrappingFunctions {
+  constructor() {
+    /** @type {function(!CaptureFn): function()} */
+    this.wrapOnError;
+    /** @type {function(!CaptureFn, boolean=): function()} */
+    this.wrapUnhandledRejection;
+    /** @type {function(!CaptureFn): function()} */
+    this.wrapConsoleError;
   }
-}
-
-/**
- * @param {!CaptureFn} captureFn
- * @param {function(): !Object} buildProperties
- */
-function safelyBuildAndCapture(captureFn, buildProperties) {
-  safely(function() {
-    captureFn(buildProperties());
-  }, undefined);
-}
-
-/**
- * The handler is probed inside the guard (Firefox throws on dead/cross-compartment objects).
- * @param {*} handler
- * @return {boolean}
- */
-function isReachableFunction(handler) {
-  return safely(function() {
-    return isFunction(handler) && isFunction(handler['call']);
-  }, false);
-}
-
-/**
- * @param {!Object} owner
- * @param {string} key
- */
-function markInstrumented(owner, key) {
-  safely(function() {
-    owner[key][INSTRUMENTED] = true;
-  }, undefined);
-}
-
-/**
- * @param {!Object} owner
- * @param {string} key
- * @param {*} original
- */
-function restore(owner, key, original) {
-  safely(function() {
-    const current = owner[key];
-    if (current != null) delete current[INSTRUMENTED];
-  }, undefined);
-  safely(function() {
-    owner[key] = original;
-  }, undefined);
-}
-
-/**
- * `window.onerror` passes the location positionally; keep it when there is no Error.
- * @param {!Array<*>} args
- * @return {*}
- */
-function resolveOnErrorInput(args) {
-  const event = args[0];
-  const source = args[1];
-  const error = args[4];
-  if (error != null) return error;
-  if (isString(event) && isString(source) && /** @type {string} */ (source).length > 0 &&
-      typeof ErrorEvent !== 'undefined') {
-    try {
-      return new ErrorEvent('error', /** @type {!ErrorEventInit} */ ({
-        'message': event, 'filename': source, 'lineno': args[2], 'colno': args[3],
-      }));
-    } catch (e) {
-      return event;
-    }
-  }
-  return event;
-}
-
-/**
- * @param {!CaptureFn} captureFn
- * @return {function()} unwrap
- */
-export function wrapOnError(captureFn) {
-  const w = /** @type {?} */ (win);
-  if (!w) logger.info('window not available, cannot wrap onerror');
-  const originalOnError = /** @type {?} */ (safely(function() {
-    return /** @type {?} */ (w.onerror);
-  }, /** @type {?} */ (undefined)));
-  w.onerror = function(...args) {
-    safelyBuildAndCapture(captureFn, function() {
-      return errorPropertiesBuilder.buildFromUnknown(resolveOnErrorInput(args), {mechanism: {'handled': false}});
-    });
-    if (!isReachableFunction(originalOnError)) return false;
-    const result = originalOnError.apply(undefined, args);
-    return result == null ? false : result;
-  };
-  markInstrumented(w, 'onerror');
-  return function() {
-    restore(w, 'onerror', originalOnError);
-  };
-}
-
-/**
- * @param {!CaptureFn} captureFn
- * @param {boolean=} defaultReturnValue
- * @return {function()} unwrap
- */
-export function wrapUnhandledRejection(captureFn, defaultReturnValue) {
-  const w = /** @type {?} */ (win);
-  if (!w) logger.info('window not available, cannot wrap onUnhandledRejection');
-  const original = /** @type {?} */ (safely(function() {
-    return /** @type {?} */ (w.onunhandledrejection);
-  }, /** @type {?} */ (undefined)));
-  w.onunhandledrejection = function(ev) {
-    safelyBuildAndCapture(captureFn, function() {
-      return errorPropertiesBuilder.buildFromUnknown(ev, {mechanism: {'handled': false}});
-    });
-    if (!isReachableFunction(original)) return !!defaultReturnValue;
-    const result = original(ev);
-    return result == null ? false : result;
-  };
-  markInstrumented(w, 'onunhandledrejection');
-  return function() {
-    restore(w, 'onunhandledrejection', original);
-  };
-}
-
-/**
- * @param {!CaptureFn} captureFn
- * @return {function()} unwrap
- */
-export function wrapConsoleError(captureFn) {
-  const con = /** @type {?} */ (typeof console !== 'undefined' ? console : undefined);
-  if (!con) logger.info('console not available, cannot wrap console.error');
-  const originalConsoleError = /** @type {?} */ (safely(function() {
-    return /** @type {?} */ (con.error);
-  }, /** @type {?} */ (undefined)));
-  con.error = function(...args) {
-    // SDK loggers pass the prefix and the diagnostic separately.
-    const isInternalDiagnostic = safely(function() {
-      return args.length > 1 && isString(args[0]) &&
-          (/^\[PostHog\.js\](?: |$)/.test(/** @type {string} */ (args[0])) || args[0] === 'rrweb logger error:');
-    }, false);
-    if (!isInternalDiagnostic) {
-      safelyBuildAndCapture(captureFn, function() {
-        const event = args.length == 1 ? args[0] : args.join(' ');
-        let error = undefined;
-        for (let i = 0; i < args.length; i++) {
-          if (args[i] instanceof Error) {
-            error = args[i];
-            break;
-          }
-        }
-        return errorPropertiesBuilder.buildFromUnknown(error || event, {
-          mechanism: {'handled': true, 'type': 'onconsole'},
-          syntheticException: new Error('PostHog syntheticException'),
-          skipFirstLines: 2,
-        });
-      });
-    }
-    if (isReachableFunction(originalConsoleError)) originalConsoleError.apply(undefined, args);
-  };
-  markInstrumented(con, 'error');
-  return function() {
-    restore(con, 'error', originalConsoleError);
-  };
 }
 
 /** @implements {Extension} */
@@ -260,7 +102,15 @@ export class ExceptionObserver {
     if (this.enabled_()) {
       logger.info('enabled');
       this.stopCapturing_();
-      this.startCapturing_();
+      // Upstream `_loadScript(this._startCapturing)`.
+      const self = this;
+      loadLazy(this.ph_, EXCEPTION_AUTOCAPTURE_KIND, function(err) {
+        if (err) {
+          logger.error('failed to load script', err);
+          return;
+        }
+        self.startCapturing_();
+      });
     } else {
       this.stopCapturing_();
     }
@@ -268,20 +118,21 @@ export class ExceptionObserver {
 
   /** @private */
   startCapturing_() {
-    if (!win || !this.enabled_()) return;
+    const fns = /** @type {!ErrorWrappingFunctions|undefined} */ (lazyPart(EXCEPTION_AUTOCAPTURE_KIND));
+    if (!win || !this.enabled_() || !fns) return;
     const self = this;
     const capture = function(props) {
       self.captureException(props);
     };
     try {
       if (!this.unwrapOnError_ && this.config_['capture_unhandled_errors']) {
-        this.unwrapOnError_ = wrapOnError(capture);
+        this.unwrapOnError_ = fns.wrapOnError(capture);
       }
       if (!this.unwrapUnhandledRejection_ && this.config_['capture_unhandled_rejections']) {
-        this.unwrapUnhandledRejection_ = wrapUnhandledRejection(capture);
+        this.unwrapUnhandledRejection_ = fns.wrapUnhandledRejection(capture);
       }
       if (!this.unwrapConsoleError_ && this.config_['capture_console_errors']) {
-        this.unwrapConsoleError_ = wrapConsoleError(capture);
+        this.unwrapConsoleError_ = fns.wrapConsoleError(capture);
       }
     } catch (e) {
       logger.error('failed to start', e);

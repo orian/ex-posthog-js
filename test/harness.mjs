@@ -47,7 +47,8 @@ export function createBrowser(opts = {}) {
     const scripts = []
     // <script> injection: the request is recorded, then the load fails (scripts
     // don't execute here), so the SDK takes its JSON fallback paths. A route
-    // answering { script: fn } instead runs fn(window) and fires onload.
+    // answering { script: fn } instead runs fn(window) (awaited when it returns
+    // a promise) and fires onload.
     const appendScript = (el) => {
         if (el.tagName !== 'SCRIPT') return el
         scripts.push(el)
@@ -55,9 +56,9 @@ export function createBrowser(opts = {}) {
         const req = { url: el.src, method: 'GET', path: u.pathname, transport: 'script' }
         requests.push(req)
         const res = respond(req)
-        setTimeout(() => {
+        setTimeout(async () => {
             if (res && typeof res.script === 'function') {
-                res.script(window)
+                await res.script(window)
                 el.onload && el.onload({ type: 'load' })
             } else {
                 el.onerror && el.onerror({ type: 'error' })
@@ -99,6 +100,7 @@ export function createBrowser(opts = {}) {
         querySelectorAll(sel) { return sel === 'script' || sel === 'body > script' ? [] : elements[sel] || [] },
         querySelector(sel) { return (elements[sel] || [])[0] || null },
         addEventListener(type, fn) { (listenersDoc[type] ||= []).push(fn) },
+        getSelection() { return null },
     }
 
     const decodeBody = async (u, body) => {
@@ -158,6 +160,8 @@ export function createBrowser(opts = {}) {
         AbortController,
         Intl, JSON, Math, Date, Object, Array, String, Number, RegExp, Uint8Array, Int32Array, ArrayBuffer, Error,
         URL, Headers, TypeError,
+        // Observes nothing (no DOM here); enough for the dead click detector to start.
+        MutationObserver: class { observe() {} disconnect() {} takeRecords() { return [] } },
         performance: { now: () => performance.now() },
         encodeURIComponent, decodeURIComponent, unescape, escape, btoa, atob, parseFloat, isNaN,
         setTimeout, clearTimeout, setInterval, clearInterval,
@@ -179,18 +183,34 @@ export function createBrowser(opts = {}) {
     return {
         window, document, requests, elements, cookies, scripts,
         dispatch(type) { (listeners[type] || []).forEach((fn) => fn({ type })) },
-        /** Runs a compiled bundle (or chunk) as a classic script. */
+        /**
+         * Runs a compiled bundle (or chunk) as a classic script, served from
+         * `<origin>/<file>` (document.currentScript while it runs).
+         */
         loadScript(file) {
             if (!this.context) this.context = vm.createContext(window)
-            vm.runInContext(fs.readFileSync(path.join(ROOT, file), 'utf8'), this.context, { filename: file })
+            document.currentScript = { src: `${url.origin}/${file}` }
+            try {
+                vm.runInContext(fs.readFileSync(path.join(ROOT, file), 'utf8'), this.context, { filename: file })
+            } finally {
+                document.currentScript = null
+            }
         },
-        /** Imports raw ES module sources with this window as the global. */
-        async importSource(entry) {
+        /**
+         * Imports raw ES module sources with this window as the global. With
+         * `fresh`, the entry gets its own module state (a cache-busting query);
+         * modules it imports are shared within the process.
+         */
+        async importSource(entry, fresh = true) {
             // The SDK only reads the `window` global (everything else hangs off it).
             globalThis.window = window
-            // Each import needs fresh module state: add a cache-busting query.
-            const u = pathToFileURL(path.join(ROOT, entry)).href + '?t=' + Math.random()
-            return import(u)
+            document.currentScript = { src: `${url.origin}/${entry}` }
+            try {
+                const u = pathToFileURL(path.join(ROOT, entry)).href + (fresh ? '?t=' + Math.random() : '')
+                return await import(u)
+            } finally {
+                document.currentScript = null
+            }
         },
     }
 }

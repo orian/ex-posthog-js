@@ -57,9 +57,9 @@ const {
 } = await import('../src/exceptions/bucketed-rate-limiter.js')
 const { ERROR_TRACKING_CAPTURE_EXTENSION_EXCEPTIONS, ERROR_TRACKING_SUPPRESSION_RULES, PostHogExceptions } =
     await import('../src/exceptions/exceptions.js')
-const { ExceptionObserver, wrapConsoleError, wrapOnError, wrapUnhandledRejection } = await import(
-    '../src/exceptions/autocapture.js'
-)
+// wrappers.js (the lazy part) registers the wrapping functions ExceptionObserver uses.
+const { wrapConsoleError, wrapOnError, wrapUnhandledRejection } = await import('../src/exceptions/wrappers.js')
+const { ExceptionObserver } = await import('../src/exceptions/autocapture.js')
 
 // ---------------------------------------------------------------------------
 // Small stand-ins for vitest's expect helpers.

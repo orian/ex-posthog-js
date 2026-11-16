@@ -13,9 +13,11 @@
  *   `posthog-browser-logs` and scope `console`. Like upstream, a recorder
  *   buffers console calls while the decision is pending (persisted hint, or the
  *   remote config enabling it) and hands them over when capture starts.
- *   Upstream loads the capture code as `/static/logs.js`; here it is compiled in,
- *   so the hand-over happens synchronously (still refused under
- *   `disable_external_dependency_loading`, as upstream's script load is).
+ *   Upstream loads the capture code as `/static/logs.js`: it is the lazy part
+ *   `logs` (console-logs.js). The lazy build loads it as its own chunk at the
+ *   same point; elsewhere it is compiled in, so the hand-over happens
+ *   synchronously (still refused under `disable_external_dependency_loading`,
+ *   as upstream's script load is).
  * - On unload (with `request_batching`) both queues are drained with sendBeacon.
  */
 import {PostHog} from '../core/posthog.js';
@@ -30,9 +32,10 @@ import {
   resolveLogsConfig,
 } from './logs-core.js';
 import {
-  BUFFERED_CONSOLE_LEVELS, BufferedConsoleEntry, ConsoleLogsHost, ConsoleLogsSink, initializeLogs,
-  originalConsoleMethod, replayConsoleBuffer,
-} from './console-logs.js';
+  BUFFERED_CONSOLE_LEVELS, BufferedConsoleEntry, ConsoleLogsHost, ConsoleLogsPart, ConsoleLogsSink, LOGS_KIND,
+  originalConsoleMethod,
+} from './console-types.js';
+import {lazyChunksEnabled, lazyPart, loadLazy} from '../core/lazy.js';
 
 /** @const {string} */
 export const LOGS_CAPTURE_ENABLED_SERVER_SIDE = '$logs_capture_enabled_server_side';
@@ -104,6 +107,8 @@ export class PostHogLogs {
     this.isLogsEnabled_ = !!this.logsConfig_()['captureConsoleLogs'];
     /** @private {boolean} */
     this.isLoaded_ = false;
+    /** @private {boolean} the lazy build's `logs` chunk is loading */
+    this.isLoading_ = false;
     /** @private {!Logger} */
     this.logger_ = baseLogger.createLogger('[logs]');
     const self = this;
@@ -328,6 +333,7 @@ export class PostHogLogs {
     if (this.disposed_) return;
     this.disposed_ = true;
     this.stopConsoleRecorder_();
+    this.isLoading_ = false;
     if (win) win.removeEventListener('online', this.onReconnect_);
     if (this.consoleLogsDispose_) this.consoleLogsDispose_();
     this.consoleLogsDispose_ = null;
@@ -545,18 +551,47 @@ export class PostHogLogs {
 
   /** Starts console capture when enabled and not yet started. */
   loadIfEnabled() {
-    if (this.disposed_ || !this.isLogsEnabled_ || this.isLoaded_) return;
+    if (this.disposed_ || !this.isLogsEnabled_ || this.isLoaded_ || this.isLoading_) return;
+    if (lazyChunksEnabled()) {
+      // Lazy build: upstream's console loader (`loadExternalDependency(posthog, 'logs', ...)`).
+      this.isLoading_ = true;
+      const self = this;
+      loadLazy(this.instance, LOGS_KIND, function(err) {
+        self.isLoading_ = false;
+        // Remote config turned capture off while the script was in flight.
+        if (self.disposed_ || !self.isLogsEnabled_) return;
+        const loaded = /** @type {!ConsoleLogsPart|undefined} */ (lazyPart(LOGS_KIND));
+        if (err || !loaded) {
+          self.logger_.error('Could not load logs script', err);
+          self.stopConsoleRecorder_();
+          return;
+        }
+        self.startConsoleCapture_(loaded);
+      });
+      return;
+    }
     if (this.instance.config['disable_external_dependency_loading']) {
       // Upstream's `/static/logs.js` load is refused in this mode.
       this.logger_.error('Could not load logs script', 'Loading of external scripts is disabled');
       this.stopConsoleRecorder_();
       return;
     }
+    this.startConsoleCapture_(/** @type {!ConsoleLogsPart} */ (lazyPart(LOGS_KIND)));
+  }
+
+  /**
+   * Hands the recorder's buffer to console capture. The recorder is unpatched
+   * before `console` is patched, so a call made now is buffered or captured
+   * live, never both.
+   * @param {!ConsoleLogsPart} part
+   * @private
+   */
+  startConsoleCapture_(part) {
     const buffered = this.takeConsoleBuffer_();
     const host = this.consoleHost_();
-    this.consoleLogsDispose_ = initializeLogs(host);
+    this.consoleLogsDispose_ = part.initializeLogs(host);
     this.isLoaded_ = true;
-    if (buffered.length > 0) replayConsoleBuffer(host, buffered);
+    if (buffered.length > 0) part.replayConsoleBuffer(host, buffered);
   }
 
   /**

@@ -72,7 +72,7 @@ const events = (b) => eventRequests(b).flatMap((r) => r.body.batch)
  */
 export const scenarios = {
     'capture: remote config, instant pageview, batched gzip events with context': {
-        builds: ['core', 'full'],
+        builds: ['core', 'full', 'lazy'],
         async run(load) {
             const { b, ph } = await load()
             ph.init(TOKEN, { ...FAST })
@@ -194,7 +194,7 @@ export const scenarios = {
     },
 
     'identify, person properties and reset': {
-        builds: ['core', 'full'],
+        builds: ['core', 'full', 'lazy'],
         async run(load) {
             const { b, ph } = await load()
             ph.init(TOKEN, { ...FAST, capture_pageview: false })
@@ -320,7 +320,7 @@ export const scenarios = {
     },
 
     'snippet stub calls are replayed': {
-        builds: ['core', 'full'],
+        builds: ['core', 'full', 'lazy'],
         async run(load) {
             const { b, ph } = await load({
                 before(window) {
@@ -374,7 +374,7 @@ export const scenarios = {
     },
 
     'feature flags load after remote config, enrich events and report calls': {
-        builds: ['full', 'core-flags'],
+        builds: ['full', 'core-flags', 'lazy'],
         async run(load) {
             const { b, ph } = await load()
             let callbackArgs = null
@@ -432,7 +432,7 @@ export const scenarios = {
     },
 
     'bootstrapped flags are available synchronously': {
-        builds: ['full'],
+        builds: ['full', 'lazy'],
         async run(load) {
             const { ph } = await load({ respond: () => ({ status: 500, body: {} }) })
             ph.init(TOKEN, {
@@ -448,7 +448,7 @@ export const scenarios = {
     },
 
     'web experiments apply the flag variant transforms when enabled': {
-        builds: ['full'],
+        builds: ['full', 'lazy'],
         async run(load) {
             const { b, ph } = await load()
             ph.init(TOKEN, { ...FAST, capture_pageview: false, disable_web_experiments: false })
@@ -462,7 +462,7 @@ export const scenarios = {
     },
 
     'web experiments are disabled by default (upstream default)': {
-        builds: ['full'],
+        builds: ['full', 'lazy'],
         async run(load) {
             const { b, ph } = await load()
             ph.init(TOKEN, { ...FAST, capture_pageview: false })
@@ -518,7 +518,7 @@ Object.assign(scenarios, {
         },
     },
     'exceptions: captureException sends $exception with steps and extra properties': {
-        builds: ['full'],
+        builds: ['full', 'lazy'],
         async run(load) {
             const { b, ph } = await load()
             ph.init(TOKEN, { ...FAST, capture_pageview: false })
@@ -567,7 +567,7 @@ Object.assign(scenarios, {
 // ---- Autocapture, heatmaps and dead clicks -------------------------------------
 Object.assign(scenarios, {
     'autocapture, heatmaps, dead clicks: remote config switches are persisted like upstream': {
-        builds: ['full'],
+        builds: ['full', 'lazy'],
         async run(load) {
             const { b, ph } = await load()
             ph.init(TOKEN, { ...FAST, capture_pageview: false })
@@ -621,7 +621,7 @@ Object.assign(scenarios, {
 // ---- Web vitals and tracing headers ----------------------------------------------
 Object.assign(scenarios, {
     'web vitals and tracing headers: remote switch persisted, fetch patched': {
-        builds: ['full'],
+        builds: ['full', 'lazy'],
         async run(load) {
             const { b, ph } = await load()
             ph.init(TOKEN, { ...FAST, capture_pageview: false, tracing_headers: ['api.example.com'] })
@@ -674,7 +674,7 @@ const otlpRequests = (b, path) => b.requests.filter((r) => r.path === path)
 
 Object.assign(scenarios, {
     'logs, metrics: captureLog, logger and metrics reach their OTLP endpoints': {
-        builds: ['full'],
+        builds: ['full', 'lazy'],
         async run(load) {
             const { b, ph } = await load()
             ph.init(TOKEN, { ...FAST, capture_pageview: false, logs: { serviceName: 'svc' } })
@@ -738,12 +738,40 @@ export const BUILDS = {
     'core-flags': { file: 'dist/posthog.core-flags.js', source: 'src/entry/core-flags.js' },
     full: { file: 'dist/posthog.full.js', source: 'src/entry/full.js' },
     chunks: { file: null, source: null },
+    // The lazy build: posthog.js loads its lazy parts from the same directory.
+    lazy: { file: 'dist/lazy/posthog.js', source: 'src/entry/lazy.js' },
+}
+
+/** The sources of the lazy build's chunks (for source mode). */
+const LAZY_SOURCES = {
+    replay: 'src/replay/recorder.js',
+    'exception-autocapture': 'src/exceptions/wrappers.js',
+    'dead-clicks-autocapture': 'src/dead-clicks/detector.js',
+    'web-vitals': 'src/web-vitals/lazy.js',
+    'tracing-headers': 'src/tracing-headers/lazy.js',
+    logs: 'src/logs/console-logs.js',
+}
+
+/**
+ * Wraps a router so the lazy build's chunk requests (`<dir of posthog.js>/<kind>.js`) run the
+ * chunk: the compiled one from dist/lazy/, or its source module.
+ */
+export function lazyChunkRouter(b, mode, respond) {
+    return (req) => {
+        const m = req.transport === 'script' && /\/(?:dist\/lazy|src\/entry)\/([\w-]+)\.js$/.exec(req.path)
+        if (m && LAZY_SOURCES[m[1]]) {
+            return { script: () => (mode === 'compiled' ? b.loadScript(`dist/lazy/${m[1]}.js`) : b.importSource(LAZY_SOURCES[m[1]], false)) }
+        }
+        return respond(req)
+    }
 }
 
 /** Returns a loader for a build, in 'compiled' or 'source' mode. */
 export function loaderFor(build, mode, scenario) {
     return async (opts = {}) => {
-        const b = createBrowser({ ...scenario.browser, ...opts, respond: opts.respond || defaultRouter })
+        const respond = opts.respond || defaultRouter
+        let b
+        b = createBrowser({ ...scenario.browser, ...opts, respond: build === 'lazy' ? (req) => lazyChunkRouter(b, mode, respond)(req) : respond })
         if (opts.before) opts.before(b.window)
         if (mode === 'compiled') b.loadScript(BUILDS[build].file)
         else await b.importSource(BUILDS[build].source)
@@ -751,10 +779,70 @@ export function loaderFor(build, mode, scenario) {
     }
 }
 
+// ---- the lazy build -----------------------------------------------------------------
+const scriptRequests = (b) => b.requests.filter((r) => r.transport === 'script')
+const LAZY_CHUNK = /\/(?:dist\/lazy|src\/entry)\/([\w-]+)\.js$/
+
+Object.assign(scenarios, {
+    'lazy: a chunk is loaded from the directory of posthog.js when its feature turns on': {
+        builds: ['lazy'],
+        async run(load) {
+            const { b, ph } = await load()
+            ph.init(TOKEN, { ...FAST, capture_pageview: false, capture_exceptions: true })
+            // Exception autocapture starts at init: like upstream, the wrapping waits for its script.
+            const [req, ...more] = scriptRequests(b).filter((r) => LAZY_CHUNK.test(r.path))
+            assert.equal(more.length, 0)
+            assert.equal(LAZY_CHUNK.exec(req.path)[1], 'exception-autocapture')
+            assert.deepEqual(new URL(req.url).searchParams.get('v'), '0.1.0-closure')
+            assert.ok(!b.window.onerror)
+            await sleep(50)
+            assert.equal(b.window.onerror.__POSTHOG_INSTRUMENTED__, true)
+            // Later starts don't load it again.
+            ph.set_config({ capture_exceptions: { capture_console_errors: true } })
+            ph.exceptionObserver.startIfEnabledOrStop()
+            await sleep(FLUSH)
+            assert.equal(scriptRequests(b).filter((r) => LAZY_CHUNK.test(r.path)).length, 1)
+        },
+    },
+    'lazy: closure_lazy_chunks_url and prepare_external_dependency_script apply to chunks': {
+        builds: ['lazy'],
+        async run(load) {
+            const prepared = []
+            const { b, ph } = await load()
+            ph.init(TOKEN, {
+                ...FAST, capture_pageview: false, capture_dead_clicks: true,
+                closure_lazy_chunks_url: 'https://cdn.example.com/ph',
+                prepare_external_dependency_script: (script) => {
+                    prepared.push(script.src)
+                    return script
+                },
+            })
+            assert.equal(prepared[0], 'https://cdn.example.com/ph/dead-clicks-autocapture.js?v=0.1.0-closure')
+            // Nothing is served there in this harness: the load fails and dead clicks don't start.
+            await sleep(100)
+            assert.equal(ph.deadClicksAutocapture.lazyLoadedDeadClicksAutocapture, undefined)
+        },
+    },
+    'lazy: disable_external_dependency_loading refuses chunks, as upstream refuses its scripts': {
+        builds: ['lazy'],
+        async run(load) {
+            const { b, ph } = await load()
+            ph.init(TOKEN, { ...FAST, capture_pageview: false, capture_exceptions: true, capture_dead_clicks: true,
+                tracing_headers: ['api.example.com'], disable_external_dependency_loading: true })
+            await sleep(100)
+            assert.equal(scriptRequests(b).filter((r) => LAZY_CHUNK.test(r.path)).length, 0)
+            assert.ok(!b.window.onerror)
+            assert.equal(ph.deadClicksAutocapture.lazyLoadedDeadClicksAutocapture, undefined)
+            await b.window.fetch('https://api.example.com/x')
+            assert.equal(b.requests.find((r) => r.path === '/x').headers, undefined)
+        },
+    },
+})
+
 // ---- regressions -----------------------------------------------------------------
 Object.assign(scenarios, {
     'featureFlags.hasLoadedFlags getter works (no self-recursion in source mode)': {
-        builds: ['full'],
+        builds: ['full', 'lazy'],
         async run(load) {
             const { ph } = await load()
             ph.init(TOKEN, { ...FAST, capture_pageview: false })

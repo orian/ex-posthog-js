@@ -842,7 +842,9 @@
     },
 
     dead_clicks: async function (ph, h) {
-      ph.init(h.token, h.config({ capture_pageview: false, capture_dead_clicks: true }))
+      // disable_surveys: upstream inserts surveys.js (not ported) after its detector started, a
+      // DOM mutation ours can't mirror (it would show up as $dead_click_last_mutation_timestamp).
+      ph.init(h.token, h.config({ capture_pageview: false, capture_dead_clicks: true, disable_surveys: true }))
       await sleep(READY_MS)
       // Nothing mutates for 3s after these: #ac-dead and the plain div are dead; the link,
       // ph-no-deadclick, ph-no-capture and the ctrl-click are ignored.
@@ -1378,6 +1380,9 @@
       await requests('other.example.test', 'other')
       await requests('third.example.test', 'none')
       ph.identify('traced-user')
+      // Let identify's $identify batch and flags reload go out first: otherwise their place
+      // among the concurrent requests below is a race (in both SDKs).
+      await sleep(300)
       await requests('api.example.test', 'identified')
       ph.capture('after-requests')
       await sleep(600)
@@ -1709,4 +1714,25 @@
       window.__flagResults = { maybe: ph.toolbar.maybeLoadToolbar(), s: toolbarState() }
     },
   })
+})()
+
+// ---- Every lazily loaded part at once ----------------------------------------------------
+// Upstream requests its /static/ scripts in the order its extensions start; the lazy build
+// must request its chunks in the same order (checked by the runner for DIFF_BUNDLE=lazy/...).
+;(function () {
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms) }) }
+  window.SCENARIOS.lazy_all_features = async function (ph, h) {
+    ph.init(h.token, h.config({ autocapture: false, capture_pageview: false, disable_surveys: true,
+      capture_exceptions: true, capture_dead_clicks: true, capture_performance: { web_vitals: true },
+      tracing_headers: ['api.example.test'], logs: { captureConsoleLogs: true } }))
+    await sleep(800)
+    console.log('all features on')
+    ph.capture('after-start')
+    await sleep(600)
+    window.__flagResults = {
+      wrapped: !!(window.onerror && window.onerror.__POSTHOG_INSTRUMENTED__),
+      detector: !!ph.deadClicksAutocapture.lazyLoadedDeadClicksAutocapture,
+      patched: !!window.fetch.__posthog_wrapped__,
+    }
+  }
 })()
