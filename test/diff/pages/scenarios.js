@@ -1380,6 +1380,9 @@
       await requests('other.example.test', 'other')
       await requests('third.example.test', 'none')
       ph.identify('traced-user')
+      // Let identify's $identify batch and flags reload go out first: otherwise their place
+      // among the concurrent requests below is a race (in both SDKs).
+      await sleep(300)
       await requests('api.example.test', 'identified')
       ph.capture('after-requests')
       await sleep(600)
