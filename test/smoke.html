@@ -7,7 +7,8 @@
   // Stub the network: record requests, answer /flags/ and /api/web_experiments/.
   var sent = [];
   window.fetch = function (url, init) {
-    sent.push({url: url, method: (init && init.method) || 'GET'});
+    var headers = init && init.headers ? new Headers(init.headers) : null;
+    sent.push({url: url, method: (init && init.method) || 'GET', traced: !!(headers && headers.get('X-POSTHOG-SESSION-ID'))});
     var body = /\/flags\//.test(url)
       ? {flags: {f: {key: 'f', enabled: true, variant: 'test', metadata: {}}}}
       : /web_experiments/.test(url)
@@ -26,7 +27,8 @@
 </script>
 <script src="../dist/chunks/core.js"></script>
 <script>
-  posthog.init('phc_smoke', {api_host: 'https://example.invalid', request_queue_config: {flush_interval_ms: 250}, disable_web_experiments: false});
+  posthog.init('phc_smoke', {api_host: 'https://example.invalid', request_queue_config: {flush_interval_ms: 250}, disable_web_experiments: false,
+    tracing_headers: ['api.example.invalid'], capture_performance: {web_vitals: true}});
   posthog.capture('smoke', {n: 1});
 </script>
 <script src="../dist/chunks/flags.js"></script>
@@ -37,6 +39,8 @@
 <script src="../dist/chunks/deadclicks.js"></script>
 <script src="../dist/chunks/heatmaps.js"></script>
 <script src="../dist/chunks/replay.js"></script>
+<script src="../dist/chunks/webvitals.js"></script>
+<script src="../dist/chunks/tracingheaders.js"></script>
 <script>
   setTimeout(function () {
     document.getElementById('out').textContent = JSON.stringify({
@@ -49,6 +53,9 @@
       modules: [!!posthog.autocapture, !!posthog.heatmaps, !!posthog.deadClicksAutocapture],
       replay: posthog.sessionRecording ? posthog.sessionRecording.status : null,
       replayStarted: posthog.sessionRecordingStarted(),
+      // file:// page: web vitals stay off (http/https only), like upstream.
+      webVitals: posthog.webVitalsAutocapture ? posthog.webVitalsAutocapture.isEnabled : null,
+      traced: [fetch('https://api.example.invalid/t') && sent[sent.length - 1].traced, fetch('https://example.invalid/u') && sent[sent.length - 1].traced],
       paths: sent.map(function (r) { return r.url.replace(/\?.*/, ''); }).sort()
     });
   }, 1200);
