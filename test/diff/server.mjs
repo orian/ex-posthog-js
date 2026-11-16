@@ -83,6 +83,7 @@ export function startServer({ port = 0 } = {}) {
             path: url.pathname,
             query: Object.fromEntries(url.searchParams),
             contentType: req.headers['content-type'],
+            bytes: body.length, // on-the-wire request body size (benchmarks)
             body: decodeBody(body, url, req.headers['content-type']),
         }
         state.log.push(entry)

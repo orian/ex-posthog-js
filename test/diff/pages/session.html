@@ -1,0 +1,109 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Session bench</title>
+<style>
+  body { font-family: sans-serif; margin: 0 }
+  nav a { margin-right: 12px }
+  .card { border: 1px solid #ccc; margin: 6px; padding: 8px; display: inline-block; width: 180px; vertical-align: top }
+  #chat .msg { padding: 4px 8px; border-bottom: 1px solid #eee }
+</style>
+</head>
+<body>
+  <!-- An "AI app"-like page: a streaming chat transcript, a product grid that
+       re-renders, route changes, a prompt box and buttons. Deterministic. -->
+  <nav><a href="#" id="nav-chat">Chat</a><a href="#" id="nav-grid">Grid</a></nav>
+  <main>
+    <input id="prompt" placeholder="Ask something" style="width: 400px">
+    <button id="send" class="btn primary">Send</button>
+    <button id="regen" class="btn">Regenerate</button>
+    <div id="chat"></div>
+    <div id="grid"></div>
+  </main>
+  <script>
+    (function () {
+      var q = new URLSearchParams(location.search)
+      var sdk = q.get('sdk')
+      window.__bench = { ready: false }
+      var events = []
+      try {
+        new PerformanceObserver(function (l) {
+          l.getEntries().forEach(function (e) {
+            if (e.interactionId) events.push(e.duration)
+          })
+        }).observe({ type: 'event', durationThreshold: 16, buffered: true })
+      } catch (e) {}
+      var longTasks = { n: 0, ms: 0 }
+      try {
+        new PerformanceObserver(function (l) {
+          l.getEntries().forEach(function (e) { longTasks.n++; longTasks.ms += e.duration })
+        }).observe({ type: 'longtask', buffered: true })
+      } catch (e) {}
+
+      // Deterministic pseudo-random so every variant sees the same DOM work.
+      var seed = 42
+      function rnd() { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff }
+      var WORDS = 'the model streams tokens while the user waits for an answer about vectors embeddings latency and retrieval'.split(' ')
+      function sentence(n) { var s = []; for (var i = 0; i < n; i++) s.push(WORDS[Math.floor(rnd() * WORDS.length)]); return s.join(' ') }
+
+      function startWorkload() {
+        var chat = document.getElementById('chat')
+        var grid = document.getElementById('grid')
+        var current = null
+        // "Streaming" assistant answer: append a token every 30 ms, new message every 40 tokens.
+        var tokens = 0
+        setInterval(function () {
+          if (!current || tokens % 40 === 0) {
+            current = document.createElement('div')
+            current.className = 'msg'
+            chat.appendChild(current)
+            if (chat.children.length > 60) chat.removeChild(chat.firstChild)
+          }
+          current.textContent += ' ' + sentence(1)
+          tokens++
+        }, 30)
+        // Product grid re-render every 2 s (20 cards with attributes).
+        setInterval(function () {
+          grid.innerHTML = ''
+          for (var i = 0; i < 20; i++) {
+            var c = document.createElement('div')
+            c.className = 'card'
+            c.setAttribute('data-id', String(Math.floor(rnd() * 1e6)))
+            c.innerHTML = '<h4>' + sentence(3) + '</h4><p>' + sentence(12) + '</p><button class="buy">Buy</button>'
+            grid.appendChild(c)
+          }
+        }, 2000)
+        // SPA route change every 3 s.
+        var route = 0
+        setInterval(function () { history.pushState({}, '', '/app/route-' + (route++ % 5)) }, 3000)
+        // Custom analytics events (if an SDK is present).
+        setInterval(function () {
+          if (window.posthog && window.posthog.capture) window.posthog.capture('ai_response_rendered', { tokens: tokens, model: 'gpt-x', latency_ms: Math.floor(rnd() * 900) })
+        }, 1000)
+      }
+
+      window.__benchResult = function () {
+        var sorted = events.slice().sort(function (a, b) { return a - b })
+        return {
+          interactions: sorted.length,
+          inpP75: sorted.length ? sorted[Math.floor(sorted.length * 0.75)] : 0,
+          inpMax: sorted.length ? sorted[sorted.length - 1] : 0,
+          longTasks: longTasks.n,
+          longTaskMs: Math.round(longTasks.ms),
+        }
+      }
+
+      if (!sdk || sdk === 'none') {
+        startWorkload(); window.__bench.ready = true; return
+      }
+      var s = document.createElement('script')
+      s.src = sdk === 'official' ? '/sdk/official/array.js' : '/sdk/ours/' + (q.get('bundle') || 'posthog.full.js')
+      s.onload = function () {
+        posthog.init('phc_diff', { api_host: 'http://ph.example.test:' + location.port, disable_surveys: true })
+        startWorkload()
+        window.__bench.ready = true
+      }
+      document.head.appendChild(s)
+    })()
+  </script>
+</body>
+</html>
