@@ -15,3 +15,7 @@ import '../exceptions/index.js';
 import '../autocapture/index.js';
 import '../dead-clicks/index.js';
 import '../heatmaps/index.js';
+// Logs and metrics (they share src/otlp/), and the toolbar loader.
+import '../logs/index.js';
+import '../metrics/index.js';
+import '../toolbar/index.js';

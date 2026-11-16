@@ -17,6 +17,11 @@
 #                               needs deadclicks.js.
 #   dist/chunks/replay.js        session replay (needs only core.js); also part of
 #                               posthog.full.js. rrweb is loaded at runtime.
+#   dist/chunks/{otlp,logs,metrics,toolbar}.js
+#                               opt-in modules: otlp.js (shared OTLP helpers, needs
+#                               core), then logs.js and/or metrics.js; toolbar.js
+#                               (the toolbar loader) needs only core. All are also
+#                               part of posthog.full.js.
 #
 # Env: CLOSURE_IMAGE (default posthog-closure-compiler:v20261109),
 #      EXTRA_FLAGS (appended to every compile, e.g. "--debug --formatting=PRETTY_PRINT").
@@ -90,17 +95,24 @@ bundle() { # name entry files...
   echo "//# sourceMappingURL=$name.js.map" >> "dist/$name.js"
 }
 
+# Logs and metrics share the OTLP helpers in src/otlp/; the toolbar loader needs only core.
+OTLP_FILES=(src/otlp/otlp.js)
+LOGS_FILES=(src/logs/logs-core.js src/logs/console-logs.js src/logs/logs.js src/logs/index.js)
+METRICS_FILES=(src/metrics/metrics-core.js src/metrics/network-metrics.js src/metrics/metrics.js src/metrics/index.js)
+TOOLBAR_FILES=(src/toolbar/toolbar.js src/toolbar/index.js)
+OPT_IN_FILES=("${OTLP_FILES[@]}" "${LOGS_FILES[@]}" "${METRICS_FILES[@]}" "${TOOLBAR_FILES[@]}")
+
 bundle posthog.core src/entry/core.js "${CORE_FILES[@]}"
 bundle posthog.core-flags src/entry/core-flags.js "${CORE_FILES[@]}" "${FLAGS_FILES[@]}" src/entry/core-flags.js
 bundle posthog.full src/entry/full.js "${CORE_FILES[@]}" "${FLAGS_FILES[@]}" "${EXPERIMENTS_FILES[@]}" \
-  "${EXCEPTIONS_FILES[@]}" "${DOM_MODULE_FILES[@]}" "${REPLAY_FILES[@]}" src/entry/full.js
+  "${EXCEPTIONS_FILES[@]}" "${DOM_MODULE_FILES[@]}" "${REPLAY_FILES[@]}" "${OPT_IN_FILES[@]}" src/entry/full.js
 
 # Chunked build. Chunks share renamed symbols through the global `__phc`
 # namespace object, so later chunks can be loaded on demand.
 CHUNK_WRAPPER='(function(){%s}).call(this);'
-echo "-> dist/chunks/{core,flags,experiments,exceptions,dom,autocapture,deadclicks,heatmaps,replay}.js"
+echo "-> dist/chunks/{core,flags,experiments,exceptions,dom,autocapture,deadclicks,heatmaps,replay,otlp,logs,metrics,toolbar}.js"
 args=()
-for f in "${CORE_FILES[@]}" "${FLAGS_FILES[@]}" "${EXPERIMENTS_FILES[@]}" "${EXCEPTIONS_FILES[@]}" "${DOM_MODULE_FILES[@]}" "${REPLAY_FILES[@]}"; do args+=(--js "$f"); done
+for f in "${CORE_FILES[@]}" "${FLAGS_FILES[@]}" "${EXPERIMENTS_FILES[@]}" "${EXCEPTIONS_FILES[@]}" "${DOM_MODULE_FILES[@]}" "${REPLAY_FILES[@]}" "${OPT_IN_FILES[@]}"; do args+=(--js "$f"); done
 closure "${args[@]}" \
   --rename_prefix_namespace __phc \
   --chunk "core:${#CORE_FILES[@]}" \
@@ -121,6 +133,14 @@ closure "${args[@]}" \
   --chunk_wrapper "heatmaps:${CHUNK_WRAPPER}" \
   --chunk "replay:${#REPLAY_FILES[@]}:core" \
   --chunk_wrapper "replay:${CHUNK_WRAPPER}" \
+  --chunk "otlp:${#OTLP_FILES[@]}:core" \
+  --chunk "logs:${#LOGS_FILES[@]}:otlp" \
+  --chunk "metrics:${#METRICS_FILES[@]}:otlp" \
+  --chunk "toolbar:${#TOOLBAR_FILES[@]}:core" \
+  --chunk_wrapper "otlp:${CHUNK_WRAPPER}" \
+  --chunk_wrapper "logs:${CHUNK_WRAPPER}" \
+  --chunk_wrapper "metrics:${CHUNK_WRAPPER}" \
+  --chunk_wrapper "toolbar:${CHUNK_WRAPPER}" \
   --chunk_output_path_prefix dist/chunks/
 
 echo

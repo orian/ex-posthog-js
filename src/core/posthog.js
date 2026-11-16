@@ -24,6 +24,7 @@ import {uuidv7} from './uuid.js';
 import {logger} from './logger.js';
 import {localStore, sessionStore} from './storage.js';
 import {ExceptionsApi, Extension, FeatureFlagsApi, SessionRecordingApi, attachAllExtensions, findExtensionFactory} from './extensions.js';
+import {LogsApi, MetricsApi, ToolbarApi} from './extensions.js';
 import {
   addEventListener, assign, copyAndTruncateStrings, doc, each, extend, getCookieValue, getPersonPropertiesHash,
   hasOwn, isArray, isBoolean, isEmptyObject, isEmptyString, isFunction, isNullish, isNumber, isObject, isString,
@@ -935,11 +936,16 @@ export class PostHog {
   /** @private */
   handleUnload_() {
     this.isPageUnloading = true;
+    // Metrics are pre-aggregated and do not ride the request queue (upstream order).
+    const metrics = /** @type {?MetricsApi} */ (this.extensions['metrics'] || null);
+    if (metrics) metrics.flush('sendBeacon');
     if (!this.config['request_batching']) {
       if (this.shouldCapturePageleave_()) this.capture(EVENT_PAGELEAVE, null, {'transport': 'sendBeacon'});
       return;
     }
     if (this.shouldCapturePageleave_()) this.capture(EVENT_PAGELEAVE);
+    const logs = /** @type {?LogsApi} */ (this.extensions['logs'] || null);
+    if (logs) logs.flushLogs('sendBeacon');
     if (this.requestQueue) this.requestQueue.unload();
     if (this.retryQueue) this.retryQueue.unload();
   }
@@ -2343,6 +2349,9 @@ export class PostHog {
   /** @return {boolean} @private */
   syncOptOutWithPersistence_() {
     const disabled = this.isPersistenceDisabled_();
+    // Release what console log capture holds as soon as capturing is off.
+    const logs = /** @type {?LogsApi} */ (this.extensions['logs'] || null);
+    if (logs && !this.is_capturing()) logs.onOptOut();
     if (this.persistence && this.persistence.disabled !== disabled) this.persistence.set_disabled(disabled);
     if (this.sessionPersistence && this.sessionPersistence.disabled !== disabled) this.sessionPersistence.set_disabled(disabled);
     this.persistSessionRegisteredPropKeys_();
@@ -2688,6 +2697,39 @@ export class PostHog {
   sendRequest(options) {
     this.sendRequest_(options);
   }
+
+  // ---- logs and toolbar (delegated to the optional `logs` / `toolbar` modules) ----
+
+  /**
+   * Sends a log record to the logs endpoint (upstream `captureLog`); a no-op
+   * without the logs module.
+   * @param {!Object} options {'body', 'level', 'attributes', 'trace_id', 'span_id', 'trace_flags'}
+   */
+  captureLog(options) {
+    const logs = /** @type {?LogsApi} */ (this.extensions['logs'] || null);
+    if (logs) logs.captureLog(options);
+  }
+
+  /**
+   * `posthog.logger`: trace/debug/info/warn/error/fatal(body, attributes).
+   * @return {!Object}
+   */
+  getLogger() {
+    const logs = /** @type {?LogsApi} */ (this.extensions['logs'] || null);
+    if (logs) return logs.getLogger();
+    const noop = function() {};
+    return {'trace': noop, 'debug': noop, 'info': noop, 'warn': noop, 'error': noop, 'fatal': noop};
+  }
+
+  /**
+   * Loads the toolbar (upstream `loadToolbar`); false without the toolbar module.
+   * @param {*} params
+   * @return {boolean}
+   */
+  loadToolbar(params) {
+    const toolbar = /** @type {?ToolbarApi} */ (this.extensions['toolbar'] || null);
+    return toolbar ? toolbar.loadToolbar(params) : false;
+  }
 }
 
 /** @const {string} */
@@ -2852,5 +2894,10 @@ export function exportPublicApi() {
   }
   Object.defineProperty(p, 'version', {get: function() {
     return LIB_VERSION;
+  }});
+  p['captureLog'] = p.captureLog;
+  p['loadToolbar'] = p.loadToolbar;
+  Object.defineProperty(p, 'logger', {get: /** @this {!PostHog} */ function() {
+    return this.getLogger();
   }});
 }

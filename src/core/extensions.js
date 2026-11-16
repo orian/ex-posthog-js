@@ -259,3 +259,51 @@ export class SessionRecordingApi {
   /** @param {string} triggerType */
   overrideTrigger(triggerType) {}
 }
+
+/**
+ * Contract the core relies on for the logs module (upstream PostHogLogs,
+ * published as `posthog.logs`). Implemented by src/logs/logs.js.
+ * @record
+ * @extends {Extension}
+ */
+export class LogsApi {
+  constructor() {}
+  /** @param {!Object} options CaptureLogOptions (quoted keys) */
+  captureLog(options) {}
+  /** @return {!Object} the `posthog.logger` object */
+  getLogger() {}
+  /** @param {string=} transport */
+  flushLogs(transport) {}
+  /** Capturing was turned off (upstream `_onOptOut`). */
+  onOptOut() {}
+}
+
+/**
+ * Contract the core relies on for the metrics module (upstream PostHogMetrics,
+ * published as `posthog.metrics`). Implemented by src/metrics/metrics.js.
+ * @record
+ * @extends {Extension}
+ */
+export class MetricsApi {
+  constructor() {}
+  /**
+   * @param {string=} transport
+   * @return {?}
+   */
+  flush(transport) {}
+}
+
+/**
+ * Contract the core relies on for the toolbar loader (upstream Toolbar,
+ * published as `posthog.toolbar`). Implemented by src/toolbar/toolbar.js.
+ * @record
+ * @extends {Extension}
+ */
+export class ToolbarApi {
+  constructor() {}
+  /**
+   * @param {*=} params
+   * @return {boolean}
+   */
+  loadToolbar(params) {}
+}
