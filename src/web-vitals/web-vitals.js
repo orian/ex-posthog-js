@@ -169,7 +169,7 @@ export class WebVitalsAutocapture {
   }
 
   /** @return {!Array<string>} */
-  allowedMetrics() {
+  getAllowedMetrics() {
     const clientConfigMetricAllowList = this.perfOption_('web_vitals_allowed_metrics');
     if (!isNullish(clientConfigMetricAllowList)) return /** @type {!Array<string>} */ (clientConfigMetricAllowList);
     const persisted = this.instance.persistence ? this.instance.persistence.props[WEB_VITALS_ALLOWED_METRICS] : undefined;
@@ -177,7 +177,7 @@ export class WebVitalsAutocapture {
   }
 
   /** @return {number} */
-  flushToCaptureTimeoutMs() {
+  getFlushToCaptureTimeoutMs() {
     return /** @type {number} */ (this.perfOption_('web_vitals_delayed_flush_ms')) ||
         DEFAULT_FLUSH_TO_CAPTURE_TIMEOUT_MILLISECONDS;
   }
@@ -187,7 +187,7 @@ export class WebVitalsAutocapture {
    * array names them, and the default attributes INP and LCP only.
    * @return {!Array<string>}
    */
-  attributionMetrics() {
+  getAttributionMetrics() {
     const clientConfig = this.perfOption_('web_vitals_attribution');
     if (isBoolean(clientConfig)) return clientConfig ? ALL_WEB_VITALS_METRICS : [];
     if (isArray(clientConfig)) return /** @type {!Array<string>} */ (clientConfig);
@@ -195,12 +195,12 @@ export class WebVitalsAutocapture {
   }
 
   /** @return {boolean} */
-  useAttribution() {
-    return this.attributionMetrics().length > 0;
+  shouldUseAttribution() {
+    return this.getAttributionMetrics().length > 0;
   }
 
   /** @return {boolean} */
-  useSoftNavs() {
+  shouldUseSoftNavs() {
     const clientConfig = this.perfOption_('__preview_web_vitals_soft_navs');
     return /** @type {boolean} */ (clientConfig != null ? clientConfig : false);
   }
@@ -214,7 +214,7 @@ export class WebVitalsAutocapture {
   }
 
   /** @return {boolean} */
-  isEnabled() {
+  checkEnabled() {
     // Always disable web vitals if we're not on http or https
     const protocol = win && win.location ? win.location.protocol : undefined;
     if (protocol !== 'http:' && protocol !== 'https:') {
@@ -227,7 +227,7 @@ export class WebVitalsAutocapture {
   }
 
   startIfEnabled() {
-    if (this.isEnabled() && !this.initialized) {
+    if (this.checkEnabled() && !this.initialized) {
       logger.info('enabled, starting...');
       const self = this;
       this.loadScript_(function() {
@@ -255,9 +255,9 @@ export class WebVitalsAutocapture {
 
   /** @return {string} */
   callbackFlavor() {
-    return this.useSoftNavs() ?
-        (this.useAttribution() ? 'web-vitals-with-attribution-soft-navs' : 'web-vitals-soft-navs') :
-        (this.useAttribution() ? 'web-vitals-with-attribution' : 'web-vitals');
+    return this.shouldUseSoftNavs() ?
+        (this.shouldUseAttribution() ? 'web-vitals-with-attribution-soft-navs' : 'web-vitals-soft-navs') :
+        (this.shouldUseAttribution() ? 'web-vitals-with-attribution' : 'web-vitals');
   }
 
   /**
@@ -353,7 +353,7 @@ export class WebVitalsAutocapture {
       const self = this;
       this.delayedFlushTimer_ = setTimeout(function() {
         self.flush_(false);
-      }, this.flushToCaptureTimeoutMs());
+      }, this.getFlushToCaptureTimeoutMs());
     }
 
     if (isUndefined(this.buffer.navigationKey)) {
@@ -376,7 +376,7 @@ export class WebVitalsAutocapture {
 
     // Keep attribution only for the metrics we attribute, bounded to small fields.
     const attributionIn = metric['attribution'];
-    if (isObject(attributionIn) && this.attributionMetrics().indexOf(metric['name']) > -1) {
+    if (isObject(attributionIn) && this.getAttributionMetrics().indexOf(metric['name']) > -1) {
       const attribution = {};
       const self = this;
       WEB_VITALS_ATTRIBUTION_ALLOWLIST.forEach(function(key) {
@@ -395,7 +395,7 @@ export class WebVitalsAutocapture {
 
     this.buffer.metrics.push(bufferedMetric);
 
-    if (this.buffer.metrics.length === this.allowedMetrics().length) {
+    if (this.buffer.metrics.length === this.getAllowedMetrics().length) {
       // we have all allowed metrics
       this.flush_(false);
     }
@@ -409,7 +409,7 @@ export class WebVitalsAutocapture {
     const flavor = this.callbackFlavor();
     const callbacks = externalCallbacks(flavor) || builtInCallbacks(flavor);
     const withoutAttribution = callbacks['withoutAttribution'];
-    const attributionMetrics = this.attributionMetrics();
+    const attributionMetrics = this.getAttributionMetrics();
     // only the attribution bundle exposes unattributed observers alongside the attributed ones
     const isAttributionBundle = !isUndefined(withoutAttribution);
     /**
@@ -432,13 +432,13 @@ export class WebVitalsAutocapture {
     }
 
     // Scope metrics to Soft Navigation entries when opted in.
-    const reportOpts = {'reportSoftNavs': this.useSoftNavs()};
+    const reportOpts = {'reportSoftNavs': this.shouldUseSoftNavs()};
     // `processedEventEntries` is never read: opt out (attribution build only).
     const inpReportOpts = isAttributionBundle && attributionMetrics.indexOf('INP') > -1 ?
         assign(reportOpts) : reportOpts;
     if (inpReportOpts !== reportOpts) inpReportOpts['includeProcessedEventEntries'] = false;
 
-    const allowed = this.allowedMetrics();
+    const allowed = this.getAllowedMetrics();
     if (allowed.indexOf('LCP') > -1) lcp(this.addToBuffer, reportOpts);
     if (allowed.indexOf('CLS') > -1) cls(this.addToBuffer, reportOpts);
     if (allowed.indexOf('FCP') > -1) fcp(this.addToBuffer, reportOpts);

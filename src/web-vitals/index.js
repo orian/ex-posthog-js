@@ -16,22 +16,22 @@ function getter(name, getter) {
   Object.defineProperty(p, name, {get: getter});
 }
 getter('isEnabled', function() {
-  return this.isEnabled();
+  return this.checkEnabled();
 });
 getter('allowedMetrics', function() {
-  return this.allowedMetrics();
+  return this.getAllowedMetrics();
 });
 getter('flushToCaptureTimeoutMs', function() {
-  return this.flushToCaptureTimeoutMs();
+  return this.getFlushToCaptureTimeoutMs();
 });
 getter('attributionMetrics', function() {
-  return this.attributionMetrics();
+  return this.getAttributionMetrics();
 });
 getter('useAttribution', function() {
-  return this.useAttribution();
+  return this.shouldUseAttribution();
 });
 getter('useSoftNavs', function() {
-  return this.useSoftNavs();
+  return this.shouldUseSoftNavs();
 });
 
 registerExtension('webVitalsAutocapture', function(instance) {
