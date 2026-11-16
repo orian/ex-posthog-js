@@ -23,7 +23,7 @@ import {isLikelyBot} from './user-agent.js';
 import {uuidv7} from './uuid.js';
 import {logger} from './logger.js';
 import {localStore, sessionStore} from './storage.js';
-import {ExceptionsApi, Extension, FeatureFlagsApi, attachAllExtensions, findExtensionFactory} from './extensions.js';
+import {ExceptionsApi, Extension, FeatureFlagsApi, SessionRecordingApi, attachAllExtensions, findExtensionFactory} from './extensions.js';
 import {
   addEventListener, assign, copyAndTruncateStrings, doc, each, extend, getCookieValue, getPersonPropertiesHash,
   hasOwn, isArray, isBoolean, isEmptyObject, isEmptyString, isFunction, isNullish, isNumber, isObject, isString,
@@ -57,6 +57,24 @@ const FBCLID_PATTERN = /^[A-Za-z0-9_-]{1,400}$/;
 const FBC_PATTERN = /^fb\.[0-9]+\.[0-9]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?$/;
 const FBP_PATTERN = /^fb\.[0-9]+\.[0-9]+\.[0-9]+$/;
 const LATEST_DEFAULTS_DATE = CONFIG_DEFAULTS_DATES.slice().sort()[CONFIG_DEFAULTS_DATES.length - 1];
+
+// Session replay (upstream posthog-core.ts): recording buttons and capture
+// diagnostics read these from individual events; the other replay debug
+// properties are sent at most once per 30s, on `$` events.
+const REQUIRED_REPLAY_PROPERTIES = [
+  '$recording_status', '$sdk_debug_recording_script_not_loaded', '$sdk_debug_replay_url_trigger_status',
+  '$sdk_debug_replay_event_trigger_status', '$sdk_debug_replay_linked_flag_trigger_status',
+  '$sdk_debug_replay_rrweb_error', '$sdk_debug_replay_internal_buffer_length', '$sdk_debug_replay_flushed_size',
+];
+const EVENTS_WITHOUT_REPLAY_DEBUG_PROPERTIES = ['$feature_flag_called', '$$heatmap', '$snapshot'];
+const REPLAY_DEBUG_PROPERTIES_INTERVAL_MS = 30000;
+/**
+ * @param {string} eventName
+ * @return {boolean}
+ */
+function isReplayDebugEvent(eventName) {
+  return eventName.charAt(0) === '$' && EVENTS_WITHOUT_REPLAY_DEBUG_PROPERTIES.indexOf(eventName) === -1;
+}
 
 /** Requests are queued until the DOM is loaded when no transport exists (upstream ENQUEUE_REQUESTS). */
 let enqueueRequests = !SUPPORTS_REQUEST && userAgent.indexOf('MSIE') === -1 && userAgent.indexOf('Mozilla') === -1;
@@ -348,6 +366,8 @@ export class PostHog {
     this.historyAutocapture = null;
     /** @type {?RemoteConfigLoader} */
     this.remoteConfigLoader = null;
+    /** @private {boolean} session replay debug properties throttle */
+    this.replayDebugPropertiesPaused_ = false;
 
     const self = this;
     const getConfig = function() {
@@ -734,6 +754,9 @@ export class PostHog {
    */
   attachExtension(name, factory) {
     if (this.extensions[name]) return;
+    // Like upstream, session replay is not created in cookieless mode (it is
+    // created when opting in from cookieless `on_reject` mode).
+    if (name === 'sessionRecording' && !this.sessionManager) return;
     let ext;
     try {
       ext = factory(this);
@@ -770,6 +793,29 @@ export class PostHog {
         logger.error('Error applying remote config to extension ' + name, e);
       }
     }
+  }
+
+  /**
+   * @return {?SessionRecordingApi}
+   * @private
+   */
+  sessionRecording_() {
+    const r = this.extensions['sessionRecording'];
+    return r ? /** @type {!SessionRecordingApi} */ (r) : null;
+  }
+
+  /**
+   * Detaches an extension (upstream `_removeExtension`).
+   * @param {string} name
+   * @private
+   */
+  detachExtension_(name) {
+    if (!this.extensions[name]) return;
+    delete this.extensions[name];
+    this.extensionOrder_ = this.extensionOrder_.filter(function(n) {
+      return n !== name;
+    });
+    this[name] = undefined;
   }
 
   /**
@@ -1336,6 +1382,14 @@ export class PostHog {
       data['uuid'] = isValidUUID(data['uuid']) ? data['uuid'] : uuidv7();
     }
 
+    if (this.sessionRecording_() && !this.replayDebugPropertiesPaused_ && isReplayDebugEvent(eventName)) {
+      this.replayDebugPropertiesPaused_ = true;
+      const instance = this;
+      setTimeout(function() {
+        instance.replayDebugPropertiesPaused_ = false;
+      }, REPLAY_DEBUG_PROPERTIES_INTERVAL_MS);
+    }
+
     const toConfirm = [];
     metaIdentifiers.forEach(function(m) {
       const setVal = data['$set'] ? data['$set'][m.channel.property] : undefined;
@@ -1449,6 +1503,16 @@ export class PostHog {
     if (this.sessionPropsManager) extend(properties, this.sessionPropsManager.getSessionProps());
 
     try {
+      const recording = this.sessionRecording_();
+      if (recording) {
+        const replayProperties = recording.getSdkDebugProperties();
+        const includeDebugProperties = !this.replayDebugPropertiesPaused_ && isReplayDebugEvent(eventName);
+        for (const key in replayProperties) {
+          if (includeDebugProperties || REQUIRED_REPLAY_PROPERTIES.indexOf(key) !== -1) {
+            properties[key] = replayProperties[key];
+          }
+        }
+      }
       properties['$sdk_debug_retry_queue_size'] = this.retryQueue ? this.retryQueue.length : undefined;
     } catch (e) {
       properties['$sdk_debug_error_capturing_properties'] = String(e);
@@ -1970,6 +2034,9 @@ export class PostHog {
     const deviceId = this.get_property(DEVICE_ID);
     const deviceModel = this.get_property(DEVICE_MODEL);
     const recordingRemoteConfig = this.get_property(SESSION_RECORDING_REMOTE_CONFIG);
+    // must run while the pre-reset distinct_id and consent state still apply
+    const recording = this.sessionRecording_();
+    if (recording) recording.flushBeforeIdentityReset();
     const wasCapturing = this.is_capturing();
     if (!isConsentTransition) this.consent.reset();
     if (!isConsentTransition && wasCapturing && !this.is_capturing() && win && win.console) {
@@ -2046,6 +2113,52 @@ export class PostHog {
   /** @return {string} */
   get_session_id() {
     return this.sessionManager ? this.sessionManager.checkAndGetSessionAndWindowId(true).sessionId : '';
+  }
+
+  /**
+   * Turns session recording on (sets `disable_session_recording: false`).
+   * `override` (true, or {'sampling', 'linked_flag', 'url_trigger',
+   * 'event_trigger'}) skips those conditions for the next recording.
+   * @param {(boolean|?Object)=} override
+   */
+  startSessionRecording(override) {
+    const overrideAll = override === true;
+    const o = isObject(override) ? override : {};
+    const sampling = overrideAll || !!o['sampling'];
+    const linkedFlag = overrideAll || !!o['linked_flag'];
+    const urlTrigger = overrideAll || !!o['url_trigger'];
+    const eventTrigger = overrideAll || !!o['event_trigger'];
+    if (sampling || linkedFlag || urlTrigger || eventTrigger) {
+      if (this.sessionManager) this.sessionManager.checkAndGetSessionAndWindowId();
+      if (sampling) {
+        const r = this.sessionRecording_();
+        if (r) r.overrideSampling();
+      }
+      if (linkedFlag) {
+        const r = this.sessionRecording_();
+        if (r) r.overrideLinkedFlag();
+      }
+      if (urlTrigger) {
+        const r = this.sessionRecording_();
+        if (r) r.overrideTrigger('url');
+      }
+      if (eventTrigger) {
+        const r = this.sessionRecording_();
+        if (r) r.overrideTrigger('event');
+      }
+    }
+    this.set_config({'disable_session_recording': false});
+  }
+
+  /** Turns session recording off (sets `disable_session_recording: true`). */
+  stopSessionRecording() {
+    this.set_config({'disable_session_recording': true});
+  }
+
+  /** @return {boolean} whether session recording is currently running */
+  sessionRecordingStarted() {
+    const r = this.sessionRecording_();
+    return !!r && r.isStarted();
   }
 
   /**
@@ -2149,6 +2262,11 @@ export class PostHog {
         }
       }
     });
+    // Upstream calls sessionRecording.startIfEnabledOrStop() between the
+    // exceptions and autocapture/heatmaps config hooks; none of these emit
+    // traffic synchronously, so calling it after the extension loop is equivalent.
+    const recording = this.sessionRecording_();
+    if (recording) recording.startIfEnabledOrStop();
     if (this.historyAutocapture && ('capture_pageview' in config || 'disable_capture_url_hashes' in config)) {
       this.historyAutocapture.startIfEnabledOrStop();
     }
@@ -2240,6 +2358,8 @@ export class PostHog {
       return;
     }
     if (this.inCookielessMode_()) {
+      const oldRecording = this.sessionRecording_();
+      if (oldRecording) oldRecording.disposeRecording(true);
       this.reset_(true, true, undefined);
       if (this.sessionManager) this.sessionManager.destroy();
       this.pageViewManager.destroy();
@@ -2251,12 +2371,19 @@ export class PostHog {
       this.pageViewManager = new PageViewManager(function() {
         return self.config;
       }, this.scrollManager, this.sessionManager);
+      const recordingFactory = findExtensionFactory('sessionRecording');
+      if (recordingFactory && this.extensionsReady_) {
+        this.detachExtension_('sessionRecording');
+        this.attachExtension('sessionRecording', recordingFactory);
+      }
     }
     const wasAlreadyGranted = this.consent.consent() === ConsentStatus.GRANTED;
     if (wasAlreadyGranted) this.syncCookielessIdentity_();
     this.consent.optInOut(true);
     this.syncOptOutWithPersistence_();
     this.startQueueIfOptedIn_();
+    const recording = this.sessionRecording_();
+    if (recording) recording.startIfEnabledOrStop();
 
     const name = options ? options['captureEventName'] : undefined;
     if (!wasAlreadyGranted && (isUndefined(name) || name)) {
@@ -2280,8 +2407,11 @@ export class PostHog {
 
   /** @private */
   enterCookielessMode_() {
+    const recording = this.sessionRecording_();
+    if (recording) recording.disposeRecording(true);
     if (this.get_distinct_id() !== COOKIELESS_SENTINEL_VALUE) this.reset_(true, true, undefined);
     this.register({[DISTINCT_ID]: COOKIELESS_SENTINEL_VALUE, [DEVICE_ID]: null});
+    this.detachExtension_('sessionRecording');
     if (this.sessionManager) this.sessionManager.destroy();
     this.pageViewManager.destroy();
     this.sessionManager = null;
@@ -2654,6 +2784,9 @@ export function exportPublicApi() {
   p['get_distinct_id'] = p.get_distinct_id;
   p['get_session_id'] = p.get_session_id;
   p['get_session_replay_url'] = p.get_session_replay_url;
+  p['startSessionRecording'] = p.startSessionRecording;
+  p['stopSessionRecording'] = p.stopSessionRecording;
+  p['sessionRecordingStarted'] = p.sessionRecordingStarted;
   p['onSessionId'] = p.onSessionId;
   p['set_config'] = p.set_config;
   p['debug'] = p.debug;

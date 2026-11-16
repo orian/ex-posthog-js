@@ -36,6 +36,7 @@
 <script src="../dist/chunks/autocapture.js"></script>
 <script src="../dist/chunks/deadclicks.js"></script>
 <script src="../dist/chunks/heatmaps.js"></script>
+<script src="../dist/chunks/replay.js"></script>
 <script>
   setTimeout(function () {
     document.getElementById('out').textContent = JSON.stringify({
@@ -46,6 +47,8 @@
       distinct: !!posthog.get_distinct_id(),
       exception: !!posthog.captureException(new Error('smoke')),
       modules: [!!posthog.autocapture, !!posthog.heatmaps, !!posthog.deadClicksAutocapture],
+      replay: posthog.sessionRecording ? posthog.sessionRecording.status : null,
+      replayStarted: posthog.sessionRecordingStarted(),
       paths: sent.map(function (r) { return r.url.replace(/\?.*/, ''); }).sort()
     });
   }, 1200);

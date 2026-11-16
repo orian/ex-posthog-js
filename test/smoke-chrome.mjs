@@ -39,7 +39,8 @@ try {
     const res = JSON.parse(out)
     const ok = res.errors.length === 0 && res.flag === 'test' && res.hero === 'New' && !res.xss && res.distinct && res.exception &&
         res.modules.every(Boolean) &&
-        res.paths.some((p) => p.endsWith('/e/')) && res.paths.some((p) => p.endsWith('/flags/'))
+        res.paths.some((p) => p.endsWith('/e/')) && res.paths.some((p) => p.endsWith('/flags/')) &&
+        res.replay === 'disabled' && res.replayStarted === false
     console.log(ok ? 'SMOKE OK' : 'SMOKE FAILED')
     process.exitCode = ok ? 0 : 1
 } finally {

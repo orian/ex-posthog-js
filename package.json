@@ -9,7 +9,8 @@
     "test": "node test/run.mjs",
     "test:source": "node test/run.mjs source",
     "test:compiled": "node test/run.mjs compiled",
-    "test:chrome": "node test/smoke-chrome.mjs"
+    "test:chrome": "node test/smoke-chrome.mjs",
+    "test:replay": "node --test test/replay.test.mjs"
   },
   "license": "MIT"
 }

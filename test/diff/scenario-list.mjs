@@ -11,3 +11,10 @@ SCENARIO_NAMES.push('exc_capture_manual', 'exc_steps_release', 'exc_onerror', 'e
 SCENARIO_NAMES.push('ac_clicks', 'ac_forms', 'ac_rageclick', 'ac_rageclick_defaults', 'ac_rageclick_config', 'ac_copy',
     'ac_opt_out', 'ac_remote_config_failure', 'ac_persisted_opt_out', 'ac_elements_chain_off', 'ac_config',
     'heatmaps_config', 'heatmaps_remote', 'heatmaps_flush', 'dead_clicks', 'dead_clicks_no_external', 'dead_clicks_remote')
+// Session replay scenarios (pages/scenarios.js, second block).
+SCENARIO_NAMES.push('replay_recording', 'replay_server_disabled', 'replay_client_disabled', 'replay_sample_rate_0',
+    'replay_sample_rate_1', 'replay_linked_flag_match', 'replay_linked_flag_miss', 'replay_url_trigger',
+    'replay_url_blocklist', 'replay_event_trigger', 'replay_minimum_duration', 'replay_minimum_duration_strict',
+    'replay_idle_rotation', 'replay_forced_rotation', 'replay_start_stop_api', 'replay_unload_flush',
+    'replay_cached_config', 'replay_stale_cached_config', 'replay_masking_network', 'replay_v2_trigger_groups',
+    'replay_idle_detection', 'replay_full_snapshot_interval')

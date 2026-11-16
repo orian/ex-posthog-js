@@ -93,7 +93,6 @@ Object.assign(RESPONSES, {
 /** Paths (regex on the diff location) whose differences are expected. Keep this short and justified. */
 export const ALLOWED = [
     /\.properties\.\$lib_version$/, // different SDK
-    /\.properties\.\$recording_status$/, // TODO(module): session replay
     /\.properties\.\$web_vitals_enabled_server_side$/, // TODO(module): web vitals (persisted from remote config)
 ]
 
@@ -111,4 +110,67 @@ Object.assign(RESPONSES, {
     ac_elements_chain_off: remoteConfig({ ...REMOTE_CONFIG, elementsChainAsString: false }),
     heatmaps_remote: remoteConfig({ ...REMOTE_CONFIG, heatmaps: true }),
     dead_clicks_remote: remoteConfig({ ...REMOTE_CONFIG, captureDeadClicks: true, heatmaps: true }),
+})
+
+// ---- session replay -------------------------------------------------------------
+// Remote configs with `sessionRecording` (the shape /array/<token>/config serves).
+const RECORDING = {
+    endpoint: '/s/',
+    consoleLogRecordingEnabled: true,
+    recorderVersion: 'v2',
+    sampleRate: null,
+    minimumDurationMilliseconds: null,
+    linkedFlag: null,
+    networkPayloadCapture: null,
+    masking: null,
+    urlTriggers: [],
+    urlBlocklist: [],
+    eventTriggers: [],
+    triggerMatchType: null,
+    scriptConfig: null,
+}
+
+/** Serves `sessionRecording` (merged into RECORDING, or false) from both config endpoints. */
+function recordingConfig(sessionRecording, extra = {}) {
+    const config = { ...REMOTE_CONFIG, ...extra, sessionRecording: sessionRecording === false ? false : { ...RECORDING, ...sessionRecording } }
+    return {
+        '/array/phc_diff/config': { body: config },
+        '/array/phc_diff/config.js': { script: `(function(){window._POSTHOG_REMOTE_CONFIG = window._POSTHOG_REMOTE_CONFIG || {}; window._POSTHOG_REMOTE_CONFIG['phc_diff'] = {config: ${JSON.stringify(config)}, siteApps: []}})()` },
+    }
+}
+
+Object.assign(RESPONSES, {
+    replay_recording: recordingConfig({}),
+    replay_server_disabled: recordingConfig(false),
+    replay_client_disabled: recordingConfig({}),
+    replay_sample_rate_0: recordingConfig({ sampleRate: '0.00' }),
+    replay_sample_rate_1: recordingConfig({ sampleRate: '1.00' }),
+    replay_linked_flag_match: recordingConfig({ linkedFlag: 'bool' }),
+    replay_linked_flag_miss: recordingConfig({ linkedFlag: { flag: 'multi', variant: 'control' } }),
+    replay_url_trigger: recordingConfig({ urlTriggers: [{ url: '/checkout', matching: 'regex' }] }),
+    replay_url_blocklist: recordingConfig({ urlBlocklist: [{ url: '/private', matching: 'regex' }] }),
+    replay_event_trigger: recordingConfig({ eventTriggers: ['purchase'] }),
+    replay_minimum_duration: recordingConfig({ minimumDurationMilliseconds: 4000 }),
+    replay_minimum_duration_strict: recordingConfig({ minimumDurationMilliseconds: 1500 }),
+    replay_idle_rotation: recordingConfig({}),
+    replay_forced_rotation: recordingConfig({}),
+    replay_start_stop_api: recordingConfig({}),
+    replay_unload_flush: recordingConfig({}),
+    replay_cached_config: recordingConfig({}),
+    replay_stale_cached_config: recordingConfig({}),
+    replay_idle_detection: recordingConfig({}),
+    replay_full_snapshot_interval: recordingConfig({}),
+    replay_masking_network: recordingConfig({
+        masking: { maskAllInputs: false, maskTextSelector: '.secret' },
+        networkPayloadCapture: { recordHeaders: true, recordBody: true },
+    }, { capturePerformance: { network_timing: true, web_vitals: false } }),
+    replay_v2_trigger_groups: recordingConfig({
+        version: 2,
+        triggerGroups: [
+            { id: 'g-all', name: 'Everyone', sampleRate: 1, conditions: { matchType: 'all', events: [], urls: [] } },
+            // sample rates are 0 or 1: the decision hashes the (random) session id
+            { id: 'g-buy', name: 'Buyers', sampleRate: 1, minDurationMs: 0, conditions: { matchType: 'any', events: [{ name: 'purchase', properties: [{ key: 'plan', value: 'pro', operator: 'exact', type: 'event' }] }] } },
+            { id: 'g-never', name: 'Never', sampleRate: 0, conditions: { matchType: 'all', urls: [{ url: '/never', matching: 'regex' }] } },
+        ],
+    }),
 })
