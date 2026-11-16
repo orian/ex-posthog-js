@@ -499,6 +499,71 @@ export const scenarios = {
     },
 }
 
+// ---- exception capture (src/exceptions) ------------------------------------------------
+Object.assign(scenarios, {
+    'exceptions: without the module captureException is a no-op': {
+        builds: ['core'],
+        async run(load) {
+            const { b, ph } = await load()
+            ph.init(TOKEN, { ...FAST, capture_pageview: false })
+            assert.equal(ph.captureException(new Error('x')), undefined)
+            ph.addExceptionStep('step')
+            ph.startExceptionAutocapture()
+            assert.equal(ph.config.capture_exceptions, true)
+            ph.stopExceptionAutocapture()
+            assert.equal(ph.config.capture_exceptions, false)
+            assert.equal(ph.exceptions, undefined)
+            await sleep(FLUSH)
+            assert.equal(events(b).filter((e) => e.event === '$exception').length, 0)
+        },
+    },
+    'exceptions: captureException sends $exception with steps and extra properties': {
+        builds: ['full'],
+        async run(load) {
+            const { b, ph } = await load()
+            ph.init(TOKEN, { ...FAST, capture_pageview: false })
+            ph.addExceptionStep('clicked', { button: 'buy' })
+            const err = new Error('boom', { cause: 'root' })
+            err.stack = 'Error: boom\n    at handler (https://app.example.com/app.js:10:5)\n    at https://app.example.com/main.js:1:2'
+            const result = ph.captureException(err, { $exception_fingerprint: 'fp' })
+            assert.ok(result)
+            await sleep(FLUSH)
+            const ev = events(b).find((e) => e.event === '$exception')
+            assert.equal(ev.properties.$exception_fingerprint, 'fp')
+            assert.equal(ev.properties.$exception_level, 'error')
+            assert.deepEqual(ev.properties.$exception_steps.map((s) => [s.$message, s.button]), [['clicked', 'buy']])
+            const [root, cause] = ev.properties.$exception_list
+            assert.deepEqual(root.mechanism, { type: 'generic', handled: true, synthetic: false, exception_id: 0 })
+            assert.deepEqual(root.stacktrace.frames.map((f) => [f.filename, f.function, f.lineno, f.colno, f.in_app]), [
+                ['https://app.example.com/main.js', '?', 1, 2, true],
+                ['https://app.example.com/app.js', 'handler', 10, 5, true],
+            ])
+            assert.deepEqual([cause.type, cause.value, cause.mechanism.source, cause.mechanism.parent_id], ['Error', 'root', 'cause', 0])
+            // Autocapture follows the remote flag (off here) and is persisted like upstream.
+            assert.equal(ph.get_property('$exception_capture_enabled_server_side'), false)
+            assert.equal(ph.exceptionObserver.isEnabled, false)
+        },
+    },
+    'chunks: exceptions can be loaded after init': {
+        builds: ['chunks'],
+        async run() {
+            const b = createBrowser({ respond: defaultRouter })
+            b.loadScript('dist/chunks/core.js')
+            const ph = b.window.posthog
+            ph.init(TOKEN, { ...FAST, capture_pageview: false, capture_exceptions: true })
+            assert.equal(ph.captureException(new Error('too early')), undefined)
+            await sleep(100)
+            b.loadScript('dist/chunks/exceptions.js')
+            assert.equal(ph.exceptionObserver.isEnabled, true)
+            assert.equal(b.window.onerror.__POSTHOG_INSTRUMENTED__, true)
+            assert.ok(ph.captureException('late'))
+            await sleep(FLUSH)
+            const ev = events(b).find((e) => e.event === '$exception')
+            assert.equal(ev.properties.$exception_list[0].value, 'late')
+        },
+    },
+})
+
 /** Build name -> how to load it. */
 export const BUILDS = {
     core: { file: 'dist/posthog.core.js', source: 'src/entry/core.js' },

@@ -67,6 +67,29 @@ export const RESPONSES = {
     },
 }
 
+// ---- exception capture: remote config variants ------------------------------------------
+const withRemoteConfig = (extra) => {
+    const config = { ...REMOTE_CONFIG, ...extra }
+    return {
+        '/array/phc_diff/config': { body: config },
+        '/array/phc_diff/config.js': { script: `(function(){window._POSTHOG_REMOTE_CONFIG = window._POSTHOG_REMOTE_CONFIG || {}; window._POSTHOG_REMOTE_CONFIG['phc_diff'] = {config: ${JSON.stringify(config)}, siteApps: []}})()` },
+    }
+}
+const EXCEPTIONS_REMOTE_ON = withRemoteConfig({ autocaptureExceptions: true, errorTracking: { autocaptureExceptions: true, suppressionRules: [] } })
+Object.assign(RESPONSES, {
+    exc_config_remote_on: EXCEPTIONS_REMOTE_ON,
+    exc_config_remote_on_false: EXCEPTIONS_REMOTE_ON,
+    exc_config_remote_on_object: EXCEPTIONS_REMOTE_ON,
+    exc_suppression: withRemoteConfig({ errorTracking: { autocaptureExceptions: false, captureExtensionExceptions: false, suppressionRules: [
+        { type: 'OR', values: [{ key: '$exception_types', operator: 'exact', value: ['MyError'] }] },
+        { type: 'AND', values: [
+            { key: '$exception_values', operator: 'icontains', value: 'ignore me' },
+            { key: '$exception_types', operator: 'regex', value: '^(Type|Range)Error$' },
+        ] },
+        { type: 'OR', values: [{ key: '$exception_values', operator: 'gt', value: '500' }, { key: '$unknown', operator: 'exact', value: 'x' }] },
+    ] } }),
+})
+
 /** Paths (regex on the diff location) whose differences are expected. Keep this short and justified. */
 export const ALLOWED = [
     /\.properties\.\$lib_version$/, // different SDK

@@ -61,6 +61,30 @@ function normalise(value, ids, key) {
     return value
 }
 
+// Stack frames inside the SDK itself differ by construction: another file (official
+// array.js and its lazy-loaded /static/ bundles vs ours), other lines/columns, other
+// minified function names, and as many frames as each bundler left after inlining
+// (e.g. upstream's console.error wrapper reaches the builder through 4 helpers). Each run
+// of consecutive SDK frames becomes one placeholder frame. Page frames are left untouched.
+const SDK_FILE = /\/sdk\/(official|ours)\/|ph\.example\.test:\d+\/static\//
+function normaliseSdkFrames(event) {
+    const list = event && event.properties && event.properties.$exception_list
+    if (!Array.isArray(list)) return event
+    for (const exception of list) {
+        const frames = exception && exception.stacktrace && exception.stacktrace.frames
+        if (!Array.isArray(frames)) continue
+        const out = []
+        for (const f of frames) {
+            if (!SDK_FILE.test(f.filename || '')) out.push(f)
+            else if (!out.length || out[out.length - 1].filename !== '<sdk>') {
+                out.push({ ...f, filename: '<sdk>', function: '<sdk>', lineno: '<sdk>', colno: '<sdk>' })
+            }
+        }
+        exception.stacktrace.frames = out
+    }
+    return event
+}
+
 /** Turns a request log into a list of comparable items (requests + events). */
 function digest(log) {
     const ids = new Map()
@@ -74,7 +98,7 @@ function digest(log) {
         const body = r.body
         const batch = body && typeof body === 'object' ? (Array.isArray(body) ? body : body.batch) : null
         requests.push({ method: r.method, path: r.path, query: normalise(query, ids), contentType: r.contentType, events: batch ? batch.map((e) => e.event) : undefined })
-        if (batch) for (const e of batch) events.push(normalise(e, ids))
+        if (batch) for (const e of batch) events.push(normalise(normaliseSdkFrames(e), ids))
         else if (body && typeof body === 'object' && r.path !== '/e/') events.push({ __request: r.path, body: normalise(body, ids) })
     }
     return { requests, events }
@@ -118,7 +142,9 @@ function compare(official, ours) {
     for (const k of im.keys()) if (!io.has(k)) out.push(`${k}: only in ours`)
     diffValues(official.results, ours.results, 'results', out)
     if (official.error || ours.error) out.push(`errors: official=${official.error} ours=${ours.error}`)
-    if (ours.pageErrors.length) out.push(`page errors (ours): ${ours.pageErrors.join(' | ')}`)
+    // Errors thrown on purpose by exception scenarios are marked 'diff-expected'.
+    const pageErrors = ours.pageErrors.filter((e) => !/diff-?expected/i.test(e))
+    if (pageErrors.length) out.push(`page errors (ours): ${pageErrors.join(' | ')}`)
     return out
 }
 
