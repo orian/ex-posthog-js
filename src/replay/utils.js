@@ -8,7 +8,7 @@ import {PostHog} from '../core/posthog.js';
 import {logger as baseLogger} from '../core/logger.js';
 import {
   clampToRange, convertToURL, each, isArray, isFunction, isNull, isNullish, isNumber, isObject, isString,
-  isUndefined, trim,
+  isUndefined, trim, utf8ByteLength,
 } from '../core/utils.js';
 import {SESSION_RECORDING_FLUSHED_SIZE} from './constants.js';
 
@@ -41,11 +41,14 @@ export function circularReferenceReplacer() {
 }
 
 /**
- * @param {string} data
+ * Upstream's `new Blob([data]).size`. A string goes through utf8ByteLength
+ * (same number, no blob); anything else (the network plugin's bodies are
+ * typed as strings, but Blob would size a buffer as binary) still uses Blob.
+ * @param {*} data
  * @return {number}
  */
 function estimateStringBytes(data) {
-  return new Blob([data]).size;
+  return isString(data) ? utf8ByteLength(/** @type {string} */ (data)) : new Blob([data]).size;
 }
 
 /** @const {number} */ export const UNSTRINGIFIABLE_EVENT_SIZE = -1;
@@ -555,7 +558,7 @@ function ignorePostHogPaths(data, apiHostConfig, isIngestionEndpoint) {
  */
 function enforcePayloadSizeLimit(payload, headers, limit, description) {
   if (isNullish(payload)) return payload;
-  let len = (headers && headers['content-length']) || estimateStringBytes(/** @type {string} */ (payload));
+  let len = (headers && headers['content-length']) || estimateStringBytes(payload);
   if (isString(len)) len = parseInt(len, 10);
   if (len > limit) return LOGGER_PREFIX + ' ' + description + ' body too large to record (' + len + ' bytes)';
   return payload;

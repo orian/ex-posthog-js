@@ -6,7 +6,7 @@
  */
 import {
   assign, base64Encode, extendURLParams, getQueryParam, isArray, isUndefined, jsonStringify, nav,
-  removeURLParam, win,
+  removeURLParam, utf8ByteLength, win,
 } from './utils.js';
 import {logger} from './logger.js';
 import {gzipSync} from './gzip.js';
@@ -103,7 +103,7 @@ export const SUPPORTS_REQUEST = hasXHR() || hasFetch();
  */
 function byteSize(s) {
   try {
-    return new Blob([s]).size;
+    return utf8ByteLength(s); // == new Blob([s]).size
   } catch (e) {
     return s.length;
   }

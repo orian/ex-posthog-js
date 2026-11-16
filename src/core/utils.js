@@ -633,3 +633,62 @@ export function microtask(fn) {
   if (P) P['resolve']()['then'](fn);
   else setTimeout(fn, 0);
 }
+
+/**
+ * UTF-8 byte length by counting UTF-16 code units: 1 byte below U+0080, 2
+ * below U+0800, 4 for a surrogate pair, and 3 for everything else, including
+ * a lone surrogate (encoded as U+FFFD, like Blob and TextEncoder do).
+ * @param {string} s
+ * @return {number}
+ */
+export function utf8ByteLengthSlow(s) {
+  const len = s.length;
+  let bytes = len;
+  for (let i = 0; i < len; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) continue;
+    if (c >= 0xd800 && c <= 0xdbff && i + 1 < len && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00) {
+      i++; // pair: 2 code units -> 4 bytes
+      bytes += 2;
+    } else {
+      bytes += c < 0x800 ? 1 : 2;
+    }
+  }
+  return bytes;
+}
+
+/** @type {?} TextEncoder, or null when it (or encodeInto) is missing */
+let utf8Encoder = undefined;
+/** @type {?Uint8Array} */
+let utf8Scratch = null;
+
+/**
+ * UTF-8 byte length of `s`: exactly `new Blob([s]).size`, which upstream uses
+ * to size payloads, without creating a blob (a Blob is registered with the
+ * browser's blob registry, which is far more expensive than encoding). Both
+ * Blob and TextEncoder take a USVString, so a lone surrogate becomes U+FFFD
+ * (3 bytes) in either. Encodes into a reused 64 KB scratch buffer, a slice at
+ * a time for long strings (encodeInto never splits a code point, and reports
+ * how many code units it consumed).
+ * @param {string} s
+ * @return {number}
+ */
+export function utf8ByteLength(s) {
+  if (utf8Encoder === undefined) {
+    const TE = win ? win['TextEncoder'] : undefined;
+    utf8Encoder = TE && typeof TE['prototype']['encodeInto'] === 'function' ? new TE() : null;
+  }
+  if (!utf8Encoder) return utf8ByteLengthSlow(s);
+  if (!utf8Scratch) utf8Scratch = new Uint8Array(65536);
+  const len = s.length;
+  let pos = 0;
+  let bytes = 0;
+  while (pos < len) {
+    const rest = pos ? s.substring(pos) : s;
+    const r = utf8Encoder['encodeInto'](rest, utf8Scratch);
+    if (!r['read']) return bytes + utf8ByteLengthSlow(rest); // can't happen with 64 KB; never loop forever
+    bytes += r['written'];
+    pos += r['read'];
+  }
+  return bytes;
+}

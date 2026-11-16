@@ -343,6 +343,51 @@ test('estimateSize reports UTF-8 bytes, and -1 when it cannot stringify', () => 
     }
 })
 
+test('estimateSize equals upstream new Blob([JSON.stringify(x, circularReferenceReplacer())]).size', () => {
+    const upstream = (x) => {
+        try {
+            const s = JSON.stringify(x, utils.circularReferenceReplacer())
+            return s ? new Blob([s]).size : 0
+        } catch {
+            return utils.UNSTRINGIFIABLE_EVENT_SIZE
+        }
+    }
+    let seed = 99
+    const r = () => ((seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) / 4294967296)
+    const strs = ['', 'a', 'héllo', '✓ 日本', '😀', '\ud800', '\udc00x', '\u0000', 'q"\\\n']
+    const leaf = () => [null, undefined, true, 0, -1.5, 1e21, NaN, strs[Math.floor(r() * strs.length)], () => 1,
+        new Date(0), Symbol('s')][Math.floor(r() * 11)]
+    const build = (depth, pool) => {
+        const k = r()
+        if (depth > 4 || k < 0.35) return leaf()
+        if (k < 0.45 && pool.length) return pool[Math.floor(r() * pool.length)] // shared or circular reference
+        const v = r() < 0.5 ? [] : {}
+        pool.push(v)
+        const n = Math.floor(r() * 5)
+        for (let i = 0; i < n; i++) {
+            const child = build(depth + 1, pool)
+            if (Array.isArray(v)) v.push(child)
+            else v['k' + i] = child
+        }
+        if (!Array.isArray(v) && r() < 0.05) {
+            const s = strs[Math.floor(r() * strs.length)]
+            v.toJSON = () => ({ viaToJSON: s })
+        }
+        return v
+    }
+    let circular = 0
+    for (let i = 0; i < 5000; i++) {
+        const v = build(0, [])
+        try { JSON.stringify(v) } catch { circular++ }
+        assert.equal(utils.estimateSize(v), upstream(v))
+    }
+    assert.ok(circular > 100, `fuzz covered ${circular} circular values`)
+    const big = { b: 10n }
+    assert.equal(utils.estimateSize(big), utils.UNSTRINGIFIABLE_EVENT_SIZE)
+    assert.equal(utils.estimateSize(undefined), 0)
+    assert.equal(utils.estimateSize(() => 1), 0)
+})
+
 test('estimateCompressedEventSize matches JSON length for compressed-event-like values', () => {
     for (const v of [null, 'hello', '', 42, -1, 3.14, true, false, {}, [], { a: 1, b: 'two' }, { a: { b: { c: 3 } } },
         { a: 1, b: undefined, c: 'three' }, [1, 'two', true, null], [1, undefined, 3],
