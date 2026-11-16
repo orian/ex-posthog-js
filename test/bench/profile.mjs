@@ -84,11 +84,21 @@ class Bundle {
             const e = this.map.findEntry(line, col)
             if (e && e.originalSource) {
                 r = { source: cleanSource(e.originalSource, this.ours), line: e.originalLine + 1, name: null }
-                for (const tok of nameTokens(this.lines[line] || '', col)) {
+                const toks = nameTokens(this.lines[line] || '', col)
+                for (const tok of toks) {
                     const n = this.map.findEntry(line, tok)
                     if (n && n.generatedColumn === tok && n.name) { r.name = n.name; break }
                 }
                 if (!r.name) r.name = this.nameFromSource(e.originalSource, e.originalLine, e.originalColumn)
+                // terser (official bundles) emits no `names` entry for identifiers it didn't
+                // rename (methods, properties): a mapped name token is then the original name.
+                if (!r.name && !this.ours) {
+                    const tok = toks.find((t) => this.map.findEntry(line, t).generatedColumn === t && identAt(this.lines[line], t) !== 'function')
+                    if (tok !== undefined) r.name = identAt(this.lines[line], tok)
+                    // class fields compiled to _defineProperty(this, "name", (a) => ...)
+                    const field = /"([A-Za-z_$][\w$]*)",\s*(?:async\s*)?(?:function\s*)?$/.exec((this.lines[line] || '').slice(Math.max(0, col - 80), col))
+                    if (!r.name && field) r.name = field[1]
+                }
             }
         }
         this.cache.set(k, r)
@@ -115,6 +125,7 @@ class Bundle {
 }
 
 const ID = /[\w$]/
+const identAt = (text, col) => /^[A-Za-z_$][\w$]*/.exec(text.slice(col))?.[0] || null
 /** Generated columns that may carry the function's name: the name token, then the `function` keyword. */
 function nameTokens(text, col) {
     const out = []
@@ -176,14 +187,32 @@ function indexRrweb(rrwebDir) {
     return index
 }
 
-/** Anchors: [rrweb-record.js line, name, file] for named functions declared in exactly one file. */
-function rrwebAnchors(rawMap, index) {
+/**
+ * Is the identifier at `col` of minified code a definition (not a use)? `function x(`,
+ * `class x`, `x(a){` (method), `x=function` / `x=(a)=>` / `x=t=>` / `x=wrapper(...=>`,
+ * `x:function`.
+ */
+function isDefinition(text, col) {
+    let end = col
+    while (end < text.length && ID.test(text[end])) end++
+    if (end === col) return false
+    const before = text.slice(Math.max(0, col - 12), col)
+    const after = text.slice(end, end + 160)
+    if (/(?:function\*?|class)\s*$/.test(before)) return true
+    if (/^\([^()]*\)\s*\{/.test(after) && /(?:[;{}]|\b(?:static|async|get|set))\s*$/.test(before)) return true
+    if (/^\s*[=:]\s*(?:async\s*)?(?:function\b|\([^()]*\)\s*=>|[\w$]+\s*=>|[\w$]+\(\s*(?:function\b|\([^()]*\)\s*=>|[\w$]+\s*=>))/.test(after)) return true
+    return false
+}
+
+/**
+ * Function definitions in the bundle's rrweb-record.js code: `defs` [line, name] (all, for
+ * naming anonymous functions) and `anchors` [line, name, file] (names declared in exactly
+ * one rrweb source file, for attributing lines to files).
+ */
+function rrwebDefinitions(rawMap, index, code) {
     const sm = new SourceMap(rawMap)
-    const srcIdx = rawMap.sources.findIndex((s) => /rrweb-record\.js$/.test(s))
-    if (srcIdx < 0) return []
-    const seen = new Map()
-    // Decode every segment through the public API: walk generated positions of names.
-    // (SourceMap has no iterator, so decode `mappings` lines and use findEntry per segment.)
+    const defs = new Map()
+    // SourceMap has no iterator: decode the generated columns of `mappings` and use findEntry.
     const lines = rawMap.mappings.split(';')
     for (let gl = 0; gl < lines.length; gl++) {
         let gc = 0
@@ -191,15 +220,26 @@ function rrwebAnchors(rawMap, index) {
             if (!seg) continue
             gc += vlq(seg)[0]
             const e = sm.findEntry(gl, gc)
-            if (!e || !e.name || !/rrweb-record\.js$/.test(e.originalSource || '')) continue
-            const files = index.get(e.name)
-            if (!files || files.size !== 1) continue
-            const key = e.originalLine + ':' + e.name
-            if (!seen.has(key)) seen.set(key, [e.originalLine + 1, e.name, [...files][0]])
+            if (!e || !/rrweb-record\.js$/.test(e.originalSource || '') || !isDefinition(code[gl] || '', gc)) continue
+            const name = e.name || identAt(code[gl], gc) // terser emits no name for unrenamed identifiers
+            const key = e.originalLine + ':' + name
+            if (!KEYWORDS.has(name) && !defs.has(key)) defs.set(key, [e.originalLine + 1, name])
         }
     }
-    return [...seen.values()].sort((a, b) => a[0] - b[0])
+    const all = [...defs.values()].sort((x, y) => x[0] - y[0])
+    const a = all.filter(([, name]) => index.get(name)?.size === 1 && !GENERIC.has(name)).map(([l, name]) => [l, name, [...index.get(name)][0]])
+    // Modules are contiguous: drop single anchors that disagree with both neighbours.
+    const anchors = a.filter((x, i) => !(i > 0 && i < a.length - 1 && a[i - 1][2] === a[i + 1][2] && x[2] !== a[i - 1][2]))
+    return { defs: all, anchors }
 }
+/** Index of the last entry of `a` (sorted by [0]) with a[i][0] <= line, or -1. */
+function lastAtOrBefore(a, line) {
+    let lo = 0, hi = a.length - 1, best = -1
+    while (lo <= hi) { const mid = (lo + hi) >> 1; if (a[mid][0] <= line) { best = mid; lo = mid + 1 } else hi = mid - 1 }
+    return best
+}
+// Method names also used for Proxy handlers, DOM APIs etc., so useless as module anchors.
+const GENERIC = new Set(['apply', 'contains', 'replace', 'restore', 'advance', 'get', 'set', 'has', 'add', 'delete', 'reset', 'emit', 'init', 'start', 'stop', 'destroy', 'flush', 'constructor', 'toString', 'handler'])
 const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
 function vlq(s) {
     const out = []
@@ -289,7 +329,6 @@ export class Attributor {
         this.locate = locate
         this.bundles = new Map()
         this.rrwebIndex = upstream ? indexRrweb(path.join(upstream, 'packages/rrweb')) : null
-        this.anchors = new Map() // bundle file -> anchors
     }
     bundle(urlPath) {
         if (this.bundles.has(urlPath)) return this.bundles.get(urlPath)
@@ -299,24 +338,27 @@ export class Attributor {
             b = new Bundle(loc.file, loc.ours, loc.sourceFile)
             if (this.rrwebIndex && fs.existsSync(loc.file + '.map')) {
                 const raw = JSON.parse(fs.readFileSync(loc.file + '.map', 'utf8'))
-                if (raw.sources.some((s) => /rrweb-record\.js$/.test(s))) b.anchors = rrwebAnchors(raw, this.rrwebIndex)
+                if (raw.sources.some((s) => /rrweb-record\.js$/.test(s))) b.rrweb = rrwebDefinitions(raw, this.rrwebIndex, b.lines)
             }
         }
         this.bundles.set(urlPath, b)
         return b
     }
-    /** rrweb-record.js line + name -> {file, near} using the upstream index and anchors. */
+    /**
+     * rrweb-record.js line + function name -> {file, near}: the file declaring that name if
+     * unique, else the file of the closest anchor before the line; `near` is the closest
+     * function definition before the line (names anonymous functions).
+     */
     rrwebFile(b, line, name) {
-        if (!this.rrwebIndex) return { file: null, near: null }
+        if (!this.rrwebIndex || !b.rrweb) return { file: null, near: null }
+        const { anchors, defs } = b.rrweb
+        const d = lastAtOrBefore(defs, line)
+        const near = d >= 0 ? defs[d][1] : null
         const files = name && this.rrwebIndex.get(name)
-        const a = b.anchors || []
-        // closest named function at or before `line` (binary search)
-        let lo = 0, hi = a.length - 1, best = -1
-        while (lo <= hi) { const mid = (lo + hi) >> 1; if (a[mid][0] <= line) { best = mid; lo = mid + 1 } else hi = mid - 1 }
-        const near = best >= 0 ? a[best] : null
-        if (files && files.size === 1) return { file: [...files][0], near: near && near[1] }
-        if (files && near && files.has(near[2])) return { file: near[2], near: near[1] }
-        return { file: near ? near[2] : null, near: near && near[1] }
+        const i = lastAtOrBefore(anchors, line)
+        const anchor = i >= 0 ? anchors[i] : null
+        if (files && files.size === 1) return { file: [...files][0], near }
+        return { file: anchor ? anchor[2] : null, near }
     }
     /** Classifies one profile call frame -> {bucket, file, fn, rrweb?: {file, fn, near}}. */
     frame(cf) {
@@ -334,7 +376,7 @@ export class Attributor {
         const b = this.bundle(p)
         const r = b && b.resolve(cf.lineNumber, cf.columnNumber)
         const base = path.basename(p)
-        if (!r) return { bucket: /\/recorder\.js$/.test(p) ? 'rrweb' : bucket, file: base, fn: (cf.functionName || '(anonymous)') + ' [unmapped]' }
+        if (!r) return { bucket, file: base, fn: (cf.functionName || '(anonymous)') + ' [unmapped]', unmapped: !!(b && b.map) }
         let file = r.source
         let fn = r.name || `(anonymous) ${path.basename(file)}:${r.line}`
         let rr = null
@@ -384,6 +426,10 @@ export class Attributor {
             }
             return frameCache.get(id)
         }
+        const opaque = (id) => {
+            const cf = nodes.get(id).callFrame
+            return cf.url ? !!frameOf(id)?.unmapped : !(cf.scriptId && cf.scriptId !== '0')
+        }
         const buckets = Object.fromEntries(Object.keys(BUCKETS).map((k) => [k, 0]))
         const fns = new Map()
         const nativeIn = {} // bucket -> µs of native callee time charged to it
@@ -401,19 +447,19 @@ export class Attributor {
             }
             let fr = frameOf(id)
             let native = null
-            if (!cf.url) {
-                if (cf.scriptId && cf.scriptId !== '0') fr = { bucket: 'other', file: '(no url)', fn: name || '(anonymous)' }
-                else {
-                    native = name || '(native)'
-                    let p = parent.get(id)
-                    while (p !== undefined && !nodes.get(p).callFrame.url) p = parent.get(p)
-                    fr = p === undefined ? null : frameOf(p)
-                    if (fr) nativeIn[fr.bucket] = (nativeIn[fr.bucket] || 0) + us
-                }
+            if (!cf.url && cf.scriptId && cf.scriptId !== '0') fr = { bucket: 'other', file: '(no url)', fn: name || '(anonymous)' }
+            else if (opaque(id)) {
+                // Natives and unmapped bundler helpers (babel's _objectSpread2 etc. at the top
+                // of recorder.js / lazy-recorder.js) are charged to their closest real caller.
+                native = cf.url ? `(bundler helper ${name || 'anonymous'})` : name || '(native)'
+                let p = parent.get(id)
+                while (p !== undefined && opaque(p)) p = parent.get(p)
+                fr = p === undefined ? null : frameOf(p)
+                if (fr) nativeIn[fr.bucket] = (nativeIn[fr.bucket] || 0) + us
             }
             if (!fr) { buckets.browser += us; addFn('browser|' + native, { bucket: 'browser', file: '(native)', fn: native }, us); continue }
             buckets[fr.bucket] += us
-            const fnName = native ? `[native] ${native} <- ${fr.fn}` : fr.fn
+            const fnName = native ? `${native.startsWith("(bundler") ? "" : "[native] "}${native} <- ${fr.fn}` : fr.fn
             addFn(fr.bucket + '|' + fr.file + '|' + fnName, { bucket: fr.bucket, file: fr.file, fn: fnName }, us)
             if (fr.bucket === 'rrweb') {
                 const leaf = fr.rr || { file: fr.file }
@@ -483,7 +529,7 @@ export function printProfile(prof, variants, opts) {
     const keys = variants.map((v) => v.key).filter((k) => prof[k])
     const base = prof.none
     console.log(`\nCPU profile (sampling every ${opts.profileInterval} µs over ${opts.profileWindow === 'load' ? 'the page from navigation to the end of the journeys' : 'the measured window'}, separate profiled runs; self time, medians of ${opts.runs} runs).`)
-    console.log('Native callees (getComputedStyle, JSON.stringify, ...) are charged to their JS caller. % = share of the variant\'s SDK total (SDK + replay + rrweb + lazy).\n')
+    console.log('Native callees (getComputedStyle, JSON.stringify, ...) and unmapped bundler helpers are charged to their JS caller. % = share of the variant\'s SDK total (SDK + replay + rrweb + lazy).\n')
     const rows = {}
     for (const b of Object.keys(BUCKETS)) {
         rows[BUCKETS[b]] = Object.fromEntries(keys.map((k) => {
@@ -511,21 +557,33 @@ export function printProfile(prof, variants, opts) {
 }
 
 // ---- CLI: re-attribute saved profiles ------------------------------------------------------
-//   node test/bench/profile.mjs DIR   (DIR from `bench:session --profile --save-profiles DIR`,
-//   files named <variant>-<run>.cpuprofile)
+//   node test/bench/profile.mjs DIR [--update RESULTS.json]
+// DIR is from `bench:session --profile --save-profiles DIR` (<variant>-<run>.cpuprofile).
+// --update rewrites the profile attribution in that results file (e.g. after improving
+// the attribution) without re-running the benchmark.
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
     const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
     const { OFFICIAL_VERSION } = await import('../diff/server.mjs')
     const dir = process.argv[2]
+    const update = process.argv[3] === '--update' ? process.argv[4] : null
     const upstream = findUpstream(root)
     const a = new Attributor(makeLocator(root, path.join(root, 'test/diff/vendor', `posthog-js-${OFFICIAL_VERSION}`, 'dist'), upstream), upstream)
     const byVariant = {}
-    for (const f of fs.readdirSync(dir).filter((f) => f.endsWith('.cpuprofile')).sort()) {
-        const key = f.replace(/-\d+\.cpuprofile$/, '')
-        ;(byVariant[key] = byVariant[key] || []).push(a.attribute(JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'))))
+    for (const f of fs.readdirSync(dir).filter((f) => f.endsWith('.cpuprofile'))) {
+        const [, key, run] = /^(.*)-(\d+)\.cpuprofile$/.exec(f)
+        ;(byVariant[key] = byVariant[key] || [])[Number(run)] = a.attribute(JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')))
     }
-    const prof = Object.fromEntries(Object.entries(byVariant).map(([k, runs]) => [k, summarise(runs)]))
+    const prof = Object.fromEntries(Object.entries(byVariant).map(([k, runs]) => [k, summarise(runs.filter(Boolean))]))
     const known = ['none', 'official', 'ours', 'lazy']
     const order = known.filter((k) => prof[k]).concat(Object.keys(prof).filter((k) => !known.includes(k)))
-    printProfile(prof, order.map((key) => ({ key })), { profileInterval: '?', runs: Math.max(...Object.values(byVariant).map((r) => r.length)) })
+    let opts = { profileInterval: '?', runs: Math.max(...Object.values(prof).map((p) => p.runs)) }
+    if (update) {
+        const res = JSON.parse(fs.readFileSync(update, 'utf8'))
+        opts = res.options
+        for (const [k, runs] of Object.entries(byVariant)) runs.forEach((cpu, i) => { if (res.profiledSamples?.[k]?.[i]) res.profiledSamples[k][i].cpu = cpu })
+        res.profile = { ...res.profile, medians: prof }
+        fs.writeFileSync(update, JSON.stringify(res, null, 2))
+    }
+    printProfile(prof, order.map((key) => ({ key })), opts)
+    if (update) console.log(`updated ${update}`)
 }
