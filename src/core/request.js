@@ -251,6 +251,27 @@ function readRetryAfter(getHeader) {
 }
 
 /**
+ * The SDK's own XHRs, so observers such as network metrics skip them (upstream
+ * `isPostHogXHR`). Created on the SDK's first XHR.
+ * @type {?WeakMap<!XMLHttpRequest, boolean>}
+ */
+let posthogXHRs = null;
+
+/** @param {!XMLHttpRequest} req */
+function markPostHogXHR(req) {
+  if (!posthogXHRs && typeof WeakMap !== 'undefined') posthogXHRs = new WeakMap();
+  if (posthogXHRs) posthogXHRs.set(req, true);
+}
+
+/**
+ * @param {!XMLHttpRequest} req
+ * @return {boolean}
+ */
+export function isPostHogXHR(req) {
+  return !!posthogXHRs && posthogXHRs.has(req);
+}
+
+/**
  * @param {!RequestOptions} options
  * @param {?EncodedBody=} preEncoded
  */
@@ -258,6 +279,7 @@ function xhr(options, preEncoded) {
   const encoded = encodeRequest(options, preEncoded);
   if (!encoded) return;
   const req = new XMLHttpRequest();
+  markPostHogXHR(req);
   req.open(options.method || 'GET', encoded.url, true);
   const body = encoded.encodedBody ? encoded.encodedBody.body : undefined;
   const headers = options.headers || {};

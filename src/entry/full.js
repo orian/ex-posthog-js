@@ -18,3 +18,7 @@ import '../heatmaps/index.js';
 // Web vitals and tracing headers (each needs only core).
 import '../web-vitals/index.js';
 import '../tracing-headers/index.js';
+// Logs and metrics (they share src/otlp/), and the toolbar loader.
+import '../logs/index.js';
+import '../metrics/index.js';
+import '../toolbar/index.js';

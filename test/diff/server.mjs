@@ -63,8 +63,18 @@ export function startServer({ port = 0 } = {}) {
             // exist only for real upstream versions; anything else is a 404 (and is logged
             // as such, so the diff can flag SDKs requesting assets that don't exist).
             const m = /^\/static\/(?:([^/]+)\/)?([^/]+)$/.exec(url.pathname)
-            const known = m && (!m[1] || m[1] === OFFICIAL_VERSION) && fs.existsSync(path.join(VENDOR, m[2]))
-            state.log.push({ method: req.method, path: url.pathname, query: Object.fromEntries(url.searchParams), status: known ? 200 : 404 })
+            const versionOk = !!m && (!m[1] || m[1] === OFFICIAL_VERSION)
+            const entry = { method: req.method, path: url.pathname, query: Object.fromEntries(url.searchParams) }
+            state.log.push(entry)
+            if (versionOk && m[2] === 'toolbar.js') {
+                // A scenario may 404 the versioned toolbar on purpose (to exercise the fallback).
+                const forced = url.pathname !== '/static/toolbar.js' && state.responses.versionedToolbar
+                entry.status = forced ? forced.status : 200
+                if (forced) entry.expected404 = true
+                return serveToolbarStub(res, url, state)
+            }
+            const known = versionOk && fs.existsSync(path.join(VENDOR, m[2]))
+            entry.status = known ? 200 : 404
             if (!known) return res.writeHead(404).end('not found')
             return sendFile(res, path.join(VENDOR, m[2]))
         }
@@ -127,4 +137,25 @@ export function startServer({ port = 0 } = {}) {
     return new Promise((resolve) => {
         server.listen(port, '0.0.0.0', () => resolve({ server, state, port: server.address().port }))
     })
+}
+
+// ---- toolbar ---------------------------------------------------------------------
+// The hosted toolbar bundle is not part of either SDK: this stub records each
+// `ph_load_toolbar(params, posthog)` call so scenarios can compare them.
+const TOOLBAR_STUB = `(function () {
+  window.ph_load_toolbar = function (params, posthog) {
+    (window.__toolbarCalls = window.__toolbarCalls || []).push({
+      params: JSON.parse(JSON.stringify(params)),
+      isGlobalInstance: posthog === window.posthog,
+    })
+  }
+})()`
+
+// With `responses.versionedToolbar = { status: 404 }`, `/static/<version>/toolbar.js` fails,
+// so the SDK falls back to `/static/toolbar.js?v=...&t=...`.
+function serveToolbarStub(res, url, state) {
+    const versioned = url.pathname !== '/static/toolbar.js'
+    if (versioned && state.responses.versionedToolbar) return res.writeHead(state.responses.versionedToolbar.status).end('not found')
+    res.writeHead(200, { 'Content-Type': 'application/javascript', 'Cache-Control': 'no-store' })
+    res.end(TOOLBAR_STUB)
 }

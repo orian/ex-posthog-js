@@ -200,6 +200,41 @@ function normaliseSdkFrames(event) {
     return event
 }
 
+// ---- logs / metrics (OTLP bodies) and the toolbar script --------------------------------
+// OTLP payloads are compared in full, except:
+// - `timeUnixNano` / `observedTimeUnixNano` / `startTimeUnixNano`: wall-clock nanos;
+// - the `sessionStartTimestamp` / `lastActivityTimestamp` log attributes: wall-clock millis;
+// - `telemetry.sdk.version` and the scope `version`: the SDK version (as `$lib_version`).
+const OTLP_PATHS = new Set(['/i/v1/logs', '/i/v1/metrics'])
+const OTLP_TIME_KEYS = new Set(['timeUnixNano', 'observedTimeUnixNano', 'startTimeUnixNano'])
+const OTLP_VOLATILE_ATTRIBUTES = new Set(['sessionStartTimestamp', 'lastActivityTimestamp'])
+const isOtlpPath = (p) => OTLP_PATHS.has(p)
+
+function normaliseOtlp(value, key) {
+    if (Array.isArray(value)) return value.map((v) => normaliseOtlp(v))
+    if (!value || typeof value !== 'object') return value
+    const out = {}
+    for (const k of Object.keys(value)) {
+        if (OTLP_TIME_KEYS.has(k) && typeof value[k] === 'string' && /^\d+000000$/.test(value[k])) out[k] = '<volatile>'
+        else out[k] = normaliseOtlp(value[k], k)
+    }
+    if (typeof out.key === 'string' && out.value && (OTLP_VOLATILE_ATTRIBUTES.has(out.key) || out.key === 'telemetry.sdk.version')) {
+        out.value = OTLP_VOLATILE_ATTRIBUTES.has(out.key) ? '<volatile>' : '<lib_version>'
+    }
+    if (key === 'scope' && typeof out.version === 'string') out.version = '<lib_version>'
+    return out
+}
+
+// The toolbar script URL: `/static/toolbar.js?v=<version>&t=<5 minute boundary>`, or
+// `/static/<version>/toolbar.js` under strict_script_versioning. Both SDKs must request
+// the same upstream version (ours uses UPSTREAM_VERSION); `t` is wall-clock time, so only
+// its shape is compared.
+const isToolbarScript = (p) => /^\/static\/(?:[\w.-]+\/)?toolbar\.js$/.test(p)
+function normaliseToolbarScript(path, query) {
+    if ('t' in query) query.t = /^\d+$/.test(query.t) && Number(query.t) % 300000 === 0 ? '<5min>' : `<bad t=${query.t}>`
+    return path
+}
+
 /** Turns a request log into a list of comparable items (requests + events). */
 function digest(log) {
     const ids = new Map()
@@ -210,9 +245,10 @@ function digest(log) {
         delete query._
         delete query.ver
         delete query.sent_at
-        const body = r.body
+        const body = isOtlpPath(r.path) ? normaliseOtlp(r.body) : r.body
         const batch = body && typeof body === 'object' ? (Array.isArray(body) ? body : body.batch) : null
-        requests.push({ method: r.method, path: r.path, query: normalise(query, ids), contentType: r.contentType, events: batch ? batch.map((e) => e.event) : undefined })
+        const path = isToolbarScript(r.path) ? normaliseToolbarScript(r.path, query) : r.path
+        requests.push({ method: r.method, path, query: normalise(query, ids), contentType: r.contentType, events: batch ? batch.map((e) => e.event) : undefined })
         if (batch) for (const e of batch) events.push(normalise(e && e.event === '$snapshot' ? expandSnapshot(e) : normaliseSdkFrames(e), ids))
         else if (body && typeof body === 'object' && r.path !== '/e/') events.push({ __request: r.path, body: normalise(body, ids) })
     }
@@ -238,7 +274,7 @@ function compare(official, ours) {
     const out = []
     const o = digest(official.log)
     const m = digest(ours.log)
-    const seq = (d) => d.requests.filter((r) => !r.path.startsWith('/static/')).map((r) => {
+    const seq = (d) => d.requests.filter((r) => !r.path.startsWith('/static/') || isToolbarScript(r.path)).map((r) => {
         const q = Object.keys(r.query).sort().map((k) => `${k}=${r.query[k]}`).join('&')
         return `${r.method} ${r.path}${q ? '?' + q : ''}${r.contentType ? ' (' + r.contentType + ')' : ''}${r.events ? ' [' + r.events.join(',') + ']' : ''}`
     })
@@ -263,7 +299,7 @@ function compare(official, ours) {
     diffValues(official.results, ours.results, 'results', out)
     if (official.error || ours.error) out.push(`errors: official=${official.error} ours=${ours.error}`)
     // Errors thrown on purpose by exception scenarios are marked 'diff-expected'.
-    const missing = ours.log.filter((r) => r.status === 404).map((r) => r.path)
+    const missing = ours.log.filter((r) => r.status === 404 && !r.expected404).map((r) => r.path)
     if (missing.length) out.push(`ours requested missing assets (404): ${missing.join(' ')}`)
     const pageErrors = ours.pageErrors.filter((e) => !/diff-?expected/i.test(e))
     if (pageErrors.length) out.push(`page errors (ours): ${pageErrors.join(' | ')}`)

@@ -22,3 +22,8 @@ SCENARIO_NAMES.push('replay_recording', 'replay_server_disabled', 'replay_client
 SCENARIO_NAMES.push('wv_remote_on', 'wv_remote_off', 'wv_allowed_metrics', 'wv_client_config', 'wv_real_metrics',
     'wv_flush_unload', 'wv_flush_timer', 'wv_external_loading_disabled',
     'th_fetch_xhr', 'th_not_configured', 'th_alias_add_tracing_headers', 'th_alias_legacy_true', 'th_set_config')
+// Logs, metrics and the toolbar loader (pages/scenarios.js, last block).
+SCENARIO_NAMES.push('logs_api', 'logs_before_send', 'logs_batching', 'logs_batch_limit', 'logs_flush_unload',
+    'logs_opt_out', 'logs_console_config', 'logs_console_remote', 'logs_console_persisted', 'logs_console_remote_off',
+    'metrics_api', 'metrics_batching', 'toolbar_hash', 'toolbar_hash_legacy', 'toolbar_load', 'toolbar_persisted',
+    'toolbar_fallback', 'toolbar_none')

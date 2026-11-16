@@ -187,3 +187,12 @@ Object.assign(RESPONSES, {
     wv_flush_timer: WEB_VITALS_ON,
     wv_external_loading_disabled: WEB_VITALS_ON,
 })
+
+// ---- logs: remote `logs.captureConsoleLogs` --------------------------------------------
+Object.assign(RESPONSES, {
+    logs_console_remote: remoteConfig({ ...REMOTE_CONFIG, logs: { captureConsoleLogs: true } }),
+    logs_console_persisted: remoteConfig({ ...REMOTE_CONFIG, logs: { captureConsoleLogs: true } }),
+    logs_console_remote_off: remoteConfig({ ...REMOTE_CONFIG, logs: { captureConsoleLogs: false } }),
+    // toolbar: the versioned script 404s, so the legacy `?v=&t=` URL is loaded (see server.mjs).
+    toolbar_fallback: { versionedToolbar: { status: 404 } },
+})

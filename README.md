@@ -11,7 +11,7 @@ when a site switches between this SDK and upstream.
 
 It is a faithful port of upstream posthog-js **1.450.0** for the core, feature
 flags, web experiments, exception capture, autocapture (with rageclicks), heatmaps, dead clicks, session replay,
-web vitals and tracing headers. `test/diff` runs the same scenarios against the
+web vitals, tracing headers, logs, metrics and the toolbar loader. `test/diff` runs the same scenarios against the
 official bundle and this SDK in headless Chrome and diffs the traffic; all
 scenarios are identical (see [Test](#test)). See [Scope](#scope) for what is
 not ported yet.
@@ -73,6 +73,13 @@ src/replay/        optional: session replay (rrweb is loaded at runtime from /st
 src/web-vitals/    optional: $web_vitals (Google's web-vitals compiled in from third_party/)
 src/tracing-headers/ optional: tracing headers / traceparent on the app's fetch and XHR
 third_party/web-vitals/ Google web-vitals 6.2.1 (Apache-2.0), ported to JSDoc; see its README
+src/otlp/          shared OTLP helpers for logs and metrics (attribute encoder, resource
+                   attributes, flush timer, backoff, the console/fetch `patch` layer)
+src/logs/          opt-in: posthog.captureLog / posthog.logger / posthog.logs and console
+                   log capture, sent to /i/v1/logs as OTLP (needs otlp)
+src/metrics/       opt-in: posthog.metrics (count, gauge, histogram, network metrics),
+                   sent to /i/v1/metrics as OTLP (needs otlp)
+src/toolbar/       opt-in: the toolbar loader (posthog.loadToolbar, posthog.toolbar)
 src/entry/         bundle entry points (core, core-flags, full)
 docker/closure-compiler/Dockerfile   Closure Compiler v20261109 (official Maven jar, JRE 21)
 scripts/build.sh   builds every bundle in Docker
@@ -89,10 +96,10 @@ upstream/          shallow clone of PostHog/posthog-js, kept for reference only 
 
 | Output | Contents | gzip |
 |---|---|---|
-| `dist/posthog.core.js` | core only | ~35.0 KB |
-| `dist/posthog.core-flags.js` | core + feature flags | ~41.7 KB |
-| `dist/posthog.full.js` | everything: core + flags + experiments + exceptions + autocapture, dead clicks, heatmaps + session replay + web vitals + tracing headers | ~98.2 KB |
-| `dist/chunks/core.js` | core chunk | ~36.4 KB |
+| `dist/posthog.core.js` | core only | ~35.2 KB |
+| `dist/posthog.core-flags.js` | core + feature flags | ~41.9 KB |
+| `dist/posthog.full.js` | everything: all modules below | ~110.8 KB |
+| `dist/chunks/core.js` | core chunk | ~36.7 KB |
 | `dist/chunks/flags.js` | flags chunk (needs core) | ~7.4 KB |
 | `dist/chunks/experiments.js` | experiments chunk (needs flags) | ~6.5 KB |
 | `dist/chunks/exceptions.js` | exception capture chunk (needs core) | ~8.4 KB |
@@ -103,6 +110,10 @@ upstream/          shallow clone of PostHog/posthog-js, kept for reference only 
 | `dist/chunks/replay.js` | session replay chunk (needs core) | ~23.3 KB |
 | `dist/chunks/webvitals.js` | web vitals chunk, web-vitals library included (needs core) | ~7.8 KB |
 | `dist/chunks/tracingheaders.js` | tracing headers chunk (needs core) | ~2.7 KB |
+| `dist/chunks/otlp.js` | shared OTLP helpers (needs core) | ~1.9 KB |
+| `dist/chunks/logs.js` | logs and console capture (needs otlp) | ~6.4 KB |
+| `dist/chunks/metrics.js` | metrics (needs otlp) | ~5.3 KB |
+| `dist/chunks/toolbar.js` | toolbar loader (needs core) | ~1.5 KB |
 
 Session replay also loads upstream's `recorder.js` (rrweb and its console and
 network plugins, ~46.5 KB gzip) from the assets host when recording starts.
@@ -153,6 +164,11 @@ module out:
 <script src="chunks/replay.js"></script>  <!-- needs only core.js -->
 <script src="chunks/webvitals.js"></script>  <!-- needs only core.js -->
 <script src="chunks/tracingheaders.js"></script>  <!-- needs only core.js -->
+<!-- opt-in: otlp.js first for logs.js / metrics.js; toolbar.js needs only core.js -->
+<script src="chunks/otlp.js"></script>
+<script src="chunks/logs.js"></script>
+<script src="chunks/metrics.js"></script>
+<script src="chunks/toolbar.js"></script>
 ```
 
 The DOM helpers shared by autocapture, dead clicks and heatmaps (element
@@ -196,6 +212,21 @@ parsing, filters, steps, rate limiting, the `window.onerror` /
 the module, so `posthog.core.js` carries none of it. The module publishes
 `posthog.exceptions` and `posthog.exceptionObserver` (with `isEnabled`), like
 upstream.
+
+Logs, metrics and the toolbar are opt-in modules in the same way. `captureLog`,
+`logger` (`trace`/`debug`/`info`/`warn`/`error`/`fatal`) and `loadToolbar` are
+core methods, as upstream; the core delegates through the `LogsApi` /
+`ToolbarApi` records and, without the modules, `captureLog` and `logger` do
+nothing and `loadToolbar` returns `false`. The core's only other hooks are
+upstream's: the unload handler drains `metrics` (always) and `logs` (with
+`request_batching`) with sendBeacon, and turning capturing off releases console
+capture (`_onOptOut`). The modules publish `posthog.logs` (`captureLog`,
+`logger`, `flush()`, `flushLogs(transport)`, `reset()`, ...),
+`posthog.metrics` (`count`, `gauge`, `histogram`, `flush(transport)`) and
+`posthog.toolbar` (`loadToolbar`, `maybeLoadToolbar`, `maybeLoadEditor`).
+Logs and metrics share the `otlp` chunk (the OTLP attribute encoder, resource
+attributes, flush timer and backoff); it is a chunk of its own so either can be
+loaded without the other.
 
 `startSessionRecording(override)`, `stopSessionRecording()` and
 `sessionRecordingStarted()` are always present;
@@ -321,6 +352,7 @@ node test/sanitizer-chrome.mjs   # html sanitiser vs real DOMPurify 3.4.13 (need
 node --test test/exceptions.test.mjs   # upstream's stack parser / coercer / builder unit tests, ported
 node --test test/web-vitals.test.mjs   # upstream's web vitals tests, ported, + the web-vitals port
 node --test test/tracing-headers.test.mjs   # upstream's tracing headers and patch tests, ported
+node --test test/logs-metrics.test.mjs # OTLP encoder, log records/pipeline, console capture, metrics aggregation
 ```
 
 The differential test serves the official `array.js` and our
@@ -366,6 +398,19 @@ Tracing headers scenarios (`th_*`) call `/__echo` on other hosts
 (`api.`/`other.`/`third.example.test`), which the fake server answers on any
 non-PostHog host by recording the request's host, method, query, headers and
 body; a random `traceparent` is normalised after its format is checked.
+Logs and metrics scenarios (`logs_*`, `metrics_*`) compare the OTLP bodies sent
+to `/i/v1/logs` and `/i/v1/metrics` in full, except wall-clock values:
+`timeUnixNano` / `observedTimeUnixNano` / `startTimeUnixNano` and the
+`sessionStartTimestamp` / `lastActivityTimestamp` log attributes are volatile,
+and `telemetry.sdk.version` / the scope `version` are the SDK version (like
+`$lib_version`). Toolbar scenarios (`toolbar_*`) serve a stub `toolbar.js` from
+the fake server that records each `ph_load_toolbar(params, posthog)` call; the
+toolbar script requests are compared (unlike other `/static/` requests) with the
+version in the path or `v` normalised and `t` (a 5-minute wall-clock boundary)
+checked for its shape only, and the scenario results compare `ph_toolbar_state`,
+the `_postHogToolbarParams` localStorage entry, the URL hash and the recorded
+calls. `toolbar_persisted` reloads the page to launch the toolbar from the
+params saved by the first load.
 
 The Node harness cannot execute injected scripts, so remote config always goes
 through the JSON fallback there.
@@ -455,8 +500,31 @@ through the JSON fallback there.
   `trace_propagation_targets`, live updates through `set_config`, and the
   spliceable patch layers shared with replay's network plugin.
 
+- Logs (`posthog-logs.ts`, browser-common `logs.ts`, `logs-config.ts`,
+  `console-logs.ts`, the `logs` entrypoint, core `logs/` and the OTLP
+  encoders): `captureLog` and `logger` with every level, attributes and trace
+  context, `beforeSend` chains, the per-interval rate cap, the in-memory queue
+  with its flush trigger (`maxBufferSize`), timer (`flushIntervalMs`), 100-record
+  slices, 413 halving, retry with backoff and the status-0 circuit breaker,
+  console capture (`logs.captureConsoleLogs` and the remote
+  `logs.captureConsoleLogs`, persisted as `$logs_capture_enabled_server_side`,
+  with the pre-load recorder and its replay), opt-out/reset handling and the
+  sendBeacon drain on unload.
+- Metrics (`posthog-metrics.ts`, `extensions/network-metrics.ts`, core
+  `metrics/`): `count` / `gauge` / `histogram` aggregation with series identity,
+  bounds, the series and bounds caps, `beforeSend`, the 60 s browser flush
+  interval, the flush on `visibilitychange` to hidden, merge-back on transient
+  failures and the sendBeacon drain on unload; `metrics.network` request
+  duration histograms for `fetch` and XHR.
+- The toolbar loader (`extensions/toolbar.ts`): the `__posthog` / `state` hash
+  param read at parse time, `_postHogToolbarParams`, `loadToolbar`,
+  `maybeLoadToolbar`, `maybeLoadEditor`, `window.ph_toolbar_state`, and the
+  `toolbar.js` URL (`/static/<version>/toolbar.js`, falling back to
+  `/static/toolbar.js?v=<version>&t=<5 min>`, with the upstream version). The hosted toolbar itself is not
+  part of this SDK.
+
 **Not yet implemented** (upstream modules to add as extensions): surveys, product tours,
-logs/metrics, conversations, the toolbar, site apps.
+conversations, site apps, WebMCP.
 
 **Known differences from upstream**
 
@@ -506,6 +574,21 @@ logs/metrics, conversations, the toolbar, site apps.
   the native CompressionStream is missing or fails, and when compressions are
   drained on unload, events are compressed with the core's encoder instead of
   fflate (same decoded data, different `$snapshot_bytes`).
+- Console log capture is compiled into the `logs` module instead of being
+  lazy-loaded from `/static/logs.js`, so it takes over the recorder's buffer
+  synchronously when capture is enabled (upstream does it once that script has
+  loaded; the same records are sent). Like the script load upstream, it is
+  refused under `disable_external_dependency_loading`. The compatibility shims
+  `logs.js` keeps for older cores (`__PosthogExtensions__.logs`) are not
+  provided.
+- Logs and metrics: upstream's `Retry-After` window is not ported because the
+  browser senders never report a `Retry-After` (it can never open there), and
+  metric exemplars are not ported because they need an active span, which the
+  browser host never provides. The OTLP encoder's debug messages go to
+  `console.log` instead of `console.debug` (debug mode only).
+- Loaded as a chunk, the toolbar module reads the URL hash when the chunk is
+  parsed (upstream: when the SDK is parsed). Upstream's deprecated
+  `toolbar._loadEditor` is mangled in its bundle and is not published here either.
 - With a `maskCapturedNetworkRequestFn` that drops an initial navigation entry,
   upstream marks the URL-less fallback in a WeakSet that the network plugin
   reads to drop the entry's server timings. recorder.js's plugin has its own
