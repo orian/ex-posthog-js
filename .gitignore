@@ -3,3 +3,4 @@ upstream/
 node_modules/
 test/diff/vendor/
 test/diff/last-report.json
+.claude/
