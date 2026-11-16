@@ -16,53 +16,77 @@ official bundle and this SDK in headless Chrome and diffs the traffic; all
 scenarios are identical (see [Test](#test)). See [Scope](#scope) for what is
 not ported yet.
 
+Two main builds: `posthog.full.js` has everything compiled in, and
+`lazy/posthog.js` is split exactly like upstream's `array.js`, loading each
+lazy part from `lazy/<kind>.js` where upstream loads `/static/<kind>.js` (see
+[The lazy build](#the-lazy-build)).
+
 ## Size and performance vs the official SDK
 
 Measured against official posthog-js 1.450.0 on the same page in headless
 Chrome with 4x CPU throttling (roughly a mid-range phone), medians of 7 runs
-(`./scripts/build.sh && node test/diff/bench.mjs`), on main at beabc10.
+(`./scripts/build.sh && node test/diff/bench.mjs`), on the `lazy-build` branch.
 Absolute times vary with machine load; the ratios were stable across runs.
 
-### Speed
+### Like for like: `lazy/posthog.js` vs `array.js`
 
-| | official `array.js` | ours `posthog.full.js` | ours `posthog.core.js` |
-|---|---|---|---|
-| Script download + parse + eval | 36.5-40.4 ms (1x) | 21.5-22.5 ms (~0.55-0.6x) | 17.6-18.4 ms (~0.45x) |
-| `posthog.init()` | 26.3-27.2 ms (1x) | 16.3-17.7 ms (~0.6-0.67x) | 11.7-12.7 ms (~0.45x) |
-| 1000 `capture()` calls (incl. client rate limiting) | 513-553 ms (1x) | ~261 ms (~0.5x) | 255-268 ms (~0.5x) |
-| Long tasks during the test | 1 (558-599 ms) | 1 (283-288 ms) | 1 (273-290 ms) |
+Upstream's CDN `array.js` is the core plus every extension's *shell*; the
+heavy parts are lazy-loaded from `/static/<kind>.js` when a feature turns on.
+Our lazy build (`lazy/posthog.js`) is split at exactly the same points and
+loads its parts from `lazy/<kind>.js` at the same moments (see
+[The lazy build](#the-lazy-build)), so the two compare like for like. Sizes
+are gzip -9; "downloaded" is every SDK script the page loaded.
 
-### Size (gzip)
+| | official `array.js` | ours `lazy/posthog.js` |
+|---|---|---|
+| Main script | `array.js` 122.4 KB (372 KB raw) | `posthog.js` 82.4 KB (231 KB raw), ~0.67x |
+| Downloaded at startup, default setup | 171 KB: `array.js` + `surveys.js` 48.7 (fetched even with surveys off; not ported here) | 82.4 KB, ~0.48x (0.67x without `surveys.js`) |
+| Downloaded with session replay on | 244 KB: + `lazy-recorder.js` 72.5 | 151 KB: + `replay.js` 21.2 + PostHog's `recorder.js` 46.5, ~0.62x |
+| Downloaded with replay, exceptions, dead clicks, web vitals, tracing headers and console logs on | 272 KB: + `web-vitals-with-attribution.js` 7.0, `exception-autocapture.js` 6.5, `dead-clicks-autocapture.js` 8.5, `logs.js` 2.8, `tracing-headers.js` 2.6 | 165 KB: + `web-vitals.js` 5.9, `exception-autocapture.js` 0.9, `dead-clicks-autocapture.js` 3.9, `logs.js` 1.6, `tracing-headers.js` 2.2, ~0.61x |
+| Script download + parse + eval (default setup) | 36.8 ms (1x) | 21.5 ms (~0.58x) |
+| `posthog.init()` (default / everything on) | 26.0 / 30.8 ms | 16.5 / 20.7 ms (~0.65x) |
+| 1000 `capture()` calls (incl. client rate limiting) | 495-580 ms | 269-297 ms (~0.5x) |
+| Long tasks during the test | 1 (540-626 ms) | 1 (293-327 ms) |
 
-Upstream's CDN `array.js` is the core plus every module's *shell*; the heavy
-parts are lazy-loaded from `/static/` when a feature turns on (`array.full.js`
-bundles most of them). Our `posthog.full.js` has everything we ported compiled
-in; only PostHog's rrweb fork (`recorder.js`) is downloaded, when replay is on.
+Without `surveys.js` (not ported), the like-for-like gaps are the main script
+(82.4 vs 122.4 KB) and each lazy part (ours are smaller: e.g. our
+`exception-autocapture.js` reuses the stack parser already in `posthog.js`,
+where upstream's bundles its own copy; `replay.js` + `recorder.js` is 67.7 KB
+vs `lazy-recorder.js` 72.5 KB). Our lazy build makes the same number of
+requests as upstream minus `surveys.js`, plus one: replay loads two scripts
+(our `replay.js` and PostHog's `recorder.js`, in parallel) where upstream
+loads `lazy-recorder.js`.
+
+### Other builds
 
 | | official | ours |
 |---|---|---|
-| Core only | `module.slim` 54.0 KB (npm build) | `posthog.core.js` 35.2 KB |
-| Main CDN script | `array.js` 122.4 KB | `posthog.full.js` 110.8 KB (309.5 KB raw vs 372 KB) |
-| Downloaded at startup, default setup | `array.js` + `surveys.js` (48.7 KB, fetched even with surveys off) = 171 KB | 110.8 KB |
-| With replay, exceptions, dead clicks, web vitals, tracing headers and logs on | ~271 KB (adds `lazy-recorder.js` 72.5, `exception-autocapture.js` 6.5, `dead-clicks-autocapture.js` 8.5, `web-vitals-with-attribution.js` 7.0, `tracing-headers.js` 2.6, `logs.js` 2.8) | ~157 KB (adds `recorder.js` 46.5) |
-| Single file with replay included | `array.full.js` 231 KB (also includes surveys) | none |
+| Core only | `module.slim` 54.0 KB (npm build) | `posthog.core.js` 35.4 KB |
+| Everything in one main script | `array.full.js` 231 KB (also includes surveys; still lazy-loads some parts) | `posthog.full.js` 111.3 KB; only `recorder.js` (46.5) is downloaded, when replay is on |
 
-The main-script gap is smaller than the download gap because about 50-55 KB of
-`posthog.full.js` (replay logic 23.3, exceptions 8.4, logs/metrics/otlp 13.5,
-web vitals 7.8, tracing headers 2.7) is code `array.js` only fetches when the
-feature is on. Per-module chunk sizes are in the Build section; core + flags
-alone is about 44 KB. Surveys, product tours and conversations are not ported,
-so part of upstream's size has no counterpart here.
+| default setup | load + eval | `init()` | 1000 captures | downloaded |
+|---|---|---|---|---|
+| official `array.js` | 36.8 ms | 26.0 ms | 495 ms | 171 KB |
+| ours `posthog.full.js` | 23.1 ms | 17.1 ms | 282 ms | 111 KB (158 KB with replay or everything on) |
+| ours `lazy/posthog.js` | 21.5 ms | 16.5 ms | 269 ms | 82 KB |
+| ours `posthog.core.js` | 17.7 ms | 11.8 ms | 269 ms | 35 KB |
+
+Surveys, product tours and conversations are not ported, so part of
+upstream's size has no counterpart here. Per-module chunk sizes are in the
+Build section; core + flags alone is about 44 KB.
 
 Other differences besides size and speed:
 
-- **Fewer requests.** Upstream lazy-loads `surveys.js` on every page (even with
-  surveys off in the project) and its replay logic inside `lazy-recorder.js`;
-  we have no surveys module and compile the replay logic in, loading only
-  PostHog's rrweb fork (`recorder.js`).
-- **Compiled in vs lazy-loaded.** Exception autocapture's wrappers and dead
-  clicks are part of our bundle or chunk instead of separate `/static/` downloads, so they start immediately
-  rather than after a script load. The resulting traffic is the same.
+- **Requests.** Upstream lazy-loads `surveys.js` on every page (even with
+  surveys off in the project); we have no surveys module. `posthog.full.js`
+  compiles every lazy part in, loading only PostHog's rrweb fork
+  (`recorder.js`); the lazy build loads its parts where upstream loads its
+  `/static/` scripts (with replay as two scripts, see above).
+- **Compiled in vs lazy-loaded.** In `posthog.full.js` and the chunks,
+  exception autocapture's wrappers, dead clicks, web vitals, tracing headers
+  and console capture start immediately rather than after a script load. The
+  resulting traffic is the same (see the known differences); the lazy build
+  starts them when upstream does.
 - **Pick what you load.** Each module is also a Closure chunk; `posthog.core.js`
   plus only the chunks you need is smaller than any upstream CDN build.
 - **Synchronous gzip** (beacons on unload, `send_instantly`, browsers without
@@ -80,7 +104,8 @@ Other differences besides size and speed:
 ```
 src/core/          always loaded: init, capture, identity, persistence, sessions,
                    remote config, batching/retry/transport, consent, pageviews,
-                   scroll tracking, rate limiting, extension registry
+                   scroll tracking, rate limiting, extension registry, lazy part
+                   registry (lazy.js) and the lazy build's chunk loader (lazy-chunks.js)
 src/flags/         optional: feature flags (/flags/?v=2)
 src/experiments/   optional: no-code web experiments (needs flags)
 src/exceptions/    optional: exception capture + autocapture (posthog.exceptions,
@@ -101,7 +126,7 @@ src/logs/          opt-in: posthog.captureLog / posthog.logger / posthog.logs an
 src/metrics/       opt-in: posthog.metrics (count, gauge, histogram, network metrics),
                    sent to /i/v1/metrics as OTLP (needs otlp)
 src/toolbar/       opt-in: the toolbar loader (posthog.loadToolbar, posthog.toolbar)
-src/entry/         bundle entry points (core, core-flags, full)
+src/entry/         bundle entry points (core, core-flags, full, lazy)
 docker/closure-compiler/Dockerfile   Closure Compiler v20261109 (official Maven jar, JRE 21)
 scripts/build.sh   builds every bundle in Docker
 test/              Node harness (fake browser) + headless-Chrome smoke test
@@ -117,31 +142,38 @@ upstream/          shallow clone of PostHog/posthog-js, kept for reference only 
 
 | Output | Contents | gzip |
 |---|---|---|
-| `dist/posthog.core.js` | core only | ~35.2 KB |
-| `dist/posthog.core-flags.js` | core + feature flags | ~41.9 KB |
-| `dist/posthog.full.js` | everything: all modules below | ~110.8 KB |
-| `dist/chunks/core.js` | core chunk | ~36.7 KB |
+| `dist/posthog.core.js` | core only | ~35.4 KB |
+| `dist/posthog.core-flags.js` | core + feature flags | ~42.1 KB |
+| `dist/posthog.full.js` | everything: all modules below | ~111.3 KB |
+| `dist/chunks/core.js` | core chunk | ~36.9 KB |
 | `dist/chunks/flags.js` | flags chunk (needs core) | ~7.4 KB |
 | `dist/chunks/experiments.js` | experiments chunk (needs flags) | ~6.5 KB |
-| `dist/chunks/exceptions.js` | exception capture chunk (needs core) | ~8.4 KB |
+| `dist/chunks/exceptions.js` | exception capture chunk (needs core) | ~8.5 KB |
 | `dist/chunks/dom.js` | shared DOM helpers (needs core) | ~3.9 KB |
 | `dist/chunks/autocapture.js` | autocapture chunk (needs dom) | ~3.5 KB |
 | `dist/chunks/deadclicks.js` | dead clicks chunk (needs dom) | ~4.5 KB |
 | `dist/chunks/heatmaps.js` | heatmaps chunk (needs deadclicks) | ~1.5 KB |
-| `dist/chunks/replay.js` | session replay chunk (needs core) | ~23.3 KB |
-| `dist/chunks/webvitals.js` | web vitals chunk, web-vitals library included (needs core) | ~7.8 KB |
+| `dist/chunks/replay.js` | session replay chunk (needs core) | ~23.6 KB |
+| `dist/chunks/webvitals.js` | web vitals chunk, web-vitals library included (needs core) | ~7.9 KB |
 | `dist/chunks/tracingheaders.js` | tracing headers chunk (needs core) | ~2.7 KB |
 | `dist/chunks/otlp.js` | shared OTLP helpers (needs core) | ~1.9 KB |
-| `dist/chunks/logs.js` | logs and console capture (needs otlp) | ~6.4 KB |
+| `dist/chunks/logs.js` | logs and console capture (needs otlp) | ~6.5 KB |
 | `dist/chunks/metrics.js` | metrics (needs otlp) | ~5.3 KB |
-| `dist/chunks/toolbar.js` | toolbar loader (needs core) | ~1.5 KB |
+| `dist/chunks/toolbar.js` | toolbar loader (needs core) | ~1.4 KB |
+| `dist/lazy/posthog.js` | the lazy build's main script: like `array.js` (see below) | ~82.4 KB |
+| `dist/lazy/replay.js` | replay recorder logic (upstream `lazy-recorder.js` without rrweb) | ~21.2 KB |
+| `dist/lazy/exception-autocapture.js` | error wrapping functions | ~0.9 KB |
+| `dist/lazy/dead-clicks-autocapture.js` | dead click detector | ~3.9 KB |
+| `dist/lazy/web-vitals.js` | Google's web-vitals, every flavour | ~5.9 KB |
+| `dist/lazy/tracing-headers.js` | fetch/XHR tracing patches | ~2.2 KB |
+| `dist/lazy/logs.js` | console log capture | ~1.6 KB |
 
 Session replay also loads upstream's `recorder.js` (rrweb and its console and
 network plugins, ~46.5 KB gzip) from the assets host when recording starts.
 Upstream loads `lazy-recorder.js` instead (~72.5 KB: rrweb plus the replay
 logic that is compiled into our bundle).
 
-Web vitals load nothing at runtime: Google's web-vitals library (6.2.1, the
+In `posthog.full.js` and the chunks, web vitals load nothing at runtime: Google's web-vitals library (6.2.1, the
 release upstream pins) is compiled into the chunk. Upstream loads
 `web-vitals-with-attribution.js` by default (~7.1 KB; `web-vitals.js`, ~4.0 KB,
 without attribution) once web vitals are enabled. Tracing headers likewise
@@ -169,6 +201,8 @@ module out:
    including after `posthog.init()`. A module loaded late attaches to the live
    instance and starts working straight away. The chunks share renamed symbols
    through a single `window.__phc` namespace object.
+3. **Lazily, like upstream.** The lazy build (`lazy/posthog.js`) loads each
+   lazy part only when its feature turns on; see [The lazy build](#the-lazy-build).
 
 ```html
 <script src="chunks/core.js"></script>
@@ -257,6 +291,55 @@ The replay chunk depends only on core: linked flags go through the public
 `onFeatureFlags`, which works whether or not the flags chunk is loaded (without
 it a linked flag never matches, like upstream without flags).
 
+### The lazy build
+
+`dist/lazy/posthog.js` is the like-for-like counterpart of upstream's
+`array.js`. It carries what `array.js` carries eagerly (the core, feature
+flags, web experiments, exception capture, autocapture, heatmaps, metrics, the
+toolbar loader) plus the *shell* of each lazily loaded extension: its config
+and remote config handling and the decision to start. The heavy part is loaded
+where upstream calls `__PosthogExtensions__.loadExternalDependency(posthog,
+kind, cb)`, from a chunk next to `posthog.js`:
+
+| upstream `/static/<kind>.js` | ours `lazy/<chunk>.js` | loaded when |
+|---|---|---|
+| `lazy-recorder` | `replay` + PostHog's `recorder.js` (rrweb), requested together | recording starts (remote config, `startSessionRecording`) |
+| `exception-autocapture` | `exception-autocapture` | exception autocapture turns on |
+| `dead-clicks-autocapture` | `dead-clicks-autocapture` | dead clicks (or heatmaps' detector) start |
+| `web-vitals`, `web-vitals-with-attribution`, `web-vitals-soft-navs`, `web-vitals-with-attribution-soft-navs` | `web-vitals` | web vitals start |
+| `tracing-headers` | `tracing-headers` | `tracing_headers` / `trace_propagation_targets` are set |
+| `logs` | `logs` | console log capture turns on |
+
+One `web-vitals` chunk serves all four flavours: they are the same web-vitals
+release (6.2.1), built with and without attribution. The extension still
+computes upstream's flavour at the same point (`capture_performance`
+attribution and soft-navs options) and checks
+`__PosthogExtensions__.postHogWebVitalsCallbacksByFlavor[flavour]` first; if
+those are missing it loads the chunk, then uses its attributed or plain
+callbacks for that flavour and, for the attribution flavours, starts the
+attribution build's resource observer, as loading that script does upstream.
+The replay chunk is the half of `lazy-recorder.js` we own; rrweb still comes
+from PostHog's `recorder.js`, requested at the same time, and recording starts
+once both have loaded. Its `<script>` element is removed once it has run, so
+the page (which replay records) has one script where upstream has one.
+
+Chunks are injected like upstream's scripts (the core's `loadScript`:
+`disable_external_dependency_loading`, `prepare_external_dependency_script`,
+`external_scripts_inject_target` apply) with `?v=<our version>` for cache
+busting. They are loaded from the directory of the script that loaded
+`posthog.js` (`document.currentScript` while it runs, like webpack's automatic
+`publicPath`), or from `closure_lazy_chunks_url` when set:
+
+```js
+posthog.init('phc_...', { closure_lazy_chunks_url: 'https://cdn.example.com/posthog/lazy/' })
+```
+
+(Upstream has no `closure_*` options, so the name can't collide with one of
+its keys.) PostHog-hosted assets stay PostHog-hosted: the remote config
+(`/array/<token>/config.js`), `toolbar.js` and `recorder.js`. The build is a
+Closure chunk graph rooted at `posthog.js` with its own namespace object,
+`window.__phl`, so it can share a page with the chunk build (`__phc`).
+
 The standard PostHog HTML snippet also works. Calls the snippet queued before
 the SDK loaded are replayed after `init`, with `identify` and `register` going
 first.
@@ -293,6 +376,21 @@ extensions (after persistence, sessions and the feature-flags module exist,
 before the bootstrap identity is applied), or immediately when the chunk is
 loaded after `init`. The instance is published as `posthog[name]`. Pick the
 upstream name (`autocapture`, `heatmaps`, `sessionRecording`, `exceptions`...).
+
+**Lazy parts.** A module that upstream splits into a shell and a
+`/static/<kind>.js` script is split the same way. The lazy part registers
+itself with `provideLazy(kind, part)` (`src/core/lazy.js`) when its code runs;
+the shell calls `loadLazy(posthog, kind, cb)` at the point upstream calls
+`loadExternalDependency` and reads the part with `lazyPart(kind)` (typed
+through a `@record` in the shell, e.g. `DeadClickDetectorApi`). The module's
+`index.js` imports the lazy part before `shell.js`, so in the bundles and
+chunks the part is present from the start and `loadLazy` calls back
+synchronously; only the lazy build installs a chunk loader. Where the
+compiled-in builds mirror upstream's script-load refusal under
+`disable_external_dependency_loading`, they do so only when
+`lazyChunksEnabled()` is false: the lazy build gets the real refusal from
+`loadScript`. List the files in `scripts/build.sh` as `*_SHELL_FILES` and
+`*_LAZY_FILES` and add the chunk to the lazy build's chunk graph.
 
 **Hooks** (`Extension` @record in `src/core/extensions.js`, all optional):
 
@@ -363,12 +461,13 @@ like upstream it is not created while the SDK is in cookieless mode.
 ## Test
 
 ```sh
-npm test                         # Node fake browser: raw sources + every compiled bundle + chunks
-npm run test:chrome              # loads the chunks in real headless Chrome (chromedp/headless-shell)
+npm test                         # Node fake browser: raw sources + every compiled bundle + chunks + the lazy build
+npm run test:chrome              # loads the chunks and the lazy build in real headless Chrome (chromedp/headless-shell)
 node --test test/user-agent.test.mjs
 node --test test/autocapture.test.mjs   # $elements_chain, value scrubbing, RageClick
 node --test test/replay.test.mjs # session replay: status, triggers, sampling, buffering, compression
 ./scripts/build.sh && node test/diff/run.mjs [scenario ...]   # differential test vs official 1.450.0
+DIFF_BUNDLE=lazy/posthog.js node test/diff/run.mjs [scenario ...]   # the same against the lazy build
 node test/sanitizer-chrome.mjs   # html sanitiser vs real DOMPurify 3.4.13 (needs it in /tmp/dp, see the file)
 node --test test/exceptions.test.mjs   # upstream's stack parser / coercer / builder unit tests, ported
 node --test test/web-vitals.test.mjs   # upstream's web vitals tests, ported, + the web-vitals port
@@ -377,7 +476,8 @@ node --test test/logs-metrics.test.mjs # OTLP encoder, log records/pipeline, con
 ```
 
 The differential test serves the official `array.js` and our
-`dist/posthog.full.js` (or `DIFF_BUNDLE=<file>`) from a fake PostHog that also
+`dist/posthog.full.js` (or `DIFF_BUNDLE=<file>`, a path under `dist/`, e.g.
+`DIFF_BUNDLE=lazy/posthog.js` for the lazy build) from a fake PostHog that also
 answers the remote config (`config.js` and JSON). It compares every request
 (method, path, query, content type, event names) and every event/body after
 normalising ids and timestamps (dead click timestamps and delays are timing
@@ -386,6 +486,26 @@ CDP: the page calls `h.click(selector)`, `h.move(x, y)`, `h.type(text)` or
 `h.cdp('Input.…', params)`, which `test/diff/chrome.mjs` runs as trusted
 `Input.*` events via a `__cdpInput` binding. `ALLOWED` in `test/diff/fixtures.mjs` lists the
 accepted differences: only `$lib_version`.
+
+Run against the lazy build, the runner also checks that our chunk requests
+(`/sdk/ours/lazy/<chunk>.js`, and PostHog's `recorder.js`) happen in the same
+order and in the same scenarios as the official SDK's `/static/<kind>.js`
+requests, with the kind map from [The lazy build](#the-lazy-build)
+(`lazy-recorder` is our `replay` chunk plus `recorder.js`, requested together;
+every web-vitals flavour is our `web-vitals` chunk). Kinds we don't port
+(`surveys`, product tours, conversations) are left out, and `toolbar.js` is
+compared as a request anyway.
+
+Normalisations that depend on the build:
+
+- Compiled-in builds only (`posthog.full.js`): `$dead_click_last_mutation_timestamp`
+  / `$dead_swipe_last_mutation_timestamp` are ignored. Their detector starts
+  synchronously at init and sees the SDK's own `config.js` `<script>` being
+  inserted, which upstream's detector, started once its script has loaded,
+  does not. The lazy build starts it where upstream does and is compared as is.
+- Lazy build only: in replay's network capture, the initial resource entry of
+  our `replay` chunk is dropped (upstream has one `lazy-recorder.js` entry for
+  it and rrweb; both SDKs have the `recorder.js` / `lazy-recorder.js` entry).
 
 Exception scenarios (`exc_*`) compare `$exception_list` frames as reported by
 Chrome for the shared test page, so filenames, lines and columns are real. Only
@@ -397,8 +517,9 @@ scenarios throw on purpose say `diff-expected` and are not reported as page
 errors.
 Session replay scenarios (`replay_*`) serve a remote config with
 `sessionRecording` and compare the `$snapshot` payloads too: the official SDK
-loads `/static/lazy-recorder.js`, ours `/static/recorder.js`, both from the
-vendored official dist (`/static/` requests are not compared). The normaliser
+loads `/static/lazy-recorder.js`, ours `/static/recorder.js` (plus, in the lazy
+build, its `replay` chunk), both from the vendored official dist (`/static/`
+requests are not compared). The normaliser
 decodes the per-event `cv: '2024-10'` gzip fields and compares the recorded
 DOM, mutations, custom events (including `$posthog_config`) and network entries
 with node ids as-is. rrweb timestamps, browser-measured network timings and
@@ -406,7 +527,9 @@ transfer sizes are volatile; the SDK and recorder `<script>` URLs in the
 recorded DOM are normalised; `$snapshot_bytes` is checked against the payload
 (it must equal upstream's size estimate) because sizes include those URLs.
 The replay scenarios set `disable_surveys` because upstream injects
-`surveys.js` (not ported) into the recorded DOM otherwise.
+`surveys.js` (not ported) into the recorded DOM otherwise; `dead_clicks` sets
+it because that insertion is a DOM mutation upstream's dead click detector
+sees.
 
 Web vitals scenarios (`wv_*`) use real LCP, CLS, FCP and INP from the test
 page and CDP input. Metric values, deltas, attribution timings and the
@@ -556,19 +679,29 @@ conversations, site apps, WebMCP.
 - Sync gzip (beacons, `send_instantly`, no CompressionStream) uses a compact
   LZ77 + fixed-Huffman encoder instead of fflate: same decoded payload,
   somewhat larger bodies.
-- Dead clicks: upstream lazy-loads the detector from `/static/`; here it is
-  compiled in, so it starts synchronously instead of after the script load.
-  As upstream, it never starts while `disable_external_dependency_loading` is
-  set (until the detector has "loaded" once).
+- Compiled in vs lazy-loaded. The items below marked *(compiled-in builds)*
+  apply to `posthog.full.js` and the per-module chunks, where the lazy parts
+  are compiled in. The lazy build (`lazy/posthog.js`) loads them where and
+  when upstream loads its `/static/` scripts, so they don't apply to it; there
+  a script-load refusal (`disable_external_dependency_loading`) is the real
+  one from `loadScript`, and only the replay chunk is an extra request (see
+  [The lazy build](#the-lazy-build)).
+- Dead clicks *(compiled-in builds)*: upstream lazy-loads the detector from
+  `/static/`; here it is compiled in, so it starts synchronously instead of
+  after the script load. As upstream, it never starts while
+  `disable_external_dependency_loading` is set (until the detector has
+  "loaded" once).
 - Hook names of extensions are renamed by Closure, so extensions must be
   compiled with the core (as bundles or chunks).
-- Exception autocapture's wrapping functions are compiled into the module
-  instead of being lazy-loaded from `/static/exception-autocapture.js`, so
-  `window.onerror` & co. are wrapped synchronously when autocapture turns on
-  (upstream wraps them once that script has loaded). The legacy globals that
-  script defines for old SDK versions (`posthogErrorWrappingFunctions`,
+- Exception autocapture *(compiled-in builds)*: the wrapping functions are
+  compiled into the module instead of being lazy-loaded from
+  `/static/exception-autocapture.js`, so `window.onerror` & co. are wrapped
+  synchronously when autocapture turns on (upstream wraps them once that
+  script has loaded), and `disable_external_dependency_loading` does not stop
+  them. In every build, the legacy globals that script defines for old SDK
+  versions (`posthogErrorWrappingFunctions`,
   `extendPostHogWithExceptionAutocapture`) are not provided.
-- Web vitals: upstream lazy-loads `/static/web-vitals*.js` when web vitals
+- Web vitals *(compiled-in builds)*: upstream lazy-loads `/static/web-vitals*.js` when web vitals
   start (at init with the client config, else when the remote config enables
   them) and registers the observers once it has loaded; here Google's library
   is compiled in and the observers are registered synchronously. They use
@@ -580,10 +713,11 @@ conversations, site apps, WebMCP.
   `__PosthogExtensions__.postHogWebVitalsCallbacksByFlavor` (or the legacy
   `postHogWebVitalsCallbacks`) are used first. Our module does not publish its
   callbacks there, and it does not install upstream's `Array.prototype.at` /
-  `findLast` polyfills (the port does not need them). Upstream builds each
-  flavour as a separate script with its own module state; here the flavours
-  share one copy (only one is used per page).
-- Tracing headers: the fetch/XHR patches are compiled in instead of being
+  `findLast` polyfills (the port does not need them). In every build,
+  upstream builds each flavour as a separate script with its own module state;
+  here the flavours share one copy (only one is used per page), and the lazy
+  build loads that copy as one `web-vitals` chunk whatever the flavour.
+- Tracing headers *(compiled-in builds)*: the fetch/XHR patches are compiled in instead of being
   lazy-loaded from `/static/tracing-headers.js`, so they are installed
   synchronously during init (upstream patches once that script has loaded;
   requests made in between carry no headers there). As upstream, nothing is
@@ -595,7 +729,7 @@ conversations, site apps, WebMCP.
   the native CompressionStream is missing or fails, and when compressions are
   drained on unload, events are compressed with the core's encoder instead of
   fflate (same decoded data, different `$snapshot_bytes`).
-- Console log capture is compiled into the `logs` module instead of being
+- Console log capture *(compiled-in builds)* is compiled into the `logs` module instead of being
   lazy-loaded from `/static/logs.js`, so it takes over the recorder's buffer
   synchronously when capture is enabled (upstream does it once that script has
   loaded; the same records are sent). Like the script load upstream, it is

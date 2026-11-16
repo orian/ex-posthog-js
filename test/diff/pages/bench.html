@@ -6,7 +6,7 @@
   <button id="b">Button</button>
   <div style="height: 2000px"></div>
   <script>
-    // Measures SDK cost on the main thread. ?sdk=official|ours&bundle=...&replay=0|1
+    // Measures SDK cost on the main thread. ?sdk=official|ours&bundle=...&all=1
     (function () {
       var q = new URLSearchParams(location.search)
       var r = (window.__bench = { longTasks: 0, longTaskMs: 0 })
@@ -21,10 +21,19 @@
       s.onload = function () {
         r.loadEvalMs = performance.now() - t0
         var t1 = performance.now()
-        posthog.init('phc_diff', {
+        var config = {
           api_host: 'http://ph.example.test:' + location.port,
           request_queue_config: { flush_interval_ms: 3000 },
-        })
+        }
+        // ?all=1: every lazily loaded part on (replay comes from the remote config).
+        if (q.get('all')) {
+          config.capture_exceptions = true
+          config.capture_dead_clicks = true
+          config.capture_performance = { web_vitals: true }
+          config.tracing_headers = ['api.example.test']
+          config.logs = { captureConsoleLogs: true }
+        }
+        posthog.init('phc_diff', config)
         r.initMs = performance.now() - t1
         var t2 = performance.now()
         for (var i = 0; i < 1000; i++) posthog.capture('bench_event', { i: i, plan: 'pro', nested: { a: [1, 2, 3] } })
