@@ -28,6 +28,14 @@ const MAX_SAFE_INTEGER = 9007199254740991;
 const propertyIsEnumerable = Object.prototype.propertyIsEnumerable;
 
 /**
+ * The BigInt constructor where the runtime has one (ES2020).
+ * @return {?function(*): ?}
+ */
+function bigIntCtor() {
+  return typeof BigInt === 'function' ? /** @type {function(*): ?} */ (BigInt) : null;
+}
+
+/**
  * Minimal debug logger the encoder reports to (upstream passes the module logger).
  * @typedef {?{info: function(...*)}}
  */
@@ -144,7 +152,7 @@ function debug(logger, message) {
  */
 function encodeBigInt(value, logger) {
   const decimal = value.toString();
-  const limit = win['BigInt'](INT64_RANGE_LIMIT_DECIMAL);
+  const limit = /** @type {function(*): ?} */ (bigIntCtor())(INT64_RANGE_LIMIT_DECIMAL);
   if (value >= limit || value < -limit) {
     debug(logger, 'Attribute ' + decimal + ' is outside the int64 range; encoding it as a string');
     return {'stringValue': decimal};
@@ -169,8 +177,8 @@ function encodeAnyValue(value, logger, state, depth) {
     if (!isFinite(value)) return {'stringValue': String(value)};
     if (Math.floor(value) === value) {
       if (Math.abs(value) <= MAX_SAFE_INTEGER) return {'intValue': String(value)};
-      const BigIntCtor = win ? win['BigInt'] : undefined;
-      if (typeof BigIntCtor !== 'function') return {'stringValue': String(value)};
+      const BigIntCtor = bigIntCtor();
+      if (!BigIntCtor) return {'stringValue': String(value)};
       const decimal = BigIntCtor(value).toString();
       if (value >= INT64_RANGE_LIMIT || value < -INT64_RANGE_LIMIT) {
         debug(logger, 'Attribute ' + decimal + ' is outside the int64 range; encoding it as a string');

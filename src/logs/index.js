@@ -15,7 +15,6 @@ p['flush'] = p.flush;
 p['reset'] = p.onReset;
 p['loadIfEnabled'] = p.loadIfEnabled;
 p['dispose'] = p.dispose;
-p['_onOptOut'] = p.onOptOut;
 p['name'] = 'logs';
 Object.defineProperty(p, 'logger', {get: /** @this {!PostHogLogs} */ function() {
   return this.getLogger();

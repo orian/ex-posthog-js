@@ -40,7 +40,11 @@ try {
     const ok = res.errors.length === 0 && res.flag === 'test' && res.hero === 'New' && !res.xss && res.distinct && res.exception &&
         res.modules.every(Boolean) &&
         res.paths.some((p) => p.endsWith('/e/')) && res.paths.some((p) => p.endsWith('/flags/')) &&
-        res.replay === 'disabled' && res.replayStarted === false
+        res.replay === 'disabled' && res.replayStarted === false &&
+        // opt-in chunks: logs, metrics, toolbar
+        res.optIn.modules.every(Boolean) && res.optIn.toolbarParamsless === false &&
+        res.optIn.loggerKeys === 'debug,error,fatal,info,trace,warn' &&
+        res.paths.some((p) => p.endsWith('/i/v1/logs')) && res.paths.some((p) => p.endsWith('/i/v1/metrics'))
     console.log(ok ? 'SMOKE OK' : 'SMOKE FAILED')
     process.exitCode = ok ? 0 : 1
 } finally {

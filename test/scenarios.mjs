@@ -618,6 +618,69 @@ Object.assign(scenarios, {
     },
 })
 
+// ---- Logs, metrics and the toolbar loader -----------------------------------------
+const otlpRequests = (b, path) => b.requests.filter((r) => r.path === path)
+
+Object.assign(scenarios, {
+    'logs, metrics: captureLog, logger and metrics reach their OTLP endpoints': {
+        builds: ['full'],
+        async run(load) {
+            const { b, ph } = await load()
+            ph.init(TOKEN, { ...FAST, capture_pageview: false, logs: { serviceName: 'svc' } })
+            ph.captureLog({ body: 'hello', level: 'warn', attributes: { a: 1 } })
+            ph.logger.error('oops')
+            await ph.logs.flush()
+            ph.metrics.count('n', 2)
+            await ph.metrics.flush()
+            const [logs] = otlpRequests(b, '/i/v1/logs')
+            const records = logs.body.resourceLogs[0].scopeLogs[0].logRecords
+            assert.deepEqual(records.map((r) => [r.severityText, r.body.stringValue]), [['WARN', 'hello'], ['ERROR', 'oops']])
+            assert.deepEqual(logs.body.resourceLogs[0].resource.attributes.find((a) => a.key === 'service.name').value, { stringValue: 'svc' })
+            assert.equal(logs.body.resourceLogs[0].scopeLogs[0].scope.name, 'web')
+            const [metrics] = otlpRequests(b, '/i/v1/metrics')
+            assert.equal(metrics.body.resourceMetrics[0].scopeMetrics[0].metrics[0].sum.dataPoints[0].asDouble, 2)
+        },
+    },
+
+    'logs, metrics, toolbar: without the modules the core methods are no-ops': {
+        builds: ['core'],
+        async run(load) {
+            const { b, ph } = await load()
+            ph.init(TOKEN, { ...FAST, capture_pageview: false })
+            ph.captureLog({ body: 'dropped' })
+            ph.logger.info('dropped')
+            assert.equal(ph.loadToolbar({}), false)
+            assert.equal(ph.logs, undefined)
+            assert.equal(ph.metrics, undefined)
+            await sleep(FLUSH)
+            assert.equal(otlpRequests(b, '/i/v1/logs').length, 0)
+        },
+    },
+
+    'chunks: otlp, logs, metrics and toolbar can be loaded after init': {
+        builds: ['chunks'],
+        async run() {
+            const b = createBrowser({ respond: defaultRouter })
+            b.loadScript('dist/chunks/core.js')
+            const ph = b.window.posthog
+            ph.init(TOKEN, { ...FAST, capture_pageview: false })
+            await sleep(100)
+            assert.equal(ph.logs, undefined)
+            b.loadScript('dist/chunks/otlp.js')
+            b.loadScript('dist/chunks/logs.js')
+            b.loadScript('dist/chunks/metrics.js')
+            b.loadScript('dist/chunks/toolbar.js')
+            ph.captureLog({ body: 'late' })
+            await ph.logs.flush()
+            ph.metrics.gauge('g', 3)
+            await ph.metrics.flush()
+            assert.equal(otlpRequests(b, '/i/v1/logs')[0].body.resourceLogs[0].scopeLogs[0].logRecords[0].body.stringValue, 'late')
+            assert.equal(otlpRequests(b, '/i/v1/metrics')[0].body.resourceMetrics[0].scopeMetrics[0].metrics[0].gauge.dataPoints[0].asDouble, 3)
+            assert.equal(typeof ph.toolbar.maybeLoadToolbar, 'function')
+        },
+    },
+})
+
 /** Build name -> how to load it. */
 export const BUILDS = {
     core: { file: 'dist/posthog.core.js', source: 'src/entry/core.js' },

@@ -37,6 +37,23 @@
 <script src="../dist/chunks/deadclicks.js"></script>
 <script src="../dist/chunks/heatmaps.js"></script>
 <script src="../dist/chunks/replay.js"></script>
+<!-- opt-in modules: otlp.js first; logs.js and metrics.js need it, toolbar.js needs only core -->
+<script src="../dist/chunks/otlp.js"></script>
+<script src="../dist/chunks/logs.js"></script>
+<script src="../dist/chunks/metrics.js"></script>
+<script src="../dist/chunks/toolbar.js"></script>
+<script>
+  posthog.captureLog({body: 'smoke log', attributes: {n: 1}});
+  posthog.logger.warn('smoke logger');
+  posthog.logs.flush();
+  posthog.metrics.count('smoke_count');
+  posthog.metrics.flush();
+  window.__optIn = {
+    modules: [!!posthog.logs, !!posthog.metrics, !!posthog.toolbar],
+    toolbarParamsless: posthog.toolbar.maybeLoadToolbar(),
+    loggerKeys: Object.keys(posthog.logger).sort().join(',')
+  };
+</script>
 <script>
   setTimeout(function () {
     document.getElementById('out').textContent = JSON.stringify({
@@ -49,6 +66,7 @@
       modules: [!!posthog.autocapture, !!posthog.heatmaps, !!posthog.deadClicksAutocapture],
       replay: posthog.sessionRecording ? posthog.sessionRecording.status : null,
       replayStarted: posthog.sessionRecordingStarted(),
+      optIn: window.__optIn,
       paths: sent.map(function (r) { return r.url.replace(/\?.*/, ''); }).sort()
     });
   }, 1200);
