@@ -6,17 +6,19 @@
  * `__add_tracing_headers`, whose `true` means every host) and a W3C
  * `traceparent` to `trace_propagation_targets`. Re-checked on set_config.
  *
- * Difference from upstream: the patch functions are compiled in (see
- * patch-fns.js) instead of being lazy-loaded from
- * `/static/tracing-headers.js`, so fetch and XHR are patched synchronously
- * during init. Like the script load, patching is refused while
- * `disable_external_dependency_loading` is set (until it has "loaded" once).
+ * The patch functions (patch-fns.js) are the lazy part `tracing-headers`
+ * (upstream `/static/tracing-headers.js`). The lazy build loads them as their
+ * own chunk at upstream's trigger point. Elsewhere they are compiled in, so
+ * fetch and XHR are patched synchronously during init; like the script load,
+ * patching is then refused while `disable_external_dependency_loading` is set
+ * (until it has "loaded" once).
  */
 import {PostHog} from '../core/posthog.js';
 import {Extension} from '../core/extensions.js';
 import {logger as baseLogger} from '../core/logger.js';
+import {lazyChunksEnabled, lazyPart, loadLazy} from '../core/lazy.js';
 import {isArray, isString, isUndefined} from '../core/utils.js';
-import {TraceparentTargets, TracingHeadersHostnames, patchFetch, patchXHR} from './patch-fns.js';
+import {TRACING_HEADERS_KIND, TraceparentTargets, TracingHeadersHostnames, TracingHeadersPatchFns} from './types.js';
 
 const logger = baseLogger.createLogger('[TracingHeaders]');
 
@@ -62,6 +64,16 @@ export class TracingHeaders {
    * @private
    */
   loadScript_(cb) {
+    if (lazyChunksEnabled()) {
+      loadLazy(this.instance, TRACING_HEADERS_KIND, function(err) {
+        if (err) {
+          logger.error('failed to load script', err);
+          return;
+        }
+        cb();
+      });
+      return;
+    }
     if (!this.loaded_ && this.instance.config['disable_external_dependency_loading']) {
       logger.error('failed to load script', 'Loading of external scripts is disabled');
       return;
@@ -174,16 +186,18 @@ export class TracingHeaders {
       this.patchedHostnames_ = this.hostnamesForPatch_;
     }
 
+    const fns = /** @type {!TracingHeadersPatchFns|undefined} */ (lazyPart(TRACING_HEADERS_KIND));
+    if (!fns) return;
     const instance = this.instance;
     const distinctId = function() {
       return /** @type {string|undefined} */ (instance.get_distinct_id());
     };
     if (isUndefined(this.restoreXHRPatch_)) {
-      this.restoreXHRPatch_ = patchXHR(this.hostnamesForPatch_, distinctId, instance.sessionManager,
+      this.restoreXHRPatch_ = fns.patchXHR(this.hostnamesForPatch_, distinctId, instance.sessionManager,
           this.traceparentTargetsForPatch_);
     }
     if (isUndefined(this.restoreFetchPatch_)) {
-      this.restoreFetchPatch_ = patchFetch(this.hostnamesForPatch_, distinctId, instance.sessionManager,
+      this.restoreFetchPatch_ = fns.patchFetch(this.hostnamesForPatch_, distinctId, instance.sessionManager,
           this.traceparentTargetsForPatch_);
     }
   }

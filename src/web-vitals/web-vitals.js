@@ -8,13 +8,15 @@
  * remote `capturePerformance.web_vitals`, persisted as
  * `$web_vitals_enabled_server_side` (with `$web_vitals_allowed_metrics`).
  *
- * Difference from upstream: upstream lazy-loads PostHog's
- * `/static/web-vitals*.js`, which bundles Google's web-vitals 6.2.1. Here the
- * same web-vitals release is compiled in (third_party/web-vitals), so the
- * observers are registered synchronously when the module starts, instead of
- * once that script has loaded. Callbacks already present on
- * `window.__PosthogExtensions__` (e.g. a page that loaded PostHog's script
- * itself) are used first, as upstream does.
+ * Upstream lazy-loads PostHog's `/static/<flavor>.js` (web-vitals,
+ * web-vitals-with-attribution and their -soft-navs variants), which bundle
+ * Google's web-vitals 6.2.1. Here the same release (third_party/web-vitals) is
+ * the lazy part `web-vitals` (lazy.js), one part for every flavour: the
+ * flavour only picks which callbacks of it are used. The lazy build loads it
+ * as its own chunk where upstream loads the flavour's script; elsewhere it is
+ * compiled in, so the observers are registered synchronously when the module
+ * starts. Callbacks already present on `window.__PosthogExtensions__` (e.g. a
+ * page that loaded PostHog's script itself) are used first, as upstream does.
  */
 import {PostHog} from '../core/posthog.js';
 import {Extension} from '../core/extensions.js';
@@ -24,11 +26,7 @@ import {
   addEventListener, assign, isArray, isBoolean, isNullish, isNumber, isObject, isUndefined, maskQueryParams,
   stripUrlHash, win,
 } from '../core/utils.js';
-import {onCLS, onFCP, onINP, onLCP} from '../../third_party/web-vitals/metrics.js';
-import {
-  onCLS as onCLSWithAttribution, onFCP as onFCPWithAttribution, onINP as onINPWithAttribution,
-  onLCP as onLCPWithAttribution, startResourceBuffer,
-} from '../../third_party/web-vitals/attribution.js';
+import {lazyChunksEnabled, lazyPart, loadLazy} from '../core/lazy.js';
 
 const logger = baseLogger.createLogger('[Web Vitals]');
 
@@ -73,22 +71,51 @@ let MetricCallback;
  */
 let WebVitalsCallbacks;
 
-/** @const {!WebVitalsCallbacks} */
-const CALLBACKS = {'onLCP': onLCP, 'onCLS': onCLS, 'onFCP': onFCP, 'onINP': onINP};
-/** @const {!WebVitalsCallbacks} */
-const CALLBACKS_WITH_ATTRIBUTION = {
-  'onLCP': onLCPWithAttribution, 'onCLS': onCLSWithAttribution, 'onFCP': onFCPWithAttribution,
-  'onINP': onINPWithAttribution, 'withoutAttribution': CALLBACKS,
-};
+/** @const {string} the lazy part (upstream kinds: the four web-vitals flavours) */
+export const WEB_VITALS_KIND = 'web-vitals';
+
+/**
+ * The lazy part: the callbacks of upstream's `web-vitals` and
+ * `web-vitals-with-attribution` scripts (the soft-navs scripts are the same
+ * web-vitals release), and the attribution build's resource observer, which
+ * upstream starts when that script loads.
+ * @record
+ */
+export class WebVitalsPart {
+  constructor() {
+    /** @type {!WebVitalsCallbacks} */
+    this.callbacks;
+    /** @type {!WebVitalsCallbacks} */
+    this.callbacksWithAttribution;
+    /** @type {function()} */
+    this.startResourceBuffer;
+  }
+}
+
+/**
+ * @param {string} flavor
+ * @return {boolean} whether the flavour is an attribution build
+ */
+function isAttributionFlavor(flavor) {
+  return flavor.indexOf('with-attribution') !== -1;
+}
 
 /**
  * The built-in callbacks for a flavor (what upstream's /static/<flavor>.js
- * defines). The soft-navigation builds are the same web-vitals release.
+ * defines), once the lazy part is present.
  * @param {string} flavor
- * @return {!WebVitalsCallbacks}
+ * @return {!WebVitalsCallbacks|undefined}
  */
 function builtInCallbacks(flavor) {
-  return flavor.indexOf('with-attribution') !== -1 ? CALLBACKS_WITH_ATTRIBUTION : CALLBACKS;
+  const part = /** @type {!WebVitalsPart|undefined} */ (lazyPart(WEB_VITALS_KIND));
+  if (!part) return undefined;
+  return isAttributionFlavor(flavor) ? part.callbacksWithAttribution : part.callbacks;
+}
+
+/** The attribution build's module-level resource observer starts when it loads. */
+function startResourceBuffer() {
+  const part = /** @type {!WebVitalsPart|undefined} */ (lazyPart(WEB_VITALS_KIND));
+  if (part) part.startResourceBuffer();
 }
 
 /** @return {?Object} `window.__PosthogExtensions__` */
@@ -262,8 +289,9 @@ export class WebVitalsAutocapture {
 
   /**
    * Upstream `_loadScript`: uses callbacks already on
-   * `__PosthogExtensions__`, else loads `/static/<flavor>.js`. The script is
-   * compiled in here; like the script load, it is refused while
+   * `__PosthogExtensions__`, else loads `/static/<flavor>.js`. The lazy build
+   * loads the `web-vitals` chunk instead (for every flavour). Elsewhere the
+   * part is compiled in; like the script load, it is refused while
    * `disable_external_dependency_loading` is set.
    * @param {function()} cb
    * @private
@@ -274,12 +302,23 @@ export class WebVitalsAutocapture {
       cb();
       return;
     }
+    if (lazyChunksEnabled()) {
+      loadLazy(this.instance, WEB_VITALS_KIND, function(err) {
+        if (err) {
+          logger.error('failed to load script', err);
+          return;
+        }
+        if (isAttributionFlavor(flavor)) startResourceBuffer();
+        cb();
+      });
+      return;
+    }
     if (this.instance.config['disable_external_dependency_loading']) {
       logger.error('failed to load script', 'Loading of external scripts is disabled');
       return;
     }
     // The attribution build's module-level resource observer starts when it loads.
-    if (builtInCallbacks(flavor) === CALLBACKS_WITH_ATTRIBUTION) startResourceBuffer();
+    if (isAttributionFlavor(flavor)) startResourceBuffer();
     cb();
   }
 
@@ -408,6 +447,10 @@ export class WebVitalsAutocapture {
 
     const flavor = this.callbackFlavor();
     const callbacks = externalCallbacks(flavor) || builtInCallbacks(flavor);
+    if (!callbacks) {
+      logger.error('web vitals callbacks not loaded - not starting');
+      return;
+    }
     const withoutAttribution = callbacks['withoutAttribution'];
     const attributionMetrics = this.getAttributionMetrics();
     // only the attribution bundle exposes unattributed observers alongside the attributed ones

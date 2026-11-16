@@ -20,6 +20,8 @@ const NATIVE = { open: FakeXHR.prototype.open, setRequestHeader: FakeXHR.prototy
 
 const { patchFetch, patchXHR } = await import('../src/tracing-headers/patch-fns.js')
 const { patch } = await import('../src/tracing-headers/patch.js')
+// lazy.js registers the patch functions the extension uses (its lazy part).
+await import('../src/tracing-headers/lazy.js')
 const { TracingHeaders } = await import('../src/tracing-headers/tracing-headers.js')
 
 const COOKIELESS_SENTINEL_VALUE = '$posthog_cookieless'
