@@ -6,25 +6,49 @@
  * compression ratio is lower than fflate's dynamic-Huffman output.
  */
 
-/** @type {?Array<number>} */
+/**
+ * CRC-32 lookup tables for slicing-by-8: table k (at k * 256) advances a byte
+ * through k further zero bytes. Int32 entries keep the arithmetic in small
+ * integers (a plain array of uint32 values holds doubles).
+ * @type {?Int32Array}
+ */
 let crcTable = null;
 
 /**
+ * CRC-32 (IEEE, as in gzip), 8 bytes per step. Same value as the bytewise
+ * table loop it replaces (test/gzip-crc.test.mjs checks it against zlib).
  * @param {!Uint8Array} bytes
  * @return {number}
  */
 export function crc32(bytes) {
-  if (!crcTable) {
-    crcTable = [];
+  let t = crcTable;
+  if (!t) {
+    t = crcTable = new Int32Array(256 * 8);
     for (let i = 0; i < 256; i++) {
       let c = i;
       for (let j = 0; j < 8; j++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-      crcTable[i] = c >>> 0;
+      t[i] = c;
+    }
+    for (let i = 0; i < 256; i++) {
+      let c = t[i];
+      for (let k = 1; k < 8; k++) {
+        c = t[c & 0xff] ^ (c >>> 8);
+        t[k * 256 + i] = c;
+      }
     }
   }
-  let crc = 0xffffffff;
-  for (let i = 0; i < bytes.length; i++) crc = crcTable[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
-  return (crc ^ 0xffffffff) >>> 0;
+  const b = bytes;
+  const n = b.length;
+  const end = n - (n & 7);
+  let crc = -1;
+  let i = 0;
+  for (; i < end; i += 8) {
+    const lo = crc ^ (b[i] | (b[i + 1] << 8) | (b[i + 2] << 16) | (b[i + 3] << 24));
+    crc = t[1792 + (lo & 0xff)] ^ t[1536 + ((lo >>> 8) & 0xff)] ^ t[1280 + ((lo >>> 16) & 0xff)] ^
+        t[1024 + (lo >>> 24)] ^ t[768 + b[i + 4]] ^ t[512 + b[i + 5]] ^ t[256 + b[i + 6]] ^ t[b[i + 7]];
+  }
+  for (; i < n; i++) crc = t[(crc ^ b[i]) & 0xff] ^ (crc >>> 8);
+  return (crc ^ -1) >>> 0;
 }
 
 /**
