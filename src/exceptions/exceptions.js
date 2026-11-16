@@ -161,10 +161,13 @@ export class PostHogExceptions {
     this.suppressionRules_ = [];
     /** @private @const {!ErrorPropertiesBuilder} */
     this.builder_ = buildErrorPropertiesBuilder();
+    const stepsConfig = this.getExceptionStepsConfig_();
     /** @private {!ResolvedExceptionStepsConfig} */
-    this.stepsConfig_ = resolveExceptionStepsConfig(this.getExceptionStepsConfig_());
+    this.stepsConfig_ = resolveExceptionStepsConfig(stepsConfig);
+    // The buffer resolves the raw (quoted-key) config itself: the resolved
+    // config's keys are renamed by Closure.
     /** @private @const {!ExceptionStepsBuffer} */
-    this.stepsBuffer_ = new ExceptionStepsBuffer(this.stepsConfig_);
+    this.stepsBuffer_ = new ExceptionStepsBuffer(stepsConfig);
   }
 
   /** @return {*} @private */
@@ -176,8 +179,9 @@ export class PostHogExceptions {
 
   /** @param {!Object} config */
   onConfigChange(config) {
-    this.stepsConfig_ = resolveExceptionStepsConfig(this.getExceptionStepsConfig_());
-    this.stepsBuffer_.setConfig(this.stepsConfig_);
+    const stepsConfig = this.getExceptionStepsConfig_();
+    this.stepsConfig_ = resolveExceptionStepsConfig(stepsConfig);
+    this.stepsBuffer_.setConfig(stepsConfig);
   }
 
   /** @param {?Object} response */
