@@ -34,9 +34,10 @@ export class Store {
    * @param {number=} days
    * @param {boolean=} crossSubdomain
    * @param {boolean=} secure
+   * @param {string=} serialized JSON.stringify(value), when the caller has it already
    * @return {boolean}
    */
-  set(name, value, days, crossSubdomain, secure) {}
+  set(name, value, days, crossSubdomain, secure, serialized) {}
   /**
    * @param {string} name
    * @param {boolean=} crossSubdomain
@@ -121,7 +122,7 @@ class CookieStore {
     return cookie;
   }
   /** @override */
-  set(name, value, days, crossSubdomain, secure) {
+  set(name, value, days, crossSubdomain, secure, serialized) {
     if (!doc) return false;
     try {
       let expires = '';
@@ -133,8 +134,8 @@ class CookieStore {
         expires = '; expires=' + date.toUTCString();
       }
       if (secure) sec = '; secure';
-      const cookie = name + '=' + encodeURIComponent(JSON.stringify(value)) + expires + '; SameSite=Lax; path=/' +
-          cdomain + sec;
+      const json = serialized === undefined ? JSON.stringify(value) : serialized;
+      const cookie = name + '=' + encodeURIComponent(json) + expires + '; SameSite=Lax; path=/' + cdomain + sec;
       if (cookie.length > 4096 * 0.9) logger.warn('cookieStore warning: large cookie, len=' + cookie.length);
       doc.cookie = cookie;
       return true;
@@ -207,10 +208,10 @@ class WebStore {
     return null;
   }
   /** @override */
-  set(name, value) {
+  set(name, value, days, crossSubdomain, secure, serialized) {
     try {
       if (win) {
-        const s = JSON.stringify(value);
+        const s = serialized === undefined ? JSON.stringify(value) : serialized;
         const storage = this.storage_();
         // setItem with the value already stored is a no-op by spec (no storage
         // event, no quota check) but not cheap; register_for_session rewrites
@@ -330,8 +331,8 @@ class LocalPlusCookieStore {
     return null;
   }
   /** @override */
-  set(name, value, days, crossSubdomain, secure) {
-    const stored = localStore.set(name, value);
+  set(name, value, days, crossSubdomain, secure, serialized) {
+    const stored = localStore.set(name, value, undefined, undefined, undefined, serialized);
     try {
       const cookieProps = getCookiePersistedProperties(/** @type {!Object} */ (value), this.custom_);
       if (keys(cookieProps).length) cookieStore.set(name, cookieProps, days, crossSubdomain, secure);

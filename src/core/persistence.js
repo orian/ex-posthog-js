@@ -198,13 +198,16 @@ export class Persistence {
   writeNow_() {
     if (this.disabled) return;
     let fingerprint;
+    let serialized;
     try {
-      fingerprint = JSON.stringify(this.props) + '|' + this.expireDays_ + '|' + this.crossSubdomain_ + '|' + this.secure_;
+      serialized = JSON.stringify(this.props);
+      fingerprint = serialized + '|' + this.expireDays_ + '|' + this.crossSubdomain_ + '|' + this.secure_;
       if (fingerprint === this.fingerprint_) return;
     } catch (e) {
-      fingerprint = undefined;
+      fingerprint = serialized = undefined;
     }
-    if (this.storage_.set(this.name, this.props, this.expireDays_, this.crossSubdomain_, this.secure_)) {
+    // The store writes `serialized` (the same JSON.stringify(this.props)) instead of stringifying again.
+    if (this.storage_.set(this.name, this.props, this.expireDays_, this.crossSubdomain_, this.secure_, serialized)) {
       this.fingerprint_ = fingerprint;
     }
   }
