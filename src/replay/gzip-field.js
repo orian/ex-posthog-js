@@ -55,29 +55,33 @@ function validationError(reason) {
 }
 
 /**
+ * Upstream validateNativeGzip(compressed, inputBytes), on the compressed bytes
+ * read back once. Upstream reads the 10-byte header and the 8-byte trailer as
+ * two blob slices, then (in gzipToStringAsync) the whole blob a third time;
+ * one read of the whole blob gives the same bytes, so the same checks run in
+ * the same order and fail with the same errors.
  * @param {?} compressed Blob
  * @param {!Uint8Array} inputBytes
- * @return {!Promise<void>}
+ * @return {!Promise<!Uint8Array>} the compressed bytes
  */
-function validateNativeGzip(compressed, inputBytes) {
+function readValidatedNativeGzip(compressed, inputBytes) {
   if (compressed['size'] < 18) return Promise.reject(validationError('too-short'));
-  return compressed['slice'](0, 10)['arrayBuffer']().then(function(headerBuf) {
-    const header = new Uint8Array(headerBuf);
-    if (!(header.length >= 2 && header[0] === 0x1f && header[1] === 0x8b) || header[2] !== 0x08) {
-      throw validationError('invalid-header');
-    }
-    return compressed['slice'](compressed['size'] - 8)['arrayBuffer']();
-  }).then(function(trailerBuf) {
-    const trailer = new DataView(trailerBuf);
+  return compressed['arrayBuffer']().then(function(buf) {
+    const bytes = new Uint8Array(/** @type {!ArrayBuffer} */ (buf));
+    // The header is bytes 0-9; size >= 18, so upstream's `length >= 2` check holds.
+    if (!(bytes[0] === 0x1f && bytes[1] === 0x8b) || bytes[2] !== 0x08) throw validationError('invalid-header');
+    const trailer = new DataView(/** @type {!ArrayBuffer} */ (buf), bytes.length - 8, 8);
     if (trailer.getUint32(0, true) !== crc32(inputBytes)) throw validationError('invalid-crc');
     if (trailer.getUint32(4, true) !== (inputBytes.length >>> 0)) throw validationError('invalid-size');
+    return bytes;
   });
 }
 
 /**
- * posthog core gzipCompress(input, isDebug, {rethrow: true}).
+ * posthog core gzipCompress(input, isDebug, {rethrow: true}), resolving with
+ * the validated compressed bytes rather than the Blob they were read from.
  * @param {string} input
- * @return {!Promise<?>} the compressed Blob
+ * @return {!Promise<!Uint8Array>}
  */
 function gzipCompress(input) {
   try {
@@ -101,13 +105,12 @@ function gzipCompress(input) {
         throw err;
       });
     });
+    // Still collected as a Blob like upstream: Safari 16's NotReadableError,
+    // which turns native gzip off, is a blob read error.
     const R = win['Response'];
     const responsePromise = new R(stream['readable'])['blob']();
     return Promise.all([responsePromise, writePromise]).then(function(results) {
-      const compressed = results[0];
-      return validateNativeGzip(compressed, inputBytes).then(function() {
-        return compressed;
-      });
+      return readValidatedNativeGzip(results[0], inputBytes);
     });
   } catch (e) {
     return Promise.reject(e);
@@ -164,11 +167,7 @@ export function gzipToStringAsync(data, replacer) {
   } catch (e) {
     return Promise.reject(e);
   }
-  return gzipCompress(serialized).then(function(compressed) {
-    return compressed['arrayBuffer']();
-  }).then(function(buf) {
-    return latin1FromBytes(new Uint8Array(buf));
-  });
+  return gzipCompress(serialized).then(latin1FromBytes);
 }
 
 /**
