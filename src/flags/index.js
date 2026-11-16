@@ -35,7 +35,7 @@ p['setReloadingPaused'] = p.setReloadingPaused;
 p['setAnonymousDistinctId'] = p.setAnonymousDistinctId;
 p['reset'] = p.reset;
 Object.defineProperty(p, 'hasLoadedFlags', {get: /** @this {!FeatureFlags} */ function() {
-  return this.hasLoadedFlags();
+  return this.checkHasLoadedFlags();
 }});
 
 registerExtension('featureFlags', function(instance) {

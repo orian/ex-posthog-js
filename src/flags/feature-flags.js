@@ -603,7 +603,7 @@ export class FeatureFlags {
   }
 
   /** @override */
-  hasLoadedFlags() {
+  checkHasLoadedFlags() {
     return this.hasLoadedFlags_;
   }
 

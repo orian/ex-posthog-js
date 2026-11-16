@@ -111,7 +111,7 @@ export function attachAllExtensions(instance) {
 export class FeatureFlagsApi {
   constructor() {}
   /** @return {boolean} */
-  hasLoadedFlags() {}
+  checkHasLoadedFlags() {}
   /**
    * @param {string} key
    * @param {?Object=} options

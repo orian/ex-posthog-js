@@ -636,3 +636,17 @@ export function loaderFor(build, mode, scenario) {
         return { b, ph: b.window.posthog }
     }
 }
+
+// ---- regressions -----------------------------------------------------------------
+Object.assign(scenarios, {
+    'featureFlags.hasLoadedFlags getter works (no self-recursion in source mode)': {
+        builds: ['full'],
+        async run(load) {
+            const { ph } = await load()
+            ph.init(TOKEN, { ...FAST, capture_pageview: false })
+            assert.equal(ph.featureFlags.hasLoadedFlags, false)
+            await sleep(150)
+            assert.equal(ph.featureFlags.hasLoadedFlags, true)
+        },
+    },
+})

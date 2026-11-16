@@ -1731,7 +1731,7 @@ export class PostHog {
   /** @return {boolean} */
   flagsEndpointWasHit() {
     const f = this.flags_();
-    return f ? f.hasLoadedFlags() : false;
+    return f ? f.checkHasLoadedFlags() : false;
   }
 
   /**
