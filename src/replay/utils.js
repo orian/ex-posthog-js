@@ -59,10 +59,28 @@ function estimateStringBytes(data) {
  */
 export function estimateSize(sizeable) {
   try {
-    const s = JSON.stringify(sizeable, circularReferenceReplacer());
+    const s = stringifyForSize(sizeable);
     return s ? estimateStringBytes(s) : 0;
   } catch (e) {
     return UNSTRINGIFIABLE_EVENT_SIZE;
+  }
+}
+
+/**
+ * Upstream's JSON.stringify(sizeable, circularReferenceReplacer()), plain
+ * stringify first. The replacer returns every value unchanged except one that
+ * is its own ancestor, which plain JSON.stringify rejects with a TypeError;
+ * so when plain stringify succeeds the replacer would have produced the same
+ * string, and on any error we run upstream's call itself (which then throws,
+ * or returns the '[Circular]' version).
+ * @param {*} sizeable
+ * @return {string|undefined}
+ */
+function stringifyForSize(sizeable) {
+  try {
+    return JSON.stringify(sizeable);
+  } catch (e) {
+    return JSON.stringify(sizeable, circularReferenceReplacer());
   }
 }
 
