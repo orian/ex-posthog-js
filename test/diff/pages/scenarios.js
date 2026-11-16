@@ -1219,3 +1219,279 @@
     },
   })
 })()
+
+// ---- Logs, metrics and the toolbar loader (src/logs, src/metrics, src/toolbar) ----------
+;(function () {
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms) }) }
+  var scenario = new URLSearchParams(location.search).get('scenario')
+  var LEVELS = ['trace', 'debug', 'info', 'warn', 'error', 'fatal']
+
+  function cfg(h, extra) {
+    var c = { autocapture: false, capture_pageview: false, disable_surveys: true }
+    for (var k in extra || {}) c[k] = extra[k]
+    return h.config(c)
+  }
+
+  function toolbarState() {
+    var stored = localStorage.getItem('_postHogToolbarParams')
+    return {
+      state: window.ph_toolbar_state,
+      stored: stored ? JSON.parse(stored) : null,
+      calls: window.__toolbarCalls || [],
+      hash: location.hash,
+    }
+  }
+
+  // Parse-time setup, before the SDK script is added: upstream reads the
+  // toolbar hash param when the SDK is parsed.
+  if (scenario === 'toolbar_hash') {
+    var state = { action: 'ph_authorize', token: 'phc_diff', userIntent: 'add-action', temporaryToken: 'tmp-1', desiredHash: '#keep' }
+    history.replaceState(null, '', location.pathname + location.search + '#__posthog=' + encodeURIComponent(btoa(JSON.stringify(state))))
+  }
+  if (scenario === 'toolbar_hash_legacy') {
+    // Legacy `state=` param, urlencoded JSON, without desiredHash: the hash is removed.
+    var legacy = { action: 'ph_authorize', token: 'phc_diff', userIntent: 'heatmaps', temporaryToken: 'tmp-2' }
+    history.replaceState(null, '', location.pathname + location.search + '#state=' + encodeURIComponent(JSON.stringify(legacy)))
+  }
+  if (scenario === 'logs_console_persisted' || scenario === 'logs_console_remote_off') {
+    // A previous page load saw `logs.captureConsoleLogs: true` in the remote config.
+    localStorage.setItem('ph_phc_diff_posthog', JSON.stringify({ distinct_id: 'ret', $device_id: 'ret', $logs_capture_enabled_server_side: true }))
+  }
+
+  Object.assign(window.SCENARIOS, {
+    logs_api: async function (ph, h) {
+      ph.init(h.token, cfg(h, { logs: { serviceName: 'shop', environment: 'test', serviceVersion: '1.2.3', resourceAttributes: { team: 'web' } } }))
+      await sleep(600)
+      ph.captureLog({ body: 'checkout completed', level: 'info', attributes: {
+        order_id: 'ord_789', amount_cents: 4999, ok: true, ratio: 0.5, big: 9007199254740993, tags: ['a', null, 2],
+        nested: { x: 1, deep: { y: 'z' } }, nil: null, undef: undefined, when: new Date(0), fn: function () {},
+      } })
+      ph.captureLog({ body: 'with trace', trace_id: '4bf92f3577b34da6a3ce929d0e0e4736', span_id: '00f067aa0ba902b7', trace_flags: 1 })
+      ph.captureLog({ body: 'unknown level', level: 'verbose' })
+      ph.captureLog({ body: '' }) // dropped: no body
+      ph.captureLog({ body: 'override auto attributes', attributes: { 'url.full': 'custom', posthogDistinctId: 'me' } })
+      LEVELS.forEach(function (l) { ph.logger[l]('logger ' + l, { level_attr: l }) })
+      ph.logs.logger.info('via posthog.logs.logger')
+      window.__flagResults = { hasLogs: !!ph.logs, loggerKeys: Object.keys(ph.logger).sort() }
+      await sleep(3600) // default 3 s flush interval
+    },
+
+    logs_before_send: async function (ph, h) {
+      ph.init(h.token, cfg(h, { logs: { beforeSend: [
+        function (log) { return log.body === 'drop me' ? null : log },
+        function (log) { log.attributes = Object.assign({}, log.attributes, { edited: true }); log.body = log.body.toUpperCase(); return log },
+      ] } }))
+      await sleep(600)
+      ph.captureLog({ body: 'keep me', attributes: { a: 1 } })
+      ph.captureLog({ body: 'drop me' })
+      await sleep(3600)
+    },
+
+    logs_batching: async function (ph, h) {
+      // Flush at 10 queued records, at most 20 records per 1 s window.
+      ph.init(h.token, cfg(h, { logs: { maxBufferSize: 10, maxLogsPerInterval: 20, flushIntervalMs: 1000 } }))
+      await sleep(600)
+      for (var i = 0; i < 25; i++) ph.captureLog({ body: 'burst ' + i, attributes: { i: i } })
+      await sleep(1500)
+      ph.captureLog({ body: 'next window' })
+      await sleep(1500)
+    },
+
+    logs_batch_limit: async function (ph, h) {
+      // 250 records: the size trigger sends 100, the timer drains the rest in
+      // slices of 100 (maxBatchRecordsPerPost).
+      ph.init(h.token, cfg(h))
+      await sleep(600)
+      for (var i = 0; i < 250; i++) ph.captureLog({ body: 'record ' + i })
+      await sleep(3800)
+    },
+
+    logs_flush_unload: async function (ph, h) {
+      ph.init(h.token, cfg(h, { logs: { captureConsoleLogs: true } }))
+      await sleep(600)
+      ph.captureLog({ body: 'flushed explicitly' })
+      await ph.logs.flush()
+      await sleep(300)
+      ph.captureLog({ body: 'dropped by reset' })
+      ph.reset()
+      await sleep(300)
+      ph.captureLog({ body: 'sent on unload', level: 'warn' })
+      console.log('console record sent on unload')
+      // Left in the queues: the runner unloads the page, which drains both with sendBeacon.
+    },
+
+    logs_opt_out: async function (ph, h) {
+      ph.init(h.token, cfg(h, { logs: { captureConsoleLogs: true } }))
+      await sleep(600)
+      ph.opt_out_capturing()
+      ph.captureLog({ body: 'while opted out' })
+      console.log('console while opted out')
+      ph.opt_in_capturing()
+      ph.captureLog({ body: 'after opt in' })
+      console.log('console after opt in')
+      await sleep(3600)
+    },
+
+    logs_console_config: async function (ph, h) {
+      ph.init(h.token, cfg(h, { logs: { captureConsoleLogs: true } }))
+      console.log('right after init', 1, true, null)
+      await sleep(600)
+      console.log('hello', { user: { id: 7, name: 'ann' }, list: [1, 2], skip: undefined, f: function () {} })
+      console.info('info line')
+      console.warn('warn line', { code: 'W1' })
+      console.error(new Error('diff-expected boom'))
+      console.debug('debug line')
+      console.log({ only: 'object', n: 1 })
+      console.log('x'.repeat(12000)) // body truncated at 10000
+      var circular = { name: 'loop' }
+      circular.self = circular
+      console.log('circular', circular)
+      console.log() // no arguments: not captured
+      ph.captureLog({ body: 'programmatic next to console' })
+      await sleep(3600)
+    },
+
+    logs_console_remote: async function (ph, h) {
+      // Console capture enabled by the remote config only (first visit: no recorder before it arrives).
+      ph.init(h.token, cfg(h))
+      console.log('before remote config')
+      await sleep(800)
+      console.log('after remote config', { n: 2 })
+      console.warn('warn after remote config')
+      window.__flagResults = { persisted: ph.get_property('$logs_capture_enabled_server_side') }
+      await sleep(3600)
+    },
+
+    logs_console_persisted: async function (ph, h) {
+      // The persisted hint starts the recorder: console calls before the remote
+      // config arrives are buffered and replayed once it enables capture.
+      ph.init(h.token, cfg(h))
+      console.log('buffered before remote config', { early: true })
+      console.error('buffered error')
+      await sleep(800)
+      console.log('live after remote config')
+      await sleep(3600)
+    },
+
+    logs_console_remote_off: async function (ph, h) {
+      // Persisted hint, but the remote config now says false: the recorder's buffer is dropped.
+      ph.init(h.token, cfg(h))
+      console.log('buffered then dropped')
+      await sleep(800)
+      console.log('not captured')
+      ph.captureLog({ body: 'programmatic still works' })
+      window.__flagResults = { persisted: ph.get_property('$logs_capture_enabled_server_side') }
+      await sleep(3600)
+    },
+
+    metrics_api: async function (ph, h) {
+      ph.init(h.token, cfg(h, { metrics: { serviceName: 'shop', environment: 'test', resourceAttributes: { team: 'web' } } }))
+      await sleep(600)
+      var m = ph.metrics
+      m.count('orders_created')
+      m.count('orders_created', 2)
+      m.count('orders_created', 1, { attributes: { plan: 'pro', region: 'eu' } })
+      m.count('orders_created', 1, { attributes: { region: 'eu', plan: 'pro' } }) // same series
+      m.count('bad_count', -1) // dropped: counters are monotonic
+      m.count('', 1) // dropped: no name
+      m.gauge('active_connections', 42)
+      m.gauge('active_connections', 40)
+      m.gauge('nan_gauge', NaN) // dropped
+      m.histogram('api_latency', 187, { unit: 'ms' })
+      m.histogram('api_latency', 12, { unit: 'ms' })
+      m.histogram('api_latency', 20000, { unit: 'ms' })
+      m.histogram('payload', 3, { bounds: [1, 2, 4] })
+      m.histogram('payload', 9, { bounds: [1, 2, 8] }) // bounds fixed by the first sample
+      m.histogram('bad_bounds', 1, { bounds: [3, 2] }) // dropped
+      await m.flush()
+      await sleep(400)
+      m.count('after_flush', 5, { unit: 'items' })
+      m.histogram('api_latency', 50, { unit: 'ms' })
+      // Left aggregated: the runner unloads the page, which drains the window with sendBeacon.
+    },
+
+    metrics_batching: async function (ph, h) {
+      ph.init(h.token, cfg(h, { metrics: { flushIntervalMs: 800, maxSeriesPerFlush: 3, beforeSend: function (s) {
+        if (s.name === 'secret') return null
+        s.attributes = Object.assign({}, s.attributes, { tagged: true })
+        return s
+      } } }))
+      await sleep(600)
+      ph.metrics.count('a')
+      ph.metrics.count('b')
+      ph.metrics.count('secret')
+      ph.metrics.gauge('c', 1)
+      ph.metrics.gauge('d', 1) // over the series cap: dropped
+      await sleep(1200) // timer flush
+      ph.metrics.count('a', 3)
+      ph.metrics.count('d')
+      await sleep(1200)
+      ph.metrics.count('dropped_by_reset')
+      ph.reset()
+      await sleep(300)
+    },
+
+    toolbar_hash: async function (ph, h) {
+      ph.init(h.token, cfg(h))
+      await sleep(800)
+      window.__flagResults = toolbarState()
+    },
+
+    toolbar_hash_legacy: async function (ph, h) {
+      ph.init(h.token, cfg(h))
+      await sleep(800)
+      window.__flagResults = toolbarState()
+    },
+
+    toolbar_load: async function (ph, h) {
+      ph.init(h.token, cfg(h, { advanced_disable_toolbar_metrics: true }))
+      await sleep(300)
+      var results = { first: ph.loadToolbar({ userIntent: 'add-action', temporaryToken: 'tok', source: 'manual' }) }
+      results.whileLoading = ph.loadToolbar({ userIntent: 'heatmaps' })
+      await sleep(600)
+      results.loaded = toolbarState()
+      results.again = ph.toolbar.loadToolbar({ userIntent: 'heatmaps', token: 'other' })
+      var el = document.createElement('div')
+      el.id = '__POSTHOG_TOOLBAR__'
+      document.body.appendChild(el)
+      results.running = ph.loadToolbar({ userIntent: 'x' })
+      el.remove()
+      results.deprecated = typeof ph.toolbar._loadEditor + '/' + typeof ph.toolbar.maybeLoadEditor
+      results.after = toolbarState()
+      window.__flagResults = results
+    },
+
+    toolbar_persisted: async function (ph, h) {
+      if (sessionStorage.getItem('toolbar_phase') !== '2') {
+        ph.init(h.token, cfg(h))
+        await sleep(300)
+        ph.loadToolbar({ userIntent: 'add-action', temporaryToken: 'persist-me' })
+        await sleep(600)
+        sessionStorage.setItem('toolbar_phase', '2')
+        location.reload()
+        return new Promise(function () {}) // the reloaded page finishes the scenario
+      }
+      // Next page load: the params saved in localStorage launch the toolbar (without userIntent).
+      ph.init(h.token, cfg(h))
+      await sleep(800)
+      window.__flagResults = toolbarState()
+    },
+
+    toolbar_fallback: async function (ph, h) {
+      // The versioned /static/<version>/toolbar.js fails (fixture): the legacy URL with v and t is loaded.
+      ph.init(h.token, cfg(h))
+      await sleep(300)
+      var first = ph.loadToolbar({ userIntent: 'add-action' })
+      await sleep(800)
+      window.__flagResults = { first: first, s: toolbarState() }
+    },
+
+    toolbar_none: async function (ph, h) {
+      // Saved params for another project do not launch the toolbar.
+      localStorage.setItem('_postHogToolbarParams', JSON.stringify({ token: 'phc_other', temporaryToken: 'x' }))
+      ph.init(h.token, cfg(h))
+      await sleep(800)
+      window.__flagResults = { maybe: ph.toolbar.maybeLoadToolbar(), s: toolbarState() }
+    },
+  })
+})()

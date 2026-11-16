@@ -18,3 +18,8 @@ SCENARIO_NAMES.push('replay_recording', 'replay_server_disabled', 'replay_client
     'replay_idle_rotation', 'replay_forced_rotation', 'replay_start_stop_api', 'replay_unload_flush',
     'replay_cached_config', 'replay_stale_cached_config', 'replay_masking_network', 'replay_v2_trigger_groups',
     'replay_idle_detection', 'replay_full_snapshot_interval')
+// Logs, metrics and the toolbar loader (pages/scenarios.js, last block).
+SCENARIO_NAMES.push('logs_api', 'logs_before_send', 'logs_batching', 'logs_batch_limit', 'logs_flush_unload',
+    'logs_opt_out', 'logs_console_config', 'logs_console_remote', 'logs_console_persisted', 'logs_console_remote_off',
+    'metrics_api', 'metrics_batching', 'toolbar_hash', 'toolbar_hash_legacy', 'toolbar_load', 'toolbar_persisted',
+    'toolbar_fallback', 'toolbar_none')

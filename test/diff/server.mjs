@@ -59,6 +59,7 @@ export function startServer({ port = 0 } = {}) {
         // Lazy-loaded SDK assets (official only): /static/<file>.js
         if (url.pathname.startsWith('/static/')) {
             state.log.push({ method: req.method, path: url.pathname, query: Object.fromEntries(url.searchParams) })
+            if (path.basename(url.pathname) === 'toolbar.js') return serveToolbarStub(res, url, state)
             return sendFile(res, path.join(VENDOR, path.basename(url.pathname)))
         }
         const entry = {
@@ -103,4 +104,25 @@ export function startServer({ port = 0 } = {}) {
     return new Promise((resolve) => {
         server.listen(port, '0.0.0.0', () => resolve({ server, state, port: server.address().port }))
     })
+}
+
+// ---- toolbar ---------------------------------------------------------------------
+// The hosted toolbar bundle is not part of either SDK: this stub records each
+// `ph_load_toolbar(params, posthog)` call so scenarios can compare them.
+const TOOLBAR_STUB = `(function () {
+  window.ph_load_toolbar = function (params, posthog) {
+    (window.__toolbarCalls = window.__toolbarCalls || []).push({
+      params: JSON.parse(JSON.stringify(params)),
+      isGlobalInstance: posthog === window.posthog,
+    })
+  }
+})()`
+
+// With `responses.versionedToolbar = { status: 404 }`, `/static/<version>/toolbar.js` fails,
+// so the SDK falls back to `/static/toolbar.js?v=...&t=...`.
+function serveToolbarStub(res, url, state) {
+    const versioned = url.pathname !== '/static/toolbar.js'
+    if (versioned && state.responses.versionedToolbar) return res.writeHead(state.responses.versionedToolbar.status).end('not found')
+    res.writeHead(200, { 'Content-Type': 'application/javascript', 'Cache-Control': 'no-store' })
+    res.end(TOOLBAR_STUB)
 }
