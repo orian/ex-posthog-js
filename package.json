@@ -10,7 +10,8 @@
     "test:source": "node test/run.mjs source",
     "test:compiled": "node test/run.mjs compiled",
     "test:chrome": "node test/smoke-chrome.mjs",
-    "test:replay": "node --test test/replay.test.mjs"
+    "test:replay": "node --test test/replay.test.mjs",
+    "bench:session": "node test/bench/session.mjs"
   },
   "license": "MIT"
 }
