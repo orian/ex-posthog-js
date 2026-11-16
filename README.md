@@ -10,7 +10,7 @@ It speaks the same wire protocol and uses the same storage format as upstream
 when a site switches between this SDK and upstream.
 
 It is a faithful port of upstream posthog-js **1.450.0** for the core, feature
-flags and web experiments. `test/diff` runs the same scenarios against the
+flags, web experiments and exception capture. `test/diff` runs the same scenarios against the
 official bundle and this SDK in headless Chrome and diffs the traffic; all
 scenarios are identical (see [Test](#test)). See [Scope](#scope) for what is
 not ported yet.
@@ -23,6 +23,8 @@ src/core/          always loaded: init, capture, identity, persistence, sessions
                    scroll tracking, rate limiting, extension registry
 src/flags/         optional: feature flags (/flags/?v=2)
 src/experiments/   optional: no-code web experiments (needs flags)
+src/exceptions/    optional: exception capture + autocapture (posthog.exceptions,
+                   posthog.exceptionObserver)
 src/entry/         bundle entry points (core, core-flags, full)
 docker/closure-compiler/Dockerfile   Closure Compiler v20261109 (official Maven jar, JRE 21)
 scripts/build.sh   builds every bundle in Docker
@@ -41,10 +43,11 @@ upstream/          shallow clone of PostHog/posthog-js, kept for reference only 
 |---|---|---|
 | `dist/posthog.core.js` | core only | ~34.2 KB |
 | `dist/posthog.core-flags.js` | core + feature flags | ~40.9 KB |
-| `dist/posthog.full.js` | core + flags + web experiments | ~47.1 KB |
-| `dist/chunks/core.js` | core chunk | ~35.5 KB |
+| `dist/posthog.full.js` | core + flags + web experiments + exceptions | ~55.2 KB |
+| `dist/chunks/core.js` | core chunk | ~35.7 KB |
 | `dist/chunks/flags.js` | flags chunk (needs core) | ~7.4 KB |
 | `dist/chunks/experiments.js` | experiments chunk (needs flags) | ~6.5 KB |
+| `dist/chunks/exceptions.js` | exception capture chunk (needs core) | ~8.4 KB |
 
 Most of the core is the user-agent tables (a faithful port of upstream's UA
 and bot detection). The experiments chunk includes the html sanitiser (~5 KB).
@@ -75,6 +78,7 @@ module out:
 <!-- optional, any time later: -->
 <script src="chunks/flags.js"></script>
 <script src="chunks/experiments.js"></script>
+<script src="chunks/exceptions.js"></script>
 ```
 
 Flag methods (`getFeatureFlag`, `isFeatureEnabled`, `onFeatureFlags`, ...) are
@@ -83,6 +87,19 @@ always present on `posthog`. Without the flags module they return `undefined`
 slim bundle. Attached modules are published like upstream:
 `posthog.featureFlags` (with upstream's methods, e.g.
 `posthog.featureFlags.overrideFeatureFlags(...)`) and `posthog.experiments`.
+
+Exception capture works the same way. `captureException`, `addExceptionStep`,
+`startExceptionAutocapture` and `stopExceptionAutocapture` are core methods, as
+upstream; the core only delegates to the `exceptions` module through the
+`ExceptionsApi` record. Without the module, `captureException` returns
+`undefined` and sends nothing, `addExceptionStep` is a no-op and the
+start/stop methods only set `capture_exceptions`, which is what upstream does
+when its `exceptions` extension is unavailable. Everything else (coercers, stack
+parsing, filters, steps, rate limiting, the `window.onerror` /
+`onunhandledrejection` / `console.error` wrappers, the remote config keys) is in
+the module, so `posthog.core.js` carries none of it. The module publishes
+`posthog.exceptions` and `posthog.exceptionObserver` (with `isEnabled`), like
+upstream.
 
 The standard PostHog HTML snippet also works. Calls the snippet queued before
 the SDK loaded are replayed after `init`, with `identify` and `register` going
@@ -141,6 +158,10 @@ upstream name (`autocapture`, `heatmaps`, `sessionRecording`, `exceptions`...).
   must be added to that list.
 - `onReset()`: called by `reset()` after persistence was cleared and before the
   new anonymous identity is registered.
+- `onConfigChange(partialConfig)`: called by `set_config()` (including the one in
+  `init` and the one the remote config triggers) after the config, persistence,
+  flags and history autocapture were updated, in attach order. Upstream's
+  `onConfigChange()` / `startIfEnabledOrStop()` calls map to it.
 
 **Core APIs for extensions** (on the `PostHog` instance):
 
@@ -181,6 +202,7 @@ npm run test:chrome              # loads the chunks in real headless Chrome (chr
 node --test test/user-agent.test.mjs
 ./scripts/build.sh && node test/diff/run.mjs [scenario ...]   # differential test vs official 1.450.0
 node test/sanitizer-chrome.mjs   # html sanitiser vs real DOMPurify 3.4.13 (needs it in /tmp/dp, see the file)
+node --test test/exceptions.test.mjs   # upstream's stack parser / coercer / builder unit tests, ported
 ```
 
 The differential test serves the official `array.js` and our
@@ -190,6 +212,15 @@ answers the remote config (`config.js` and JSON). It compares every request
 normalising ids and timestamps. `ALLOWED` in `test/diff/fixtures.mjs` lists the
 accepted differences: `$lib_version`, and properties owned by modules that do
 not exist yet (`TODO(module)`).
+
+Exception scenarios (`exc_*`) compare `$exception_list` frames as reported by
+Chrome for the shared test page, so filenames, lines and columns are real. Only
+frames inside the SDK file itself are normalised: each run of consecutive frames
+from `/sdk/official/`, `/sdk/ours/` or the official lazy-loaded `/static/`
+bundles becomes one `<sdk>` frame, because file, minified names, positions and
+the number of frames left after inlining differ by construction. Errors the
+scenarios throw on purpose say `diff-expected` and are not reported as page
+errors.
 
 The Node harness cannot execute injected scripts, so remote config always goes
 through the JSON fallback there.
@@ -211,10 +242,20 @@ through the JSON fallback there.
   features and the background refresh.
 - Web experiments with an html sanitiser equivalent to DOMPurify 3.4.13 under
   upstream's config.
+- Exception capture (`posthog-exceptions.ts`, the `exception-autocapture`
+  extension and its wrapping functions, core `error-tracking`): coercers for
+  Error / DOMException / ErrorEvent / PromiseRejectionEvent / Event / objects /
+  strings / primitives, Chrome and Gecko stack parsers (Safari extension frames,
+  recursion collapse, frame and line limits, `in_app`), causes and
+  `AggregateError` members, `$exception_steps`, `$release_id` and chunk ids,
+  the per-type bucketed rate limiter, remote `suppressionRules`, the
+  extension / injected-script / SDK-error filters, `capture_exceptions` vs the
+  `autocaptureExceptions` remote flag (`$exception_capture_enabled_server_side`,
+  `$error_tracking_suppression_rules`, `$error_tracking_capture_extension_exceptions`).
 
 **Not yet implemented** (upstream modules to add as extensions): autocapture,
 heatmaps, rageclicks/dead clicks, session replay, surveys, product tours,
-exception autocapture, web vitals, logs/metrics, conversations, the toolbar,
+web vitals, logs/metrics, conversations, the toolbar,
 site apps, tracing headers.
 
 **Known differences from upstream**
@@ -228,5 +269,11 @@ site apps, tracing headers.
   somewhat larger bodies.
 - Hook names of extensions are renamed by Closure, so extensions must be
   compiled with the core (as bundles or chunks).
+- Exception autocapture's wrapping functions are compiled into the module
+  instead of being lazy-loaded from `/static/exception-autocapture.js`, so
+  `window.onerror` & co. are wrapped synchronously when autocapture turns on
+  (upstream wraps them once that script has loaded). The legacy globals that
+  script defines for old SDK versions (`posthogErrorWrappingFunctions`,
+  `extendPostHogWithExceptionAutocapture`) are not provided.
 
 PostHog's original license is kept in `LICENSE.upstream`.
