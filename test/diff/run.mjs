@@ -3,6 +3,7 @@
 //   node test/diff/run.mjs [scenario ...]      (requires ./scripts/build.sh first)
 import fs from 'node:fs'
 import path from 'node:path'
+import zlib from 'node:zlib'
 import { startServer } from './server.mjs'
 import { launchChrome } from './chrome.mjs'
 import { ROOT } from '../harness.mjs'
@@ -37,7 +38,91 @@ const VOLATILE_KEYS = new Set(['$time', '$insert_id', 'sent_at', 'timestamp', '$
     '$event_time_override_system_time', '$sdk_debug_retry_queue_size', '$lib_rate_limit_remaining_tokens',
     '$timezone_offset', '$time_since_page_load'])
 
-function normalise(value, ids, key) {
+// ---- session replay ($snapshot) --------------------------------------------------
+// Replay payloads are made comparable without hiding structure:
+// - `cv: '2024-10'` events carry gzip (latin1 string) fields: they are decoded,
+//   so the recorded DOM/mutations are compared, not the encoder's bytes (the
+//   unload path uses our sync encoder, which differs from fflate).
+// - rrweb/recorder timestamps (`timestamp`, `timeOffset`, idle/activity
+//   timestamps, session start, cache_timestamp) are wall-clock: volatile.
+// - The recorded DOM contains the SDK and recorder <script> tags, whose URLs
+//   differ by design (array.js vs posthog.full.js, lazy-recorder.js vs
+//   recorder.js, 1.450.0 vs our version): those URLs are normalised.
+// - Byte sizes depend on those URLs, so `$snapshot_bytes` is checked for
+//   consistency with the payload instead (each SDK's reported size must equal
+//   upstream's estimate of what it sent), and buffer/flushed sizes are volatile.
+// Node ids are kept: both SDKs record the same page with the same rrweb build.
+const REPLAY_VOLATILE_KEYS = new Set(['timeOffset', 'lastActivityTimestamp', 'eventTimestamp', 'cache_timestamp',
+    '$sdk_debug_session_start', '$debug_first_full_snapshot_timestamp', '$sdk_debug_replay_internal_buffer_size',
+    '$sdk_debug_replay_flushed_size', 'flushed_size', 'bufferSize'])
+
+function gunzipLatin1(s) {
+    return JSON.parse(zlib.gunzipSync(Buffer.from(s, 'latin1')).toString('utf8'))
+}
+
+function decompressReplayEvent(e) {
+    if (!e || e.cv !== '2024-10') return e
+    const out = { ...e }
+    if (e.type === 2 && typeof e.data === 'string') out.data = gunzipLatin1(e.data)
+    else if (e.type === 3 && e.data) {
+        out.data = { ...e.data }
+        for (const k of ['texts', 'attributes', 'removes', 'adds']) {
+            if (typeof e.data[k] === 'string') out.data[k] = gunzipLatin1(e.data[k])
+        }
+    }
+    return out
+}
+
+// upstream estimateCompressedEventSize
+function estimateCompressedEventSize(value) {
+    if (value === null) return 4
+    if (value === undefined) return 0
+    switch (typeof value) {
+        case 'string': return value.length + 2
+        case 'number': return String(value).length
+        case 'boolean': return value ? 4 : 5
+        case 'object': {
+            if (Array.isArray(value)) {
+                let size = 2
+                value.forEach((el, i) => { size += (i > 0 ? 1 : 0) + (el == null ? 4 : estimateCompressedEventSize(el)) })
+                return size
+            }
+            let size = 2
+            let first = true
+            for (const k of Object.keys(value)) {
+                if (value[k] === undefined) continue
+                if (!first) size += 1
+                first = false
+                size += k.length + 3 + estimateCompressedEventSize(value[k])
+            }
+            return size
+        }
+        default: return 0
+    }
+}
+
+function expandSnapshot(e) {
+    const p = e.properties
+    if (!p || !Array.isArray(p.$snapshot_data)) return e
+    const expected = p.$snapshot_data.reduce((sum, ev) => sum + (ev && ev.cv
+        ? estimateCompressedEventSize(ev) : Buffer.byteLength(JSON.stringify(ev))), 0)
+    const bytes = p.$snapshot_bytes === expected ? '<consistent>' : `<inconsistent: ${p.$snapshot_bytes} != ${expected}>`
+    return { ...e, properties: { ...p, $snapshot_bytes: bytes, $snapshot_data: p.$snapshot_data.map(decompressReplayEvent) } }
+}
+
+function normaliseUrls(value) {
+    return value
+        .replace(/\/sdk\/(official\/array\.js|ours\/[\w.\/-]+\.js)/g, '/sdk/<sdk>')
+        .replace(/\/static\/(?:[\w.-]+\/)?(?:lazy-)?recorder\.js(?:\?v=[\w.-]+)?/g, '/static/<recorder>')
+}
+
+// Network plugin entries: browser-measured timings and transfer sizes.
+const NETWORK_VOLATILE = /(Start|End|Time|duration|timeOrigin|Size|Complete|Interactive)$/
+
+function normalise(value, ids, key, inNetwork) {
+    if (inNetwork && NETWORK_VOLATILE.test(key || '') && typeof value === 'number') return '<volatile>'
+    if (inNetwork && key === 'date') return '<volatile>'
+    if (REPLAY_VOLATILE_KEYS.has(key) && value !== undefined && value !== null) return '<volatile>'
     if (VOLATILE_KEYS.has(key) && value !== undefined && value !== null) return '<volatile>'
     if (typeof value === 'string') {
         if (UUID.test(value)) {
@@ -50,12 +135,13 @@ function normalise(value, ids, key) {
             if (!ids.has(u)) ids.set(u, `<id${ids.size}>`)
             return ids.get(u)
         })
-        return value.replace(/:\d{4,5}\//g, ':<port>/').replace(/:\d{4,5}$/, ':<port>').replace(/sdk=(official|ours)/g, 'sdk=<sdk>').replace(/&bundle=[^&]*/g, '')
+        return normaliseUrls(value).replace(/:\d{4,5}\//g, ':<port>/').replace(/:\d{4,5}$/, ':<port>').replace(/sdk=(official|ours)/g, 'sdk=<sdk>').replace(/&bundle=[^&]*/g, '')
     }
-    if (Array.isArray(value)) return value.map((v) => normalise(v, ids))
+    if (Array.isArray(value)) return value.map((v) => normalise(v, ids, undefined, inNetwork))
     if (value && typeof value === 'object') {
         const out = {}
-        for (const k of Object.keys(value).sort()) out[k] = normalise(value[k], ids, k)
+        const net = inNetwork || value.plugin === 'rrweb/network@1'
+        for (const k of Object.keys(value).sort()) out[k] = normalise(value[k], ids, k, net)
         return out
     }
     return value
@@ -74,7 +160,7 @@ function digest(log) {
         const body = r.body
         const batch = body && typeof body === 'object' ? (Array.isArray(body) ? body : body.batch) : null
         requests.push({ method: r.method, path: r.path, query: normalise(query, ids), contentType: r.contentType, events: batch ? batch.map((e) => e.event) : undefined })
-        if (batch) for (const e of batch) events.push(normalise(e, ids))
+        if (batch) for (const e of batch) events.push(normalise(e && e.event === '$snapshot' ? expandSnapshot(e) : e, ids))
         else if (body && typeof body === 'object' && r.path !== '/e/') events.push({ __request: r.path, body: normalise(body, ids) })
     }
     return { requests, events }
@@ -83,6 +169,11 @@ function digest(log) {
 function diffValues(a, b, at, out) {
     if (ALLOWED.some((re) => re.test(at))) return
     if (JSON.stringify(a) === JSON.stringify(b)) return
+    // Same-length arrays (e.g. $snapshot_data) are compared element by element for readable diffs.
+    if (Array.isArray(a) && Array.isArray(b) && a.length === b.length && at.indexOf('$snapshot_data') !== -1) {
+        a.forEach((x, i) => diffValues(x, b[i], `${at}[${i}]`, out))
+        return
+    }
     if (a && b && typeof a === 'object' && typeof b === 'object' && !Array.isArray(a) && !Array.isArray(b)) {
         for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) diffValues(a[k], b[k], `${at}.${k}`, out)
         return

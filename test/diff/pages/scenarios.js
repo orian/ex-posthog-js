@@ -273,3 +273,308 @@
     },
   }
 })()
+
+// ---- session replay -----------------------------------------------------------
+// The remote config for each scenario (fixtures.mjs) enables recording. Both
+// SDKs record the same page with the same rrweb build; the runner decodes and
+// compares the $snapshot payloads.
+;(function () {
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms) }) }
+  async function waitFor(fn, ms) {
+    var end = Date.now() + (ms || 6000)
+    while (Date.now() < end) {
+      try { if (fn()) return true } catch (e) {}
+      await sleep(25)
+    }
+    return false
+  }
+  // Recording starts after the remote config and the recorder script loaded.
+  async function started(ph) {
+    var ok = await waitFor(function () { return ph.sessionRecordingStarted() })
+    await sleep(300) // full snapshot compression (CompressionStream) settles
+    return ok
+  }
+  var counter = 0
+  // A user interaction (releases the "no interaction yet" hold), a DOM
+  // mutation and masked input.
+  function interact() {
+    counter++
+    document.getElementById('buy').click()
+    var p = document.createElement('p')
+    p.className = 'added'
+    p.textContent = 'added ' + counter
+    document.body.insertBefore(p, document.getElementById('form'))
+    var input = document.getElementById('email')
+    input.value = 'person' + counter + '@example.com'
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+  }
+  function status(ph) {
+    var sr = ph.sessionRecording
+    return { started: ph.sessionRecordingStarted(), status: sr ? sr.status : null }
+  }
+  function seedPersistence(extra) {
+    var now = Date.now()
+    var props = {
+      distinct_id: 'returning', $device_id: 'returning', $user_state: 'anonymous',
+      $sesid: [now - 1000, '0190f5b8-0000-7000-8000-00000000bbbb', now - 5000],
+    }
+    for (var k in extra) props[k] = extra[k]
+    localStorage.setItem('ph_phc_diff_posthog', JSON.stringify(props))
+  }
+  var CACHED_CONFIG = {
+    enabled: true, endpoint: '/s/', consoleLogRecordingEnabled: true, recorderVersion: 'v2', sampleRate: null,
+    minimumDurationMilliseconds: null, linkedFlag: null, networkPayloadCapture: { capturePerformance: false },
+    canvasRecording: {}, masking: null, urlTriggers: [], urlBlocklist: [], eventTriggers: [], triggerMatchType: null,
+    scriptConfig: null,
+  }
+
+  // Surveys are not ported, and upstream injects surveys.js whenever the remote
+  // config has a `surveys` key, which would add a <script> to the recorded DOM.
+  function cfg(h, extra) {
+    var c = { autocapture: false, disable_surveys: true }
+    for (var k in extra || {}) c[k] = extra[k]
+    return h.config(c)
+  }
+
+  Object.assign(window.SCENARIOS, {
+    replay_recording: async function (ph, h) {
+      ph.init(h.token, cfg(h, { capture_pageview: 'history_change' }))
+      var ok = await started(ph)
+      interact()
+      console.log('hello from the page', { n: 1 })
+      await sleep(2500)
+      history.pushState({}, '', '/docs/next?x=1')
+      interact()
+      ph.capture('after-navigation')
+      await sleep(2500)
+      window.__flagResults = { ok: ok, s: status(ph), url: ph.get_session_replay_url().replace(ph.get_session_id(), '<sid>') }
+    },
+
+    replay_server_disabled: async function (ph, h) {
+      ph.init(h.token, cfg(h))
+      await sleep(1500)
+      interact()
+      ph.capture('no-recording')
+      await sleep(800)
+      window.__flagResults = status(ph)
+    },
+
+    replay_client_disabled: async function (ph, h) {
+      ph.init(h.token, cfg(h, { disable_session_recording: true }))
+      await sleep(1500)
+      interact()
+      ph.capture('no-recording')
+      await sleep(800)
+      window.__flagResults = status(ph)
+    },
+
+    replay_sample_rate_0: async function (ph, h) {
+      ph.init(h.token, cfg(h))
+      var ok = await started(ph)
+      interact()
+      ph.capture('sampled-out')
+      await sleep(2500)
+      window.__flagResults = { ok: ok, s: status(ph) }
+    },
+
+    replay_sample_rate_1: async function (ph, h) {
+      ph.init(h.token, cfg(h))
+      var ok = await started(ph)
+      interact()
+      ph.capture('sampled-in')
+      await sleep(2500)
+      window.__flagResults = { ok: ok, s: status(ph) }
+    },
+
+    replay_linked_flag_match: async function (ph, h) {
+      ph.init(h.token, cfg(h))
+      var ok = await started(ph)
+      await sleep(500) // flags
+      interact()
+      await sleep(2500)
+      window.__flagResults = { ok: ok, s: status(ph) }
+    },
+
+    replay_linked_flag_miss: async function (ph, h) {
+      ph.init(h.token, cfg(h))
+      var ok = await started(ph)
+      await sleep(500)
+      interact()
+      ph.capture('flag-missed')
+      await sleep(2500)
+      window.__flagResults = { ok: ok, s: status(ph) }
+    },
+
+    replay_url_trigger: async function (ph, h) {
+      ph.init(h.token, cfg(h, { capture_pageview: 'history_change' }))
+      var ok = await started(ph)
+      interact()
+      await sleep(2500)
+      var before = status(ph)
+      history.pushState({}, '', '/checkout/step-1')
+      await sleep(100)
+      interact()
+      await sleep(2500)
+      window.__flagResults = { ok: ok, before: before, after: status(ph) }
+    },
+
+    replay_url_blocklist: async function (ph, h) {
+      ph.init(h.token, cfg(h, { capture_pageview: 'history_change' }))
+      var ok = await started(ph)
+      interact()
+      await sleep(2500)
+      history.pushState({}, '', '/private/account')
+      await sleep(100)
+      interact()
+      await sleep(600)
+      var paused = status(ph)
+      history.pushState({}, '', '/public')
+      await sleep(100)
+      interact()
+      await sleep(2500)
+      window.__flagResults = { ok: ok, paused: paused, after: status(ph) }
+    },
+
+    replay_event_trigger: async function (ph, h) {
+      ph.init(h.token, cfg(h))
+      var ok = await started(ph)
+      interact()
+      await sleep(2500)
+      var before = status(ph)
+      ph.capture('purchase', { plan: 'pro' })
+      interact()
+      await sleep(2500)
+      window.__flagResults = { ok: ok, before: before, after: status(ph) }
+    },
+
+    replay_minimum_duration: async function (ph, h) {
+      ph.init(h.token, cfg(h))
+      var ok = await started(ph)
+      interact()
+      await sleep(2300) // flush held: session shorter than 4s
+      interact()
+      await sleep(2500) // the rescheduled flush ships once the session is long enough
+      window.__flagResults = { ok: ok, s: status(ph) }
+    },
+
+    replay_minimum_duration_strict: async function (ph, h) {
+      ph.init(h.token, cfg(h, { session_recording: { strictMinimumDuration: true } }))
+      var ok = await started(ph)
+      interact()
+      await sleep(2300) // buffer spans less than 1.5s
+      interact()
+      await sleep(2500)
+      window.__flagResults = { ok: ok, s: status(ph) }
+    },
+
+    replay_idle_rotation: async function (ph, h) {
+      ph.init(h.token, cfg(h))
+      var ok = await started(ph)
+      interact()
+      await sleep(2500)
+      // An event timestamped two hours later finds the session idle: it rotates
+      // (activityTimeout), and the recorder links and restarts.
+      ph.capture('much-later', {}, { timestamp: new Date(Date.now() + 2 * 3600 * 1000) })
+      await sleep(300)
+      interact()
+      await sleep(2500)
+      window.__flagResults = { ok: ok, s: status(ph) }
+    },
+
+    replay_forced_rotation: async function (ph, h) {
+      ph.init(h.token, cfg(h))
+      var ok = await started(ph)
+      interact()
+      await sleep(400)
+      ph.reset() // flushes the old identity's buffer, new session on the next event
+      ph.capture('after-reset')
+      await sleep(300)
+      interact()
+      await sleep(2500)
+      window.__flagResults = { ok: ok, s: status(ph) }
+    },
+
+    replay_start_stop_api: async function (ph, h) {
+      ph.init(h.token, cfg(h, { disable_session_recording: true }))
+      await sleep(1200)
+      var before = status(ph)
+      ph.startSessionRecording({ sampling: true })
+      var ok = await started(ph)
+      interact()
+      await sleep(2500)
+      ph.stopSessionRecording()
+      var stopped = status(ph)
+      interact()
+      ph.capture('after-stop')
+      await sleep(600)
+      ph.startSessionRecording()
+      await started(ph)
+      interact()
+      await sleep(2500)
+      window.__flagResults = { ok: ok, before: before, stopped: stopped, after: status(ph) }
+    },
+
+    replay_unload_flush: async function (ph, h) {
+      // No interaction: the fresh-start hold is released by the (visible)
+      // page's unload, which flushes and parks nothing.
+      ph.init(h.token, cfg(h))
+      var ok = await started(ph)
+      var p = document.createElement('p')
+      p.textContent = 'just before leaving'
+      document.body.appendChild(p)
+      await sleep(100)
+      window.__flagResults = { ok: ok, s: status(ph) }
+    },
+
+    replay_cached_config: async function (ph, h) {
+      // A second page load: recording starts from the persisted (fresh) remote
+      // config, before the new remote config arrives.
+      seedPersistence({ $session_recording_remote_config: Object.assign({ cache_timestamp: Date.now() }, CACHED_CONFIG) })
+      ph.init(h.token, cfg(h))
+      var early = status(ph)
+      var ok = await started(ph)
+      interact()
+      await sleep(2500)
+      window.__flagResults = { ok: ok, early: early, s: status(ph) }
+    },
+
+    replay_stale_cached_config: async function (ph, h) {
+      // A persisted config older than 1h is not trusted: recording waits for a
+      // fresh remote config.
+      seedPersistence({ $session_recording_remote_config: Object.assign({ cache_timestamp: Date.now() - 2 * 3600 * 1000 }, CACHED_CONFIG) })
+      ph.init(h.token, cfg(h))
+      var early = status(ph)
+      var ok = await started(ph)
+      interact()
+      await sleep(2500)
+      window.__flagResults = { ok: ok, early: early, s: status(ph) }
+    },
+
+    replay_masking_network: async function (ph, h) {
+      var secret = document.createElement('div')
+      secret.className = 'secret'
+      secret.textContent = 'masked text'
+      document.body.appendChild(secret)
+      // No /flags request: whether it finishes before the recorder starts (and so
+      // appears in the initial network entries) is a race.
+      ph.init(h.token, cfg(h, { advanced_disable_feature_flags_on_first_load: true, session_recording: { maskInputOptions: { email: true } } }))
+      var ok = await started(ph)
+      interact()
+      var res = await fetch('/scenarios.js?probe=1', { method: 'POST', headers: { 'X-Probe': 'yes', 'X-Api-Key': 'k' }, body: '{"q":1}' })
+      await res.text()
+      await sleep(2500)
+      window.__flagResults = { ok: ok, s: status(ph) }
+    },
+
+    replay_v2_trigger_groups: async function (ph, h) {
+      ph.init(h.token, cfg(h))
+      var ok = await started(ph)
+      interact()
+      await sleep(2500)
+      ph.capture('purchase', { plan: 'pro' })
+      interact()
+      await sleep(2500)
+      window.__flagResults = { ok: ok, s: status(ph) }
+    },
+  })
+})()

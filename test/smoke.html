@@ -31,6 +31,7 @@
 </script>
 <script src="../dist/chunks/flags.js"></script>
 <script src="../dist/chunks/experiments.js"></script>
+<script src="../dist/chunks/replay.js"></script>
 <script>
   setTimeout(function () {
     document.getElementById('out').textContent = JSON.stringify({
@@ -39,6 +40,8 @@
       hero: document.getElementById('hero').textContent,
       xss: !!window.__xss,
       distinct: !!posthog.get_distinct_id(),
+      replay: posthog.sessionRecording ? posthog.sessionRecording.status : null,
+      replayStarted: posthog.sessionRecordingStarted(),
       paths: sent.map(function (r) { return r.url.replace(/\?.*/, ''); }).sort()
     });
   }, 1200);
