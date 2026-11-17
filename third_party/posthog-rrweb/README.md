@@ -76,8 +76,9 @@ TypeScript as is. Upstream builds it with vite/rolldown, then Babel and terser
 with property mangling of `_`-prefixed names (with rrweb's names reserved);
 esbuild does no property mangling, which only renames internals.
 
-**Size.** gzip -9: ours 46.5 KB (46,464 bytes) vs PostHog's 46.5 KB (46,549
-bytes); raw 142 KB vs 151 KB.
+**Size.** gzip -9: PostHog's 46.5 KB (46,549 bytes); ours 46.5 KB (46,464
+bytes) unmodified, 46.7 KB (46,702 bytes) with the optimisations below; raw
+144 KB vs 151 KB.
 
 **Identical behaviour.** Before any change, with `src/` equal to
 `original/`, every diff scenario was identical for both builds
@@ -88,8 +89,28 @@ SDK with PostHog's `lazy-recorder.js` and ours with this build.
 
 ## Changes from upstream
 
-None to behaviour. Build-only:
+Build-only:
 
 - `@posthog/core` resolves to `packages/core/src/utils/index.ts` (the
   recorder uses only helpers from there), marked side-effect free so esbuild
   drops the unused ones, as rollup does upstream.
+
+Performance, none of which changes what is recorded (same events, same node
+ids, same order; each is its own commit with the reasoning, and
+`npm run test:recorder-equivalence` checks `src/` against `original/`):
+
+- `utils/src/index.ts`: cached untainted methods (`contains`,
+  `getRootNode`) are called with `.call` instead of a new bound function and
+  cache key per call; the node accessors read their cached getter directly.
+- `rrweb/src/record/mutation.ts`: removed subtrees are no longer walked when
+  the removal is processed. The emission checks an added or moved node's
+  parent's ancestors against the removed roots (memoised); the subtrees are
+  still walked into `removesSubTreeCache` when the emission is deferred
+  (frozen or locked buffer) or throws.
+- `rrweb/src/record/index.ts`, `observer.ts`: event payloads are built with
+  `Object.assign({source}, p)` instead of `{source, ...p}`, which the build
+  lowers to an object-spread helper for its oldest targets.
+- `rrweb/src/utils.ts`: `getWindowScroll` reads `document.scrollingElement`
+  once.
+
+`diff -ru original src` shows all of it.
