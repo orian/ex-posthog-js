@@ -4,10 +4,12 @@
  * gzipField[Async]). Native gzip and its output validation (posthog core
  * gzip.ts) live in core/gzip.js, shared with the request path.
  *
- * The async path uses the browser's CompressionStream exactly like upstream,
- * so it produces the same bytes. The sync path (used when draining on unload,
- * or after native gzip failed) uses the core encoder instead of fflate: the
- * output differs but decodes to the same data.
+ * The async path uses the browser's CompressionStream like upstream for
+ * fields over SYNC_GZIP_MAX_CHARS; shorter ones, where a CompressionStream
+ * round trip costs several times the compression itself, go through the
+ * core's sync encoder. The sync path (used when draining on unload, or after
+ * native gzip failed) uses the core encoder instead of fflate. Either way the
+ * bytes differ from upstream's but decode to the same data.
  */
 import {gzipCompress, gzipSync} from '../core/gzip.js';
 import {isArray} from '../core/utils.js';
@@ -64,6 +66,20 @@ export function gzipToString(data, replacer) {
 }
 
 /**
+ * Serialised fields up to this many UTF-16 code units are compressed with the
+ * sync encoder instead of a CompressionStream. A native call costs about
+ * 0.4-0.6 ms at 4x CPU throttling whatever the size (stream setup,
+ * Response.blob(), reading the blob back), the sync encoder 0.04 ms for a
+ * short field and 0.25 ms at 2.5 KB; they cross over at about 16 KB
+ * (test/bench/gzip-chrome.mjs). Most mutation fields are under 1 KB.
+ * @const {number}
+ */
+export const SYNC_GZIP_MAX_CHARS = 8192;
+
+/**
+ * Upstream gzipToStringAsync. Small inputs take the sync encoder (see
+ * SYNC_GZIP_MAX_CHARS); the result still arrives through the promise, so the
+ * event is captured in the same order, from the same compression queue.
  * @param {*} data
  * @param {function(): function(this:?, string, *): *} replacer
  * @return {!Promise<string>}
@@ -72,6 +88,7 @@ export function gzipToStringAsync(data, replacer) {
   let serialized;
   try {
     serialized = serializeForCompression(data, replacer);
+    if (serialized.length <= SYNC_GZIP_MAX_CHARS) return Promise.resolve(gzipStringToString(serialized));
   } catch (e) {
     return Promise.reject(e);
   }

@@ -8,8 +8,8 @@ import assert from 'node:assert/strict'
 import zlib from 'node:zlib'
 
 globalThis.window = globalThis
-const { crc32, gzipSync, isNativeAsyncGzipError } = await import('../src/core/gzip.js')
-const { gzipToStringAsync, gzipFieldAsync } = await import('../src/replay/gzip-field.js')
+const { crc32, gzipSync, gzipCompress, isNativeAsyncGzipError } = await import('../src/core/gzip.js')
+const { gzipToStringAsync, gzipFieldAsync, latin1FromBytes, SYNC_GZIP_MAX_CHARS } = await import('../src/replay/gzip-field.js')
 const { circularReferenceReplacer } = await import('../src/replay/utils.js')
 
 function rng(seed) {
@@ -159,13 +159,18 @@ const INPUTS = [
     { big: 'abc'.repeat(20000), n: Array.from({ length: 500 }, (_, i) => i) },
 ]
 
+// gzipToStringAsync's native branch (fields over SYNC_GZIP_MAX_CHARS); shorter ones are
+// compressed synchronously (tested below), so the validation cases call it directly.
+const nativeToString = (input) => gzipCompress(JSON.stringify(input)).then(latin1FromBytes)
+const isLarge = (input) => JSON.stringify(input).length > SYNC_GZIP_MAX_CHARS
+
 for (const [name, mutate] of Object.entries(CASES)) {
     test(`native gzip: ${name} -> same result as upstream's validation`, async () => {
         globalThis.CompressionStream = mutate ? corruptingCS(mutate) : RealCS
         try {
             for (const input of INPUTS) {
                 const want = await outcome(refGzipToStringAsync(input))
-                const got = await outcome(gzipToStringAsync(input, circularReferenceReplacer))
+                const got = await outcome(isLarge(input) ? gzipToStringAsync(input, circularReferenceReplacer) : nativeToString(input))
                 assert.deepEqual(got, want)
                 if (process.env.SHOW_OUTCOMES) console.log(name, got.error ? got.message : 'ok')
                 if (!mutate)assert.equal(zlib.gunzipSync(Buffer.from(got.ok, 'latin1')).toString('utf8'), JSON.stringify(input))
@@ -188,7 +193,7 @@ test('native gzip: a failing blob read (Safari 16 NotReadableError) still reject
     }
     try {
         const want = await outcome(refGzipToStringAsync({ a: 1 }))
-        const got = await outcome(gzipToStringAsync({ a: 1 }, circularReferenceReplacer))
+        const got = await outcome(nativeToString({ a: 1 }))
         assert.deepEqual(got, want)
         assert.equal(got.error, 'NotReadableError')
         assert.equal(got.native, true)
@@ -206,7 +211,7 @@ test('native gzip: a failing write rejects with the write error', async () => {
         }
     }
     try {
-        const got = await outcome(gzipToStringAsync({ a: 1 }, circularReferenceReplacer))
+        const got = await outcome(nativeToString({ a: 1 }))
         assert.equal(got.error, 'TypeError')
         assert.equal(got.native, false)
     } finally {
@@ -214,9 +219,43 @@ test('native gzip: a failing write rejects with the write error', async () => {
     }
 })
 
-test('gzipFieldAsync([]) is cached and equals a fresh compression of []', async () => {
+test('gzipFieldAsync([]) is cached and decodes to []', async () => {
     const a = await gzipFieldAsync([], circularReferenceReplacer)
     const b = await gzipFieldAsync([], circularReferenceReplacer)
     assert.equal(a, b)
-    assert.equal(a, await refGzipToStringAsync([]))
+    assert.equal(zlib.gunzipSync(Buffer.from(a, 'latin1')).toString('utf8'), '[]')
+})
+
+test('fields up to SYNC_GZIP_MAX_CHARS skip CompressionStream, larger ones use it', async () => {
+    let streams = 0
+    globalThis.CompressionStream = class extends RealCS {
+        constructor(format) {
+            super(format)
+            streams++
+        }
+    }
+    // A broken CompressionStream must not matter below the threshold either.
+    try {
+        const small = [[], { a: 1 }, [{ id: 1, text: 'héllo ✓ 😀 \ud800' }], 'x'.repeat(SYNC_GZIP_MAX_CHARS - 2)]
+        for (const input of small) {
+            const got = await gzipToStringAsync(input, circularReferenceReplacer)
+            assert.equal(zlib.gunzipSync(Buffer.from(got, 'latin1')).toString('utf8'), JSON.stringify(input))
+        }
+        assert.equal(streams, 0)
+        const large = 'x'.repeat(SYNC_GZIP_MAX_CHARS - 1) // 8193 chars serialised
+        const got = await gzipToStringAsync(large, circularReferenceReplacer)
+        assert.equal(streams, 1)
+        assert.equal(got, await refGzipToStringAsync(large))
+        globalThis.CompressionStream = corruptingCS(CASES['bad crc (first trailer byte)'])
+        const small2 = await gzipToStringAsync({ b: 2 }, circularReferenceReplacer)
+        assert.equal(zlib.gunzipSync(Buffer.from(small2, 'latin1')).toString('utf8'), '{"b":2}')
+        // Serialisation errors still reject (and are not native errors).
+        const cyclic = {}
+        cyclic.self = cyclic
+        const r = await outcome(gzipToStringAsync(cyclic, () => { throw new TypeError('no replacer') }))
+        assert.equal(r.error, 'TypeError')
+        assert.equal(r.native, false)
+    } finally {
+        globalThis.CompressionStream = RealCS
+    }
 })
