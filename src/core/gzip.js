@@ -1,11 +1,12 @@
 /**
  * @fileoverview gzip for request bodies and replay fields.
  *
- * - Synchronous gzip (RFC 1952) with an LZ77 + fixed-Huffman deflate encoder.
- *   Stands in for upstream's fflate `gzipSync`, which upstream uses for
- *   beacons, `send_instantly` captures and when CompressionStream is
- *   unavailable or failed. The output is standard gzip (any inflater decodes
- *   it); the compression ratio is lower than fflate's dynamic-Huffman output.
+ * - Synchronous gzip (RFC 1952): our own deflate encoder (lazy LZ77 matching,
+ *   dynamic or fixed Huffman or stored blocks, whichever is smallest). Stands
+ *   in for upstream's fflate `gzipSync`, which upstream uses for beacons,
+ *   `send_instantly` captures and when CompressionStream is unavailable or
+ *   failed. The bytes differ from fflate's (any inflater decodes them); the
+ *   output is a little smaller.
  * - Native gzip: posthog core gzip.ts (isGzipSupported, gzipCompress with its
  *   output validation, isNativeAsyncGzipError / isNativeAsyncGzipReadError),
  *   used by the request path and by session replay.
@@ -114,163 +115,447 @@ export function strToU8(s) {
   return ar.subarray(0, ai);
 }
 
-// Length codes 257..285: base lengths and extra bits.
-const LEN_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
-  163, 195, 227, 258];
-const LEN_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
-const DIST_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049,
-  3073, 4097, 6145, 8193, 12289, 16385, 24577];
-const DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+// ---- deflate (RFC 1951) ----------------------------------------------------------------
+//
+// LZ77 with hash chains and lazy matching, then per block the smallest of a dynamic
+// Huffman, fixed Huffman or stored encoding, computed exactly.
 
-class BitWriter {
-  /** @param {number} capacity */
-  constructor(capacity) {
-    /** @type {!Uint8Array} */
-    this.buf = new Uint8Array(capacity);
-    /** @type {number} */
-    this.pos = 0;
-    /** @private {number} */
-    this.bitBuf_ = 0;
-    /** @private {number} */
-    this.bitCount_ = 0;
-  }
+/** Order in which the code length code lengths are sent. */
+const CL_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
 
-  /** @param {number} b */
-  byte(b) {
-    if (this.pos >= this.buf.length) {
-      const next = new Uint8Array(this.buf.length * 2 + 16);
-      next.set(this.buf);
-      this.buf = next;
-    }
-    this.buf[this.pos++] = b;
-  }
-
-  /**
-   * Writes `n` bits of `value`, least significant bit first.
-   * @param {number} value
-   * @param {number} n
-   */
-  bits(value, n) {
-    this.bitBuf_ |= value << this.bitCount_;
-    this.bitCount_ += n;
-    while (this.bitCount_ >= 8) {
-      this.byte(this.bitBuf_ & 0xff);
-      this.bitBuf_ >>>= 8;
-      this.bitCount_ -= 8;
-    }
-  }
-
-  /**
-   * Writes a Huffman code (most significant bit first).
-   * @param {number} code
-   * @param {number} len
-   */
-  code(code, len) {
-    let rev = 0;
-    for (let i = 0; i < len; i++) {
-      rev = (rev << 1) | ((code >>> i) & 1);
-    }
-    this.bits(rev, len);
-  }
-
-  flushBits() {
-    if (this.bitCount_ > 0) this.byte(this.bitBuf_ & 0xff);
-    this.bitBuf_ = 0;
-    this.bitCount_ = 0;
-  }
-}
+/** Symbols (literals and matches) per block. */
+const BLOCK_SYMBOLS = 8192;
+// Match finder, tuned on test/bench/gzip.mjs: zlib level 6's good_length, a lazy match
+// search at every position (zlib's max_lazy at its maximum) and a shorter chain.
+const GOOD_LENGTH = 8;
+const MAX_CHAIN = 64;
+/** Farthest match distance (zlib's MAX_DIST: the window minus the lookahead). */
+const MAX_DIST = 32768 - 262;
 
 /**
- * @param {!BitWriter} w
- * @param {number} sym literal/length symbol 0..287
+ * @typedef {{lenBase: !Uint16Array, lenExtra: !Uint8Array, distBase: !Uint16Array,
+ *     distExtra: !Uint8Array, lenCode: !Uint8Array, distCode: !Uint8Array,
+ *     fixedLitLen: !Uint8Array, fixedLitCodes: !Uint16Array, fixedDistLen: !Uint8Array,
+ *     fixedDistCodes: !Uint16Array}}
  */
-function writeLitLen(w, sym) {
-  if (sym < 144) w.code(0x30 + sym, 8);
-  else if (sym < 256) w.code(0x190 + sym - 144, 9);
-  else if (sym < 280) w.code(sym - 256, 7);
-  else w.code(0xc0 + sym - 280, 8);
-}
+let DeflateTables;
+
+/** @type {?DeflateTables} */
+let tables = null;
 
 /**
- * @param {!BitWriter} w
- * @param {number} len 3..258
- * @param {number} dist 1..32768
+ * Tables built on first use: base value and extra bits of the length codes 257..285
+ * and the distance codes; length - 3 -> length code index (0..28); distance - 1 ->
+ * distance code (zlib's d_code: 0..255 directly, then 256 + (d >> 7)); the fixed
+ * Huffman code lengths and codes.
+ * @return {!DeflateTables}
  */
-function writeMatch(w, len, dist) {
-  let li = 28;
-  while (LEN_BASE[li] > len) li--;
-  writeLitLen(w, 257 + li);
-  if (LEN_EXTRA[li]) w.bits(len - LEN_BASE[li], LEN_EXTRA[li]);
-  let di = 29;
-  while (DIST_BASE[di] > dist) di--;
-  w.code(di, 5);
-  if (DIST_EXTRA[di]) w.bits(dist - DIST_BASE[di], DIST_EXTRA[di]);
-}
-
-/**
- * Raw deflate of `data` as a single fixed-Huffman block.
- * @param {!Uint8Array} data
- * @param {!BitWriter} w
- */
-function deflate(data, w) {
-  const WINDOW = 32768;
-  const HASH_SIZE = 1 << 15;
-  const MAX_CHAIN = 32;
-  const head = new Int32Array(HASH_SIZE);
-  const prev = new Int32Array(WINDOW);
-  for (let i = 0; i < HASH_SIZE; i++) head[i] = -1;
-  const n = data.length;
-  w.bits(1, 1); // BFINAL
-  w.bits(1, 2); // BTYPE = fixed Huffman
-  /**
-   * @param {number} i
-   * @return {number}
-   */
-  const hash = function(i) {
-    return ((data[i] << 10) ^ (data[i + 1] << 5) ^ data[i + 2]) & (HASH_SIZE - 1);
+function getTables() {
+  if (tables) return tables;
+  const lenBase = new Uint16Array(29);
+  const lenExtra = new Uint8Array(29);
+  const lenCode = new Uint8Array(256);
+  for (let c = 0, base = 3; c < 29; c++) {
+    lenExtra[c] = c < 8 || c === 28 ? 0 : (c >> 2) - 1;
+    lenBase[c] = c === 28 ? 258 : base;
+    base += 1 << lenExtra[c];
+    for (let l = lenBase[c]; l < base && l <= 258; l++) lenCode[l - 3] = c;
+  }
+  const distBase = new Uint16Array(30);
+  const distExtra = new Uint8Array(30);
+  const distCode = new Uint8Array(512);
+  for (let c = 0, base = 1; c < 30; c++) {
+    distExtra[c] = c < 4 ? 0 : (c >> 1) - 1;
+    distBase[c] = base;
+    base += 1 << distExtra[c];
+    for (let d = distBase[c] - 1; d < base - 1; d++) distCode[d < 256 ? d : 256 + (d >>> 7)] = c;
+  }
+  const fixedLitLen = new Uint8Array(288);
+  for (let i = 0; i < 288; i++) fixedLitLen[i] = i < 144 ? 8 : i < 256 ? 9 : i < 280 ? 7 : 8;
+  const fixedDistLen = new Uint8Array(30);
+  for (let i = 0; i < 30; i++) fixedDistLen[i] = 5;
+  return tables = {
+    lenBase: lenBase,
+    lenExtra: lenExtra,
+    distBase: distBase,
+    distExtra: distExtra,
+    lenCode: lenCode,
+    distCode: distCode,
+    fixedLitLen: fixedLitLen,
+    fixedLitCodes: huffmanCodes(fixedLitLen),
+    fixedDistLen: fixedDistLen,
+    fixedDistCodes: huffmanCodes(fixedDistLen),
   };
-  /** @param {number} i */
-  const insert = function(i) {
-    if (i + 2 >= n) return;
-    const h = hash(i);
-    prev[i & (WINDOW - 1)] = head[h];
-    head[h] = i;
-  };
-  let i = 0;
-  while (i < n) {
-    let bestLen = 0;
-    let bestDist = 0;
-    if (i + 2 < n) {
-      let cand = head[hash(i)];
-      let chain = MAX_CHAIN;
-      const maxLen = Math.min(258, n - i);
-      while (cand >= 0 && i - cand <= WINDOW && chain-- > 0) {
-        if (data[cand + bestLen] === data[i + bestLen]) {
-          let l = 0;
-          while (l < maxLen && data[cand + l] === data[i + l]) l++;
-          if (l > bestLen) {
-            bestLen = l;
-            bestDist = i - cand;
-            if (l === maxLen) break;
-          }
-        }
-        const p = prev[cand & (WINDOW - 1)];
-        if (p >= cand) break;
-        cand = p;
+}
+
+/**
+ * Huffman code lengths for the symbol frequencies `freq`, at most `maxBits` long
+ * (lengths over the limit are fixed like miniz's tdefl_huffman_enforce_max_code_size).
+ * With fewer than two used symbols, two codes of length 1 are returned (zlib does
+ * the same: a single code still takes a bit, and the code length code must be
+ * complete).
+ * @param {!Int32Array} freq
+ * @param {number} maxBits
+ * @return {!Uint8Array}
+ */
+function huffmanLengths(freq, maxBits) {
+  const n = freq.length;
+  const lengths = new Uint8Array(n);
+  /** @type {!Array<number>} */
+  const syms = [];
+  for (let i = 0; i < n; i++) {
+    if (freq[i]) syms.push(i);
+  }
+  const m = syms.length;
+  if (m < 2) {
+    lengths[m ? syms[0] : 1] = 1;
+    lengths[m && !syms[0] ? 1 : 0] = 1;
+    return lengths;
+  }
+  syms.sort(function(a, b) {
+    return freq[a] - freq[b] || a - b;
+  });
+  // Two-queue Huffman construction: leaves 0..m-1 (ascending weight), internal nodes
+  // m..2m-2 (created in ascending weight order).
+  const weight = new Int32Array(2 * m);
+  const parent = new Int32Array(2 * m);
+  for (let i = 0; i < m; i++) weight[i] = freq[syms[i]];
+  let leaf = 0;
+  let node = m;
+  for (let k = m; k < 2 * m - 1; k++) {
+    for (let t = 0; t < 2; t++) {
+      const x = leaf < m && (node >= k || weight[leaf] <= weight[node]) ? leaf++ : node++;
+      weight[k] += weight[x];
+      parent[x] = k;
+    }
+  }
+  // Depths, root first (a parent comes after its children); reuses `weight`.
+  const depth = weight;
+  depth[2 * m - 2] = 0;
+  for (let k = 2 * m - 3; k >= 0; k--) depth[k] = depth[parent[k]] + 1;
+  const count = new Int32Array(maxBits + 1);
+  for (let i = 0; i < m; i++) count[depth[i] < maxBits ? depth[i] : maxBits]++;
+  // Clamping made the code over-full (Kraft sum above 1); move leaves down until it fits.
+  let kraft = 0;
+  for (let b = 1; b <= maxBits; b++) kraft += count[b] << (maxBits - b);
+  for (; kraft > 1 << maxBits; kraft--) {
+    count[maxBits]--;
+    for (let b = maxBits - 1; b > 0; b--) {
+      if (count[b]) {
+        count[b]--;
+        count[b + 1] += 2;
+        break;
       }
     }
-    if (bestLen >= 3) {
-      writeMatch(w, bestLen, bestDist);
-      for (let k = 0; k < bestLen; k++) insert(i + k);
-      i += bestLen;
+  }
+  // The least frequent symbols get the longest codes.
+  let s = 0;
+  for (let b = maxBits; b > 0; b--) {
+    for (let c = count[b]; c > 0; c--) lengths[syms[s++]] = b;
+  }
+  return lengths;
+}
+
+/**
+ * Canonical Huffman codes for `lengths`, bit-reversed (deflate sends codes most
+ * significant bit first into an LSB-first stream).
+ * @param {!Uint8Array} lengths
+ * @return {!Uint16Array}
+ */
+function huffmanCodes(lengths) {
+  const n = lengths.length;
+  const count = new Uint16Array(16);
+  const next = new Uint16Array(16);
+  const codes = new Uint16Array(n);
+  for (let i = 0; i < n; i++) count[lengths[i]]++;
+  count[0] = 0;
+  for (let b = 1, code = 0; b < 16; b++) next[b] = code = (code + count[b - 1]) << 1;
+  for (let i = 0; i < n; i++) {
+    const len = lengths[i];
+    if (!len) continue;
+    let c = next[len]++;
+    let r = 0;
+    for (let k = 0; k < len; k++) {
+      r = (r << 1) | (c & 1);
+      c >>>= 1;
+    }
+    codes[i] = r;
+  }
+  return codes;
+}
+
+/**
+ * Raw deflate of `data` into the zeroed buffer `out`, starting at bit `pos`.
+ * @param {!Uint8Array} data
+ * @param {!Uint8Array} out at least data.length + 6 * ((data.length >>> 12) + 2) + 3
+ *     bytes past `pos`: no block is larger than storing it
+ * @param {number} pos
+ * @return {number} the bit position after the final block
+ */
+function deflate(data, out, pos) {
+  const t = getTables();
+  const lenCode = t.lenCode;
+  const distCode = t.distCode;
+  const lenBase = t.lenBase;
+  const lenExtra = t.lenExtra;
+  const distBase = t.distBase;
+  const distExtra = t.distExtra;
+  const n = data.length;
+  // Multiplicative hash of the next 4 bytes (3 for inputs up to 8 KB, where 3-byte
+  // matches pay off; 4 keeps the chains short in replay's cv '2024-10' strings, gzip
+  // bytes as latin1 whose UTF-8 is mostly 0xC2/0xC3 every other byte). The tables
+  // grow with the input up to the 32 KB window: no 128 KB to clear for a short event.
+  let hashBits = 9;
+  while (hashBits < 15 && 1 << hashBits < n) hashBits++;
+  const hashShift = 32 - hashBits;
+  const fourth = n > 8192 ? 255 : 0;
+  const windowMask = (1 << hashBits) - 1; // the whole input, or the 32 KB window
+  // Positions + 1 (0: none). prev links each position to the previous one with its hash.
+  const head = new Int32Array(1 << hashBits);
+  const prev = new Int32Array(1 << hashBits);
+  const syms = new Int32Array(BLOCK_SYMBOLS);
+  const litFreq = new Int32Array(286);
+  const distFreq = new Int32Array(30);
+  let nsyms = 0;
+  let blockStart = 0;
+  let emitted = 0;
+
+  /**
+   * Writes the `bits` low bits of `v` (at most 16, so that with the bit offset they
+   * fit in 3 bytes), LSB first, OR-ing into the zeroed buffer.
+   * @param {number} v
+   * @param {number} bits
+   */
+  const put = function(v, bits) {
+    const o = pos >>> 3;
+    v <<= pos & 7;
+    out[o] |= v;
+    out[o + 1] |= v >>> 8;
+    out[o + 2] |= v >>> 16;
+    pos += bits;
+  };
+
+  /** @param {number} i */
+  const insert = function(i) {
+    const h = (((data[i] | data[i + 1] << 8 | data[i + 2] << 16 | (data[i + 3] & fourth) << 24) >>> 0) * 40503) >>>
+        hashShift;
+    prev[i & windowMask] = head[h];
+    head[h] = i + 1;
+  };
+
+  /**
+   * Ends the block of symbols covering data[blockStart, emitted).
+   * @param {number} last 1 for the final block
+   */
+  const flush = function(last) {
+    litFreq[256] = 1;
+    const litLen = huffmanLengths(litFreq, 15);
+    const distLen = huffmanLengths(distFreq, 15);
+    let hlit = 286;
+    while (hlit > 257 && !litLen[hlit - 1]) hlit--;
+    let hdist = 30;
+    while (hdist > 1 && !distLen[hdist - 1]) hdist--;
+    // Code lengths, run-length encoded (16: repeat the previous 3-6 times; 17, 18:
+    // 3-10 and 11-138 zeros), as symbol | repeat count << 5.
+    const lens = new Uint8Array(hlit + hdist);
+    lens.set(litLen.subarray(0, hlit));
+    lens.set(distLen.subarray(0, hdist), hlit);
+    /** @type {!Array<number>} */
+    const rle = [];
+    const clFreq = new Int32Array(19);
+    for (let i = 0; i < lens.length;) {
+      const len = lens[i];
+      let run = 1;
+      while (i + run < lens.length && lens[i + run] === len) run++;
+      i += run;
+      if (!len) {
+        for (; run >= 11; run -= 138) {
+          rle.push(18 | ((run < 138 ? run : 138) - 11) << 5);
+          clFreq[18]++;
+        }
+        if (run >= 3) {
+          rle.push(17 | (run - 3) << 5);
+          clFreq[17]++;
+          run = 0;
+        }
+      } else {
+        rle.push(len);
+        clFreq[len]++;
+        for (run--; run >= 3; run -= 6) {
+          rle.push(16 | ((run < 6 ? run : 6) - 3) << 5);
+          clFreq[16]++;
+        }
+      }
+      for (; run > 0; run--) {
+        rle.push(len);
+        clFreq[len]++;
+      }
+    }
+    const clLen = huffmanLengths(clFreq, 7);
+    let hclen = 19;
+    while (hclen > 4 && !clLen[CL_ORDER[hclen - 1]]) hclen--;
+
+    // Exact sizes in bits of each encoding.
+    let extra = 0;
+    for (let i = 0; i < 29; i++) extra += litFreq[257 + i] * lenExtra[i];
+    for (let i = 0; i < 30; i++) extra += distFreq[i] * distExtra[i];
+    let dynamicBits = 17 + 3 * hclen + 2 * clFreq[16] + 3 * clFreq[17] + 7 * clFreq[18] + extra;
+    let fixedBits = 3 + extra;
+    for (let i = 0; i < 19; i++) dynamicBits += clFreq[i] * clLen[i];
+    for (let i = 0; i < 286; i++) {
+      dynamicBits += litFreq[i] * litLen[i];
+      fixedBits += litFreq[i] * t.fixedLitLen[i];
+    }
+    for (let i = 0; i < 30; i++) {
+      dynamicBits += distFreq[i] * distLen[i];
+      fixedBits += distFreq[i] * 5;
+    }
+    const size = emitted - blockStart;
+    const chunks = size ? Math.ceil(size / 65535) : 1;
+    // 3 header bits, padding to a byte, LEN/NLEN and the bytes; then 1 byte (3 bits
+    // and padding) + 4 per further 65535-byte chunk.
+    const storedBits = 3 + ((8 - ((pos + 3) & 7)) & 7) + 8 * size + 32 * chunks + 8 * (chunks - 1);
+
+    if (storedBits <= dynamicBits && storedBits <= fixedBits) {
+      for (let s = blockStart; ;) {
+        const e = s + 65535 < emitted ? s + 65535 : emitted;
+        put(last && e === emitted ? 1 : 0, 3);
+        pos += (8 - (pos & 7)) & 7;
+        const o = pos / 8;
+        const l = e - s;
+        out[o] = l & 255;
+        out[o + 1] = l >>> 8;
+        out[o + 2] = ~l & 255;
+        out[o + 3] = (~l >>> 8) & 255;
+        out.set(data.subarray(s, e), o + 4);
+        pos += (l + 4) * 8;
+        s = e;
+        if (s >= emitted) break;
+      }
     } else {
-      writeLitLen(w, data[i]);
+      let litCodes = t.fixedLitCodes;
+      let distCodes = t.fixedDistCodes;
+      let ll = t.fixedLitLen;
+      let dl = t.fixedDistLen;
+      if (dynamicBits < fixedBits) {
+        put(last | 4, 3);
+        put(hlit - 257, 5);
+        put(hdist - 1, 5);
+        put(hclen - 4, 4);
+        for (let i = 0; i < hclen; i++) put(clLen[CL_ORDER[i]], 3);
+        const clCodes = huffmanCodes(clLen);
+        for (let i = 0; i < rle.length; i++) {
+          const sym = rle[i] & 31;
+          put(clCodes[sym], clLen[sym]);
+          if (sym > 15) put(rle[i] >>> 5, sym === 16 ? 2 : sym === 17 ? 3 : 7);
+        }
+        litCodes = huffmanCodes(litLen);
+        distCodes = huffmanCodes(distLen);
+        ll = litLen;
+        dl = distLen;
+      } else {
+        put(last | 2, 3);
+      }
+      for (let i = 0; i < nsyms; i++) {
+        const v = syms[i];
+        if (v < 256) {
+          put(litCodes[v], ll[v]);
+          continue;
+        }
+        const len = v & 255;
+        const lc = lenCode[len];
+        put(litCodes[257 + lc], ll[257 + lc]);
+        if (lenExtra[lc]) put(len + 3 - lenBase[lc], lenExtra[lc]);
+        const d = (v >>> 8) - 1;
+        const dc = distCode[d < 256 ? d : 256 + (d >>> 7)];
+        put(distCodes[dc], dl[dc]);
+        if (distExtra[dc]) put(d + 1 - distBase[dc], distExtra[dc]);
+      }
+      put(litCodes[256], ll[256]);
+    }
+    for (let i = 0; i < 286; i++) litFreq[i] = 0;
+    for (let i = 0; i < 30; i++) distFreq[i] = 0;
+    nsyms = 0;
+    blockStart = emitted;
+  };
+
+  /** @param {number} b */
+  const literal = function(b) {
+    syms[nsyms++] = b;
+    litFreq[b]++;
+    emitted++;
+    if (nsyms === BLOCK_SYMBOLS) flush(0);
+  };
+
+  /**
+   * @param {number} len 3..258
+   * @param {number} dist 1..32768
+   */
+  const match = function(len, dist) {
+    syms[nsyms++] = (dist << 8) | (len - 3);
+    litFreq[257 + lenCode[len - 3]]++;
+    const d = dist - 1;
+    distFreq[distCode[d < 256 ? d : 256 + (d >>> 7)]]++;
+    emitted += len;
+    if (nsyms === BLOCK_SYMBOLS) flush(0);
+  };
+
+  // Lazy matching (zlib deflate_slow): a match at i is only taken if the match at
+  // i + 1 is not longer; otherwise data[i] goes out as a literal.
+  let prevLen = 2;
+  let prevDist = 0;
+  let pending = false;
+  let i = 0;
+  while (i < n) {
+    let curLen = 2;
+    let curDist = 0;
+    if (i + 2 < n) {
       insert(i);
+      const maxLen = n - i < 258 ? n - i : 258;
+      if (prevLen < maxLen) {
+        const limit = i - MAX_DIST;
+        let best = prevLen;
+        let chain = prevLen >= GOOD_LENGTH ? MAX_CHAIN >> 2 : MAX_CHAIN;
+        let cand = prev[i & windowMask] - 1;
+        while (cand >= limit && cand >= 0 && chain-- > 0) {
+          if (data[cand + best] === data[i + best] && data[cand] === data[i] && data[cand + 1] === data[i + 1]) {
+            let l = 2;
+            while (l < maxLen && data[cand + l] === data[i + l]) l++;
+            if (l > best) {
+              best = l;
+              curDist = i - cand;
+              if (l >= maxLen) break;
+            }
+          }
+          const p = prev[cand & windowMask] - 1;
+          if (p >= cand) break; // the slot was reused by a newer position
+          cand = p;
+        }
+        if (curDist) curLen = best;
+        // A 3-byte match far away costs more than its literals (zlib's TOO_FAR).
+        if (curLen === 3 && curDist > 4096) curLen = 2;
+      }
+    }
+    if (prevLen >= 3 && curLen <= prevLen) {
+      match(prevLen, prevDist);
+      const end = i - 1 + prevLen;
+      for (let k = i + 1; k < end; k++) {
+        if (k + 2 < n) insert(k);
+      }
+      i = end;
+      pending = false;
+      prevLen = 2;
+    } else {
+      if (pending) literal(data[i - 1]);
+      pending = true;
+      prevLen = curLen;
+      prevDist = curDist;
       i++;
     }
   }
-  writeLitLen(w, 256);
-  w.flushBits();
+  if (pending) literal(data[n - 1]);
+  flush(1);
+  return pos;
 }
 
 /**
@@ -280,17 +565,26 @@ function deflate(data, w) {
  * @return {!Uint8Array}
  */
 export function gzipSync(s) {
-  const data = strToU8(s);
-  const w = new BitWriter(Math.max(64, (data.length >>> 1) + 32));
-  [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3].forEach(function(b) {
-    w.byte(b);
-  });
-  deflate(data, w);
+  return gzipBytes(strToU8(s));
+}
+
+/**
+ * gzip (RFC 1952) of `data`: no name, mtime 0, OS 3 (Unix), like fflate's.
+ * @param {!Uint8Array} data
+ * @return {!Uint8Array}
+ */
+export function gzipBytes(data) {
+  const n = data.length;
+  const out = new Uint8Array(n + 6 * ((n >>> 12) + 2) + 21);
+  out[0] = 0x1f;
+  out[1] = 0x8b;
+  out[2] = 8;
+  out[9] = 3;
+  let o = (deflate(data, out, 80) + 7) >>> 3;
   const crc = crc32(data);
-  const size = data.length >>> 0;
-  for (let k = 0; k < 4; k++) w.byte((crc >>> (8 * k)) & 0xff);
-  for (let k = 0; k < 4; k++) w.byte((size >>> (8 * k)) & 0xff);
-  return w.buf.subarray(0, w.pos);
+  for (let k = 0; k < 4; k++) out[o++] = (crc >>> (8 * k)) & 0xff;
+  for (let k = 0; k < 4; k++) out[o++] = (n >>> (8 * k)) & 0xff;
+  return out.subarray(0, o);
 }
 
 // ---- native gzip (CompressionStream), posthog core gzip.ts -----------------------------
