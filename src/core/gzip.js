@@ -58,15 +58,48 @@ export function crc32(bytes) {
 }
 
 /**
- * UTF-8 encodes a string without TextEncoder (ES5 runtime).
+ * fflate strToU8(s) (0.4.x, as bundled by upstream), the UTF-8 step of
+ * upstream's sync gzip. With TextEncoder it is TextEncoder: a lone surrogate
+ * becomes U+FFFD. Without it, fflate's own loop, ported as is, including its
+ * surrogate handling: any code unit in 0xd800-0xdfff is combined with the
+ * next one (which is consumed, even a quote or a missing one: NaN & 1023 is 0)
+ * as `(0x10000 + (c & 0xffc00)) | (next & 0x3ff)`, because fflate's
+ * `c & 1023 << 10` masks with 1023 << 10. Valid pairs are mis-encoded too
+ * (U+1F600 becomes U+1DA00). It never throws, so the body is always gzipped.
  * @param {string} s
  * @return {!Uint8Array}
  */
-export function utf8Encode(s) {
-  const bin = unescape(encodeURIComponent(s));
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
+export function strToU8(s) {
+  const TE = win ? win['TextEncoder'] : undefined;
+  if (TE) return /** @type {!Uint8Array} */ (new TE()['encode'](s));
+  const l = s.length;
+  let ar = new Uint8Array(l + (l >>> 1));
+  let ai = 0;
+  for (let i = 0; i < l; ++i) {
+    if (ai + 5 > ar.length) {
+      const n = new Uint8Array(ai + 8 + ((l - i) << 1));
+      n.set(ar);
+      ar = n;
+    }
+    let c = s.charCodeAt(i);
+    if (c < 128) {
+      ar[ai++] = c;
+    } else if (c < 2048) {
+      ar[ai++] = 192 | (c >>> 6);
+      ar[ai++] = 128 | (c & 63);
+    } else if (c > 55295 && c < 57344) {
+      c = (65536 + (c & 1047552)) | (s.charCodeAt(++i) & 1023);
+      ar[ai++] = 240 | (c >>> 18);
+      ar[ai++] = 128 | ((c >>> 12) & 63);
+      ar[ai++] = 128 | ((c >>> 6) & 63);
+      ar[ai++] = 128 | (c & 63);
+    } else {
+      ar[ai++] = 224 | (c >>> 12);
+      ar[ai++] = 128 | ((c >>> 6) & 63);
+      ar[ai++] = 128 | (c & 63);
+    }
+  }
+  return ar.subarray(0, ai);
 }
 
 // Length codes 257..285: base lengths and extra bits.
@@ -229,12 +262,13 @@ function deflate(data, w) {
 }
 
 /**
- * gzip-compresses a string (UTF-8). mtime is 0, like fflate's `{mtime: 0}`.
+ * gzip-compresses a string, UTF-8 encoded like upstream's
+ * `gzipSync(strToU8(s), {mtime: 0})`.
  * @param {string} s
  * @return {!Uint8Array}
  */
 export function gzipSync(s) {
-  const data = utf8Encode(s);
+  const data = strToU8(s);
   const w = new BitWriter(Math.max(64, (data.length >>> 1) + 32));
   [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3].forEach(function(b) {
     w.byte(b);

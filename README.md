@@ -975,6 +975,8 @@ npm run test:chrome              # loads the chunks and the lazy build in real h
 node --test test/user-agent.test.mjs
 node --test test/autocapture.test.mjs   # $elements_chain, value scrubbing, RageClick
 node --test test/replay.test.mjs # session replay: status, triggers, sampling, buffering, compression
+node --test test/gzip-native.test.mjs  # native gzip validation (requests and replay), crc32 vs zlib
+node --test test/strtou8.test.mjs      # sync gzip's UTF-8 step vs fflate's strToU8
 ./scripts/build.sh && node test/diff/run.mjs [scenario ...]   # differential test vs official 1.450.0
 DIFF_BUNDLE=lazy/posthog.js node test/diff/run.mjs [scenario ...]   # the same against the lazy build
 node test/sanitizer-chrome.mjs   # html sanitiser vs real DOMPurify 3.4.13 (needs it in /tmp/dp, see the file)
@@ -1186,8 +1188,9 @@ conversations, site apps, WebMCP.
   feature-flag merging, `/flags` timing metrics (`metrics.flags`),
   `rewriteRequestPath` ingestion-endpoint tracking (the rewrite itself works).
 - Sync gzip (beacons, `send_instantly`, no CompressionStream) uses a compact
-  LZ77 + fixed-Huffman encoder instead of fflate: same decoded payload,
-  somewhat larger bodies.
+  LZ77 + fixed-Huffman encoder instead of fflate: same decoded payload
+  (the input is UTF-8 encoded by a port of fflate's `strToU8`), somewhat
+  larger bodies.
 - Compiled in vs lazy-loaded. The items below marked *(compiled-in builds)*
   apply to `posthog.full.js` and the per-module chunks, where the lazy parts
   are compiled in. The lazy build (`lazy/posthog.js`) loads them where and
@@ -1271,5 +1274,18 @@ conversations, site apps, WebMCP.
   invalid output was sent as is (or uncompressed, without a gzip header).
   Scenarios `gzip_native_bad_crc`, `gzip_native_bad_header`,
   `gzip_native_throws_once`, `gzip_native_not_readable`.
+- Lone surrogates in synchronously gzipped bodies. The sync encoder's UTF-8
+  step is now a port of fflate's `strToU8`: `TextEncoder` when present (a
+  lone surrogate becomes U+FFFD), else fflate's own loop, quirks included
+  (it combines any surrogate with the next code unit, so even valid pairs
+  come out as other code points). Before, it used `encodeURIComponent`,
+  which throws on a lone surrogate: a `send_instantly` batch went
+  uncompressed as JSON and an unload beacon batch was dropped (its base64
+  fallback throws too). This applies to engines whose `JSON.stringify`
+  leaves lone surrogates raw (before ES2019's well-formed stringify);
+  replay's sync field compression uses the same encoder. Scenario
+  `gzip_lone_surrogate` (emulates that `JSON.stringify`),
+  `test/strtou8.test.mjs` (fflate 0.4.9 outputs, with and without
+  `TextEncoder`).
 
 PostHog's original license is kept in `LICENSE.upstream`.
