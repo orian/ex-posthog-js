@@ -125,6 +125,15 @@ export default class MutationBuffer {
   private movedSet = new Set<Node>();
   private droppedSet = new Set<Node>();
   private removesSubTreeCache = new Set<Node>();
+  // Removed nodes whose subtrees have not been added to removesSubTreeCache
+  // yet. The cache only answers "is this node's parent inside a removed
+  // subtree?" during this buffer's next emission, and until then the DOM is
+  // the one the removal was processed against (processMutations ends with
+  // emit()). So instead of walking every removed subtree up front, the drain
+  // checks the parent's ancestors against these roots. If emission is
+  // deferred (frozen, locked, or it threw), the DOM may change before the
+  // next one, so the subtrees are walked then, as before.
+  private removedRoots = new Set<Node>();
 
   private mutationCb: observerParam['mutationCb'];
   private blockClass: observerParam['blockClass'];
@@ -258,6 +267,7 @@ export default class MutationBuffer {
 
   public emit = (): void => {
     if (this.frozen || this.locked) {
+      this.walkRemovedRoots();
       return;
     }
 
@@ -269,9 +279,54 @@ export default class MutationBuffer {
     try {
       this.processBufferedMutations();
     } finally {
+      // Normally consumed by processBufferedMutations; left over only if it threw.
+      this.walkRemovedRoots();
       recordMutationCost(nowMs() - startedAt, startGeneration);
     }
   };
+
+  // What processRemoves did when the removal was processed: add every node of
+  // each removed subtree (as dom.childNodes walks it) to removesSubTreeCache.
+  private walkRemovedRoots(): void {
+    if (!this.removedRoots.size) return;
+    for (const root of this.removedRoots) {
+      processRemoves(root, this.removesSubTreeCache);
+    }
+    this.removedRoots.clear();
+  }
+
+  // Whether n's parent is in removesSubTreeCache, or in the subtree of a
+  // removed root not walked yet: in the DOM this emission runs against, the
+  // nodes dom.childNodes reaches from a root are exactly the nodes whose
+  // dom.parentNode chain reaches it. `memo` caches the ancestor lookups for
+  // one emission.
+  private isParentRemoved(n: Node, memo: Map<Node, boolean>): boolean {
+    if (this.removesSubTreeCache.size === 0 && this.removedRoots.size === 0) {
+      return false;
+    }
+    const parent = dom.parentNode(n);
+    if (!parent) return false;
+    if (this.removesSubTreeCache.has(parent)) return true;
+    if (this.removedRoots.size === 0) return false;
+    const chain: Node[] = [];
+    let found = false;
+    let node: Node | null = parent;
+    while (node) {
+      const known = memo.get(node);
+      if (known !== undefined) {
+        found = known;
+        break;
+      }
+      chain.push(node);
+      if (this.removedRoots.has(node)) {
+        found = true;
+        break;
+      }
+      node = dom.parentNode(node);
+    }
+    for (const c of chain) memo.set(c, found);
+    return found;
+  }
 
   // Queued nodes can become blocked before emission. Check the current tree,
   // including each shadow host: closest()/parentElement do not cross that boundary.
@@ -351,9 +406,10 @@ export default class MutationBuffer {
 
     // Fold movedSet into addedSet so a single topological-order drain
     // handles both.
+    const removedMemo = new Map<Node, boolean>();
     for (const n of this.movedSet) {
       if (
-        isParentRemoved(this.removesSubTreeCache, n, this.mirror) &&
+        this.isParentRemoved(n, removedMemo) &&
         !this.movedSet.has(dom.parentNode(n)!)
       ) {
         continue;
@@ -365,11 +421,7 @@ export default class MutationBuffer {
     // re-walking the DOM for parentRemoved/droppedSet membership per node.
     for (const n of Array.from(this.addedSet)) {
       const inDroppedTree = isAncestorInSet(this.droppedSet, n);
-      const parentWasRemoved = isParentRemoved(
-        this.removesSubTreeCache,
-        n,
-        this.mirror,
-      );
+      const parentWasRemoved = this.isParentRemoved(n, removedMemo);
       // A node that is itself in movedSet is never dropped, even when its
       // parent chain was removed in the same batch.
       const movedExempt =
@@ -599,6 +651,7 @@ export default class MutationBuffer {
     this.movedSet = new Set<Node>();
     this.droppedSet = new Set<Node>();
     this.removesSubTreeCache = new Set<Node>();
+    this.removedRoots = new Set<Node>();
     this.movedMap = {};
 
     const selectedAttributeChanges = this.selectedAttributeChanges;
@@ -1001,7 +1054,7 @@ export default class MutationBuffer {
                   ? true
                   : undefined,
             });
-            processRemoves(n, this.removesSubTreeCache);
+            this.removedRoots.add(n);
           }
           this.mapRemoves.add(n);
         });
@@ -1105,21 +1158,6 @@ function processRemoves(n: Node, cache: Set<Node>) {
   }
 
   return;
-}
-
-function isParentRemoved(removes: Set<Node>, n: Node, mirror: Mirror): boolean {
-  if (removes.size === 0) return false;
-  return _isParentRemoved(removes, n, mirror);
-}
-
-function _isParentRemoved(
-  removes: Set<Node>,
-  n: Node,
-  _mirror: Mirror,
-): boolean {
-  const node: ParentNode | null = dom.parentNode(n);
-  if (!node) return false;
-  return removes.has(node);
 }
 
 function isAncestorInSet(set: Set<Node>, n: Node): boolean {
