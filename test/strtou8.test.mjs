@@ -1,9 +1,10 @@
 // strToU8 (src/core/gzip.js), the UTF-8 step of the sync gzip encoder (beacons,
-// send_instantly, no CompressionStream, replay's unload drain), must produce the bytes
-// upstream's fflate strToU8 produces: TextEncoder's output when TextEncoder exists, else
-// fflate's own loop with its surrogate quirks. Checked against expected outputs recorded
-// from fflate 0.4.9 (the version upstream 1.450.0 bundles) and against a reference copy of
-// its loop.
+// send_instantly, no CompressionStream, replay's unload drain), must produce correct
+// WHATWG UTF-8, byte for byte what TextEncoder produces, on both paths: with TextEncoder,
+// and with our fallback loop when TextEncoder is missing. With TextEncoder this equals
+// upstream's fflate strToU8 (checked against outputs recorded from fflate 0.4.9). Without
+// it, fflate mis-encodes surrogates; we deliberately send correct UTF-8 instead (the
+// recorded fflate outputs document that difference).
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import zlib from 'node:zlib'
@@ -69,13 +70,15 @@ const VECTORS = [
         withTE: '7b226b223a22f09f9880efbfbd227d', withoutTE: '7b226b223a22f09da880f09da0a27d' },
 ]
 
-test('strToU8 matches fflate 0.4.9 outputs, with and without TextEncoder', () => {
+test('strToU8 gives TextEncoder bytes on both paths; fflate matches only with TextEncoder', () => {
     for (const v of VECTORS) {
         const s = fromUnits(v.units)
         assert.equal(hex(strToU8(s)), v.withTE, `with TextEncoder: ${v.units}`)
         assert.equal(hex(fflateStrToU8(s)), v.withTE, `reference, with TextEncoder: ${v.units}`)
         withoutTextEncoder(() => {
-            assert.equal(hex(strToU8(s)), v.withoutTE, `without TextEncoder: ${v.units}`)
+            // Ours: correct UTF-8, identical to the TextEncoder path.
+            assert.equal(hex(strToU8(s)), v.withTE, `without TextEncoder: ${v.units}`)
+            // fflate's loop (what upstream sends there) still matches the recorded quirky bytes.
             assert.equal(hex(fflateStrToU8(s)), v.withoutTE, `reference, without TextEncoder: ${v.units}`)
         })
     }
@@ -107,25 +110,52 @@ function randomString(r, n) {
     return String.fromCharCode(...units)
 }
 
-test('strToU8 equals fflate strToU8 on random strings (both paths), including buffer growth', () => {
+test('fallback loop: same size as fflate on well-formed text; lone surrogates keep the next character', () => {
+    const r = rng(11)
+    // Well-formed text from random code points (ASCII, 2-byte, 3-byte, astral).
+    const point = () => {
+        const k = r()
+        if (k < 0.4) return Math.floor(r() * 128)
+        if (k < 0.55) return 128 + Math.floor(r() * (2048 - 128))
+        if (k < 0.75) return 2048 + Math.floor(r() * (0xd800 - 2048))
+        return 0x10000 + Math.floor(r() * 0x100000)
+    }
+    for (let k = 0; k < 2000; k++) {
+        const s = String.fromCodePoint(...Array.from({ length: Math.floor(r() * 200) }, point))
+        // fflate's surrogate path is only wrong in the code point it produces, not its length.
+        withoutTextEncoder(() => assert.equal(strToU8(s).length, fflateStrToU8(s).length))
+    }
+    // A lone surrogate costs U+FFFD (3 bytes) but no longer swallows what follows it:
+    // fflate turns '\ud800"' into one 4-byte sequence (the quote is lost), we keep the quote.
+    withoutTextEncoder(() => {
+        assert.equal(hex(strToU8('\ud800"')), 'efbfbd22')
+        assert.equal(fflateStrToU8('\ud800"').length, 4)
+    })
+})
+
+test('strToU8 equals TextEncoder on random strings (both paths), including buffer growth', () => {
     const r = rng(7)
+    const te = new TextEncoder()
     for (let k = 0; k < 3000; k++) {
         const s = randomString(r, Math.floor(r() * (k < 2900 ? 64 : 5000)))
-        assert.equal(hex(strToU8(s)), hex(fflateStrToU8(s)))
-        withoutTextEncoder(() => assert.equal(hex(strToU8(s)), hex(fflateStrToU8(s))))
+        const expected = hex(te.encode(s))
+        assert.equal(hex(strToU8(s)), expected)
+        assert.equal(hex(fflateStrToU8(s)), expected) // upstream, with TextEncoder
+        withoutTextEncoder(() => assert.equal(hex(strToU8(s)), expected))
     }
 })
 
 test('gzipSync never throws on lone surrogates and gunzips to strToU8 bytes', () => {
     const s = JSON.stringify({ a: 'x'.repeat(300) }).slice(0, -1) + ',"b":"a\ud800b\udc00😀\ud83d"}'
     assert.equal(hex(zlib.gunzipSync(Buffer.from(gzipSync(s)))), hex(new TextEncoder().encode(s)))
+    const expected = hex(new TextEncoder().encode(s))
     withoutTextEncoder(() => {
         const gz = gzipSync(s)
-        assert.equal(hex(zlib.gunzipSync(Buffer.from(gz))), hex(fflateStrToU8(s)))
+        assert.equal(hex(zlib.gunzipSync(Buffer.from(gz))), expected)
     })
 })
 
-test("replay's sync field compression (gzipToString) encodes lone surrogates like fflate", () => {
+test("replay's sync field compression (gzipToString) encodes lone surrogates as correct UTF-8", () => {
     // Pre-ES2019 engines leave lone surrogates raw in JSON.stringify's output.
     const nativeStringify = JSON.stringify
     JSON.stringify = function () {

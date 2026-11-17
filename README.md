@@ -1183,6 +1183,16 @@ conversations, site apps, WebMCP.
 
 **Known differences from upstream**
 
+- **Intentional:** in browsers without `TextEncoder`, the sync gzip path
+  (beacons, `send_instantly`, no CompressionStream, replay's unload drain)
+  sends correct UTF-8. Upstream's fflate `strToU8` mis-encodes surrogates
+  there: it merges any surrogate with the next code unit, so emoji arrive as
+  wrong code points (U+1F600 as U+1DA00) and a lone surrogate swallows the
+  character after it (e.g. a closing quote). Ours produces exactly what
+  `TextEncoder` would: same length as fflate for well-formed text; a lone
+  surrogate becomes U+FFFD and the next character is kept, so that case can be
+  up to 2 bytes longer. With `TextEncoder` (every current browser) both SDKs
+  send identical bytes. `test/strtou8.test.mjs` covers both paths.
 - Not ported (opt-in upstream, off by default): `split_storage`,
   `cookieWinsOnConflict` cross-subdomain identity reconciliation, cross-tab
   feature-flag merging, `/flags` timing metrics (`metrics.flags`),
@@ -1274,21 +1284,15 @@ conversations, site apps, WebMCP.
   invalid output was sent as is (or uncompressed, without a gzip header).
   Scenarios `gzip_native_bad_crc`, `gzip_native_bad_header`,
   `gzip_native_throws_once`, `gzip_native_not_readable`.
-- Lone surrogates in synchronously gzipped bodies. The sync encoder's UTF-8
-  step is now a port of fflate's `strToU8`: `TextEncoder` when present (a
-  lone surrogate becomes U+FFFD), else fflate's own loop, quirks included
-  (it combines any surrogate with the next code unit, so even valid pairs
-  come out as other code points). Before, it used `encodeURIComponent`,
-  which throws on a lone surrogate: a `send_instantly` batch went
-  uncompressed as JSON and an unload beacon batch was dropped (its base64
-  fallback throws too). This applies to engines whose `JSON.stringify`
-  leaves lone surrogates raw (before ES2019's well-formed stringify);
-  replay's sync field compression uses the same encoder. Scenario
-  `gzip_lone_surrogate` (emulates that `JSON.stringify`),
-  `test/strtou8.test.mjs` (fflate 0.4.9 outputs, with and without
-  `TextEncoder`).
-  Copying fflate's mis-encoding on the no-`TextEncoder` path is deliberate:
-  the server receives exactly the bytes upstream would send. Don't "fix" it
-  to correct UTF-8 without making it a documented difference.
+- Lone surrogates in synchronously gzipped bodies. Before, the sync
+  encoder's UTF-8 step used `encodeURIComponent`, which throws on a lone
+  surrogate: a `send_instantly` batch went uncompressed as JSON and an unload
+  beacon batch was dropped (its base64 fallback throws too). Now it never
+  throws and encodes like `TextEncoder` (identical to upstream wherever
+  `TextEncoder` exists; see the intentional difference above for browsers
+  without it). This applies to engines whose `JSON.stringify` leaves lone
+  surrogates raw (before ES2019's well-formed stringify); replay's sync field
+  compression uses the same encoder. Scenario `gzip_lone_surrogate` (emulates
+  that `JSON.stringify`), `test/strtou8.test.mjs`.
 
 PostHog's original license is kept in `LICENSE.upstream`.

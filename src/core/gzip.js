@@ -58,14 +58,16 @@ export function crc32(bytes) {
 }
 
 /**
- * fflate strToU8(s) (0.4.x, as bundled by upstream), the UTF-8 step of
- * upstream's sync gzip. With TextEncoder it is TextEncoder: a lone surrogate
- * becomes U+FFFD. Without it, fflate's own loop, ported as is, including its
- * surrogate handling: any code unit in 0xd800-0xdfff is combined with the
- * next one (which is consumed, even a quote or a missing one: NaN & 1023 is 0)
- * as `(0x10000 + (c & 0xffc00)) | (next & 0x3ff)`, because fflate's
- * `c & 1023 << 10` masks with 1023 << 10. Valid pairs are mis-encoded too
- * (U+1F600 becomes U+1DA00). It never throws, so the body is always gzipped.
+ * UTF-8 encoding for the sync gzip path. Uses TextEncoder when present; the
+ * fallback loop produces exactly the same bytes (WHATWG UTF-8: surrogate
+ * pairs become 4-byte sequences, a lone surrogate becomes U+FFFD, EF BF BD).
+ *
+ * Deliberate difference from upstream: upstream calls fflate's strToU8, whose
+ * no-TextEncoder loop mis-encodes surrogates (`c & 1023 << 10` masks with
+ * 1023 << 10, so it merges any surrogate with the next code unit, consuming
+ * it even when it is a quote: U+1F600 becomes U+1DA00, a lone surrogate eats
+ * the next character). We send correct UTF-8 instead; it is never longer.
+ * It never throws, so the body is always gzipped.
  * @param {string} s
  * @return {!Uint8Array}
  */
@@ -87,12 +89,22 @@ export function strToU8(s) {
     } else if (c < 2048) {
       ar[ai++] = 192 | (c >>> 6);
       ar[ai++] = 128 | (c & 63);
-    } else if (c > 55295 && c < 57344) {
-      c = (65536 + (c & 1047552)) | (s.charCodeAt(++i) & 1023);
-      ar[ai++] = 240 | (c >>> 18);
-      ar[ai++] = 128 | ((c >>> 12) & 63);
-      ar[ai++] = 128 | ((c >>> 6) & 63);
-      ar[ai++] = 128 | (c & 63);
+    } else if (c >= 0xd800 && c <= 0xdfff) {
+      const next = i + 1 < l ? s.charCodeAt(i + 1) : 0;
+      if (c <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
+        // Valid pair: one 4-byte sequence.
+        c = 0x10000 + ((c - 0xd800) << 10) + (next - 0xdc00);
+        i++;
+        ar[ai++] = 240 | (c >>> 18);
+        ar[ai++] = 128 | ((c >>> 12) & 63);
+        ar[ai++] = 128 | ((c >>> 6) & 63);
+        ar[ai++] = 128 | (c & 63);
+      } else {
+        // Lone surrogate: U+FFFD, like TextEncoder; the next unit is kept.
+        ar[ai++] = 0xef;
+        ar[ai++] = 0xbf;
+        ar[ai++] = 0xbd;
+      }
     } else {
       ar[ai++] = 224 | (c >>> 12);
       ar[ai++] = 128 | ((c >>> 6) & 63);
