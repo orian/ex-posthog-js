@@ -1287,5 +1287,8 @@ conversations, site apps, WebMCP.
   `gzip_lone_surrogate` (emulates that `JSON.stringify`),
   `test/strtou8.test.mjs` (fflate 0.4.9 outputs, with and without
   `TextEncoder`).
+  Copying fflate's mis-encoding on the no-`TextEncoder` path is deliberate:
+  the server receives exactly the bytes upstream would send. Don't "fix" it
+  to correct UTF-8 without making it a documented difference.
 
 PostHog's original license is kept in `LICENSE.upstream`.
