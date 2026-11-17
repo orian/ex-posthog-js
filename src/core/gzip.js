@@ -58,6 +58,11 @@ export function crc32(bytes) {
   return (crc ^ -1) >>> 0;
 }
 
+/** The TextEncoder strToU8 reuses, and the constructor it came from. */
+let encoder = null;
+/** @type {*} */
+let encoderClass = null;
+
 /**
  * UTF-8 encoding for the sync gzip path. Uses TextEncoder when present; the
  * fallback loop produces exactly the same bytes (WHATWG UTF-8: surrogate
@@ -74,7 +79,13 @@ export function crc32(bytes) {
  */
 export function strToU8(s) {
   const TE = win ? win['TextEncoder'] : undefined;
-  if (TE) return /** @type {!Uint8Array} */ (new TE()['encode'](s));
+  if (TE) {
+    if (TE !== encoderClass) {
+      encoderClass = TE;
+      encoder = new TE();
+    }
+    return /** @type {!Uint8Array} */ (encoder['encode'](s));
+  }
   const l = s.length;
   let ar = new Uint8Array(l + (l >>> 1));
   let ai = 0;
@@ -122,6 +133,9 @@ export function strToU8(s) {
 
 /** Order in which the code length code lengths are sent. */
 const CL_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+
+/** Shell sort gaps (Ciura) for sorting up to 288 symbols. */
+const SHELL_GAPS = [132, 57, 23, 10, 4, 1];
 
 /** Symbols (literals and matches) per block. */
 const BLOCK_SYMBOLS = 8192;
@@ -196,25 +210,36 @@ function getTables() {
  * complete).
  * @param {!Int32Array} freq
  * @param {number} maxBits
+ * @param {!Int32Array} scratch at least 288 entries
  * @return {!Uint8Array}
  */
-function huffmanLengths(freq, maxBits) {
+function huffmanLengths(freq, maxBits, scratch) {
   const n = freq.length;
   const lengths = new Uint8Array(n);
-  /** @type {!Array<number>} */
-  const syms = [];
+  // Used symbols sorted by (frequency, symbol), as frequency << 9 | symbol (frequencies
+  // stay below 2^22: a block has 8192 symbols). Shell sort (Ciura's gaps): at most 286
+  // keys, no comparator calls, no allocation.
+  const syms = scratch;
+  let m = 0;
   for (let i = 0; i < n; i++) {
-    if (freq[i]) syms.push(i);
+    if (freq[i]) syms[m++] = freq[i] << 9 | i;
   }
-  const m = syms.length;
+  for (let g = 0; g < 6; g++) {
+    const gap = SHELL_GAPS[g];
+    for (let i = gap; i < m; i++) {
+      const key = syms[i];
+      let j = i;
+      for (; j >= gap && syms[j - gap] > key; j -= gap) syms[j] = syms[j - gap];
+      syms[j] = key;
+    }
+  }
   if (m < 2) {
-    lengths[m ? syms[0] : 1] = 1;
-    lengths[m && !syms[0] ? 1 : 0] = 1;
+    const only = m ? syms[0] & 511 : 0;
+    lengths[m ? only : 1] = 1;
+    lengths[m && !only ? 1 : 0] = 1;
     return lengths;
   }
-  syms.sort(function(a, b) {
-    return freq[a] - freq[b] || a - b;
-  });
+  for (let i = 0; i < m; i++) syms[i] &= 511;
   // Two-queue Huffman construction: leaves 0..m-1 (ascending weight), internal nodes
   // m..2m-2 (created in ascending weight order).
   const weight = new Int32Array(2 * m);
@@ -284,15 +309,113 @@ function huffmanCodes(lengths) {
   return codes;
 }
 
+// ---- encoder state, reused between calls ----------------------------------------------
+//
+// Allocating and zeroing the match finder's tables and the symbol buffer cost more than
+// compressing a short replay field. They are kept between calls instead:
+// - head/prev hold positions as `base + i + 1`; every call moves `base` past the values
+//   the previous one stored, so older entries read as "no position" (<= base) and the
+//   tables never need clearing (they are reallocated when `base` nears 2^31);
+// - the output buffer is written through a bit accumulator, so it needs no zeroing
+//   either; the result is copied out of it.
+// The calls are synchronous and run no outside code, so they cannot interleave; a call
+// that throws midway leaves nothing a later call reads (it reserved its range of `base`
+// first). Memory: up to 2 x 128 KB of hash tables (32 KB window), 32 KB of symbols and a
+// 64 KB output buffer. Tables above 16 KB each (inputs over 4 KB) and the output buffer
+// are dropped by the next call that does not need them once none has for RELEASE_MS:
+// they only grow on large inputs (unload beacons, replay batches), which come rarely.
+
+/** Hash table sizes (log2) kept indefinitely: 4096 entries, 16 KB each. */
+const SMALL_HASH_BITS = 12;
+/** Largest output buffer kept between calls. */
+const KEEP_OUT_BYTES = 65536;
+/** Idle time after which large buffers are dropped (checked by the next call). */
+const RELEASE_MS = 10000;
+
 /**
- * Raw deflate of `data` into the zeroed buffer `out`, starting at bit `pos`.
+ * @typedef {{head: !Int32Array, prev: !Int32Array, bits: number, base: number,
+ *     syms: !Int32Array, litFreq: !Int32Array, distFreq: !Int32Array, sort: !Int32Array,
+ *     out: ?Uint8Array, lastLarge: number}}
+ */
+let EncoderState;
+
+/** @type {?EncoderState} */
+let state = null;
+
+/**
+ * Tests only (unused in the builds, so compiled out): the reused state, or null.
+ * @return {?EncoderState}
+ */
+export function encoderStateForTest() {
+  return state;
+}
+
+/**
+ * The reused encoder state, with hash tables of at least 2^bits entries and room in
+ * `base` for `n` more positions.
+ * @param {number} bits
+ * @param {number} n
+ * @return {!EncoderState}
+ */
+function getState(bits, n) {
+  let st = state;
+  if (!st) {
+    st = state = {
+      head: new Int32Array(1 << SMALL_HASH_BITS),
+      prev: new Int32Array(1 << SMALL_HASH_BITS),
+      bits: SMALL_HASH_BITS,
+      base: 0,
+      syms: new Int32Array(BLOCK_SYMBOLS),
+      litFreq: new Int32Array(286),
+      distFreq: new Int32Array(30),
+      sort: new Int32Array(288),
+      out: null,
+      lastLarge: 0,
+    };
+  }
+  const now = Date.now();
+  if (bits > SMALL_HASH_BITS || n > KEEP_OUT_BYTES / 2) {
+    st.lastLarge = now;
+  } else if (now - st.lastLarge > RELEASE_MS) {
+    if (st.bits > SMALL_HASH_BITS) {
+      st.head = new Int32Array(1 << SMALL_HASH_BITS);
+      st.prev = new Int32Array(1 << SMALL_HASH_BITS);
+      st.bits = SMALL_HASH_BITS;
+      st.base = 0;
+    }
+    if (st.out && st.out.length > 4096) st.out = null;
+  }
+  if (bits > st.bits || st.base + n + 1 > 0x3fffffff) {
+    if (bits > st.bits) st.bits = bits;
+    st.head = new Int32Array(1 << st.bits);
+    st.prev = new Int32Array(1 << st.bits);
+    st.base = 0;
+  }
+  return st;
+}
+
+/**
+ * The part of the hash tables an input uses: it grows with the input up to the 32 KB
+ * window.
+ * @param {number} n input length
+ * @return {number} log2 of the table size, 9..15
+ */
+function hashBitsFor(n) {
+  let bits = 9;
+  while (bits < 15 && 1 << bits < n) bits++;
+  return bits;
+}
+
+/**
+ * Raw deflate of `data` into `out` from byte `o`.
  * @param {!Uint8Array} data
  * @param {!Uint8Array} out at least data.length + 6 * ((data.length >>> 12) + 2) + 3
- *     bytes past `pos`: no block is larger than storing it
- * @param {number} pos
- * @return {number} the bit position after the final block
+ *     bytes past `o`: no block is larger than storing it
+ * @param {number} o
+ * @param {!EncoderState} st from getState(hashBitsFor(data.length), data.length)
+ * @return {number} the byte position after the final block
  */
-function deflate(data, out, pos) {
+function deflate(data, out, o, st) {
   const t = getTables();
   const lenCode = t.lenCode;
   const distCode = t.distCode;
@@ -303,36 +426,43 @@ function deflate(data, out, pos) {
   const n = data.length;
   // Multiplicative hash of the next 4 bytes (3 for inputs up to 8 KB, where 3-byte
   // matches pay off; 4 keeps the chains short in replay's cv '2024-10' strings, gzip
-  // bytes as latin1 whose UTF-8 is mostly 0xC2/0xC3 every other byte). The tables
-  // grow with the input up to the 32 KB window: no 128 KB to clear for a short event.
-  let hashBits = 9;
-  while (hashBits < 15 && 1 << hashBits < n) hashBits++;
+  // bytes as latin1 whose UTF-8 is mostly 0xC2/0xC3 every other byte).
+  const hashBits = hashBitsFor(n);
   const hashShift = 32 - hashBits;
   const fourth = n > 8192 ? 255 : 0;
   const windowMask = (1 << hashBits) - 1; // the whole input, or the 32 KB window
-  // Positions + 1 (0: none). prev links each position to the previous one with its hash.
-  const head = new Int32Array(1 << hashBits);
-  const prev = new Int32Array(1 << hashBits);
-  const syms = new Int32Array(BLOCK_SYMBOLS);
-  const litFreq = new Int32Array(286);
-  const distFreq = new Int32Array(30);
+  // Positions as base + i + 1 (<= base: none, from an earlier call). prev links each
+  // position to the previous one with its hash.
+  const head = st.head;
+  const prev = st.prev;
+  const base = st.base;
+  st.base = base + n;
+  const unset = ~base; // -base - 1, as an int: head/prev value + unset = position (negative: none)
+  const syms = st.syms;
+  const litFreq = st.litFreq;
+  const distFreq = st.distFreq;
+  for (let i = 0; i < 286; i++) litFreq[i] = 0;
+  for (let i = 0; i < 30; i++) distFreq[i] = 0;
   let nsyms = 0;
   let blockStart = 0;
   let emitted = 0;
+  // Bit accumulator: `bc` pending bits (fewer than 8 between writes) in `bb`, LSB first.
+  let bb = 0;
+  let bc = 0;
 
   /**
-   * Writes the `bits` low bits of `v` (at most 16, so that with the bit offset they
-   * fit in 3 bytes), LSB first, OR-ing into the zeroed buffer.
+   * Writes the `bits` low bits of `v` (at most 16), LSB first.
    * @param {number} v
    * @param {number} bits
    */
   const put = function(v, bits) {
-    const o = pos >>> 3;
-    v <<= pos & 7;
-    out[o] |= v;
-    out[o + 1] |= v >>> 8;
-    out[o + 2] |= v >>> 16;
-    pos += bits;
+    bb |= v << bc;
+    bc += bits;
+    while (bc >= 8) {
+      out[o++] = bb;
+      bb >>>= 8;
+      bc -= 8;
+    }
   };
 
   /** @param {number} i */
@@ -340,7 +470,7 @@ function deflate(data, out, pos) {
     const h = (((data[i] | data[i + 1] << 8 | data[i + 2] << 16 | (data[i + 3] & fourth) << 24) >>> 0) * 40503) >>>
         hashShift;
     prev[i & windowMask] = head[h];
-    head[h] = i + 1;
+    head[h] = base + i + 1;
   };
 
   /**
@@ -349,8 +479,8 @@ function deflate(data, out, pos) {
    */
   const flush = function(last) {
     litFreq[256] = 1;
-    const litLen = huffmanLengths(litFreq, 15);
-    const distLen = huffmanLengths(distFreq, 15);
+    const litLen = huffmanLengths(litFreq, 15, st.sort);
+    const distLen = huffmanLengths(distFreq, 15, st.sort);
     let hlit = 286;
     while (hlit > 257 && !litLen[hlit - 1]) hlit--;
     let hdist = 30;
@@ -391,7 +521,7 @@ function deflate(data, out, pos) {
         clFreq[len]++;
       }
     }
-    const clLen = huffmanLengths(clFreq, 7);
+    const clLen = huffmanLengths(clFreq, 7, st.sort);
     let hclen = 19;
     while (hclen > 4 && !clLen[CL_ORDER[hclen - 1]]) hclen--;
 
@@ -414,21 +544,21 @@ function deflate(data, out, pos) {
     const chunks = size ? Math.ceil(size / 65535) : 1;
     // 3 header bits, padding to a byte, LEN/NLEN and the bytes; then 1 byte (3 bits
     // and padding) + 4 per further 65535-byte chunk.
-    const storedBits = 3 + ((8 - ((pos + 3) & 7)) & 7) + 8 * size + 32 * chunks + 8 * (chunks - 1);
+    const storedBits = 3 + ((8 - ((bc + 3) & 7)) & 7) + 8 * size + 32 * chunks + 8 * (chunks - 1);
 
     if (storedBits <= dynamicBits && storedBits <= fixedBits) {
       for (let s = blockStart; ;) {
         const e = s + 65535 < emitted ? s + 65535 : emitted;
         put(last && e === emitted ? 1 : 0, 3);
-        pos += (8 - (pos & 7)) & 7;
-        const o = pos / 8;
+        if (bc) out[o++] = bb;
+        bb = bc = 0;
         const l = e - s;
         out[o] = l & 255;
         out[o + 1] = l >>> 8;
         out[o + 2] = ~l & 255;
         out[o + 3] = (~l >>> 8) & 255;
         out.set(data.subarray(s, e), o + 4);
-        pos += (l + 4) * 8;
+        o += l + 4;
         s = e;
         if (s >= emitted) break;
       }
@@ -516,7 +646,7 @@ function deflate(data, out, pos) {
         const limit = i - MAX_DIST;
         let best = prevLen;
         let chain = prevLen >= GOOD_LENGTH ? MAX_CHAIN >> 2 : MAX_CHAIN;
-        let cand = prev[i & windowMask] - 1;
+        let cand = prev[i & windowMask] + unset;
         while (cand >= limit && cand >= 0 && chain-- > 0) {
           if (data[cand + best] === data[i + best] && data[cand] === data[i] && data[cand + 1] === data[i + 1]) {
             let l = 2;
@@ -527,7 +657,7 @@ function deflate(data, out, pos) {
               if (l >= maxLen) break;
             }
           }
-          const p = prev[cand & windowMask] - 1;
+          const p = prev[cand & windowMask] + unset;
           if (p >= cand) break; // the slot was reused by a newer position
           cand = p;
         }
@@ -555,7 +685,8 @@ function deflate(data, out, pos) {
   }
   if (pending) literal(data[n - 1]);
   flush(1);
-  return pos;
+  if (bc) out[o++] = bb;
+  return o;
 }
 
 /**
@@ -571,20 +702,31 @@ export function gzipSync(s) {
 /**
  * gzip (RFC 1952) of `data`: no name, mtime 0, OS 3 (Unix), like fflate's.
  * @param {!Uint8Array} data
- * @return {!Uint8Array}
+ * @return {!Uint8Array} a new array, or for large inputs a view of one
  */
 export function gzipBytes(data) {
   const n = data.length;
-  const out = new Uint8Array(n + 6 * ((n >>> 12) + 2) + 21);
+  const cap = n + 6 * ((n >>> 12) + 2) + 21;
+  // Small outputs are written to the kept buffer and copied out; large ones get their
+  // own buffer, returned as a view.
+  const keep = cap <= KEEP_OUT_BYTES;
+  const st = getState(hashBitsFor(n), n);
+  let out = keep ? st.out : null;
+  if (!out || out.length < cap) out = new Uint8Array(keep && cap < 4096 ? 4096 : cap);
   out[0] = 0x1f;
   out[1] = 0x8b;
   out[2] = 8;
+  for (let k = 3; k < 9; k++) out[k] = 0;
   out[9] = 3;
-  let o = (deflate(data, out, 80) + 7) >>> 3;
+  let o = deflate(data, out, 10, st);
+  if (keep) st.out = out;
   const crc = crc32(data);
   for (let k = 0; k < 4; k++) out[o++] = (crc >>> (8 * k)) & 0xff;
   for (let k = 0; k < 4; k++) out[o++] = (n >>> (8 * k)) & 0xff;
-  return out.subarray(0, o);
+  if (!keep) return out.subarray(0, o);
+  const result = new Uint8Array(o);
+  result.set(out.subarray(0, o));
+  return result;
 }
 
 // ---- native gzip (CompressionStream), posthog core gzip.ts -----------------------------

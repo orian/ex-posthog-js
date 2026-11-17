@@ -10,7 +10,7 @@ import { loadCorpus } from './bench/gzip-corpus.mjs'
 import * as fflate from './third_party/fflate-0.4.9/browser.js'
 
 globalThis.window = globalThis
-const { gzipSync, gzipBytes } = await import('../src/core/gzip.js')
+const { gzipSync, gzipBytes, encoderStateForTest } = await import('../src/core/gzip.js')
 
 /** Seeded PRNG (mulberry32) so failures reproduce. */
 function rng(seed) {
@@ -180,4 +180,109 @@ test('output is deterministic and independent of earlier calls', () => {
     gzipSync('x'.repeat(100000))
     gzipBytes(randomBytes(rng(5), 70000))
     assert.ok(first.equals(Buffer.from(gzipSync(c.text))))
+})
+
+// ---- reused encoder state (hash tables, symbol and output buffers kept between calls) ----
+
+// A second copy of the module: its own state, so its outputs come from a different history.
+const other = await import('../src/core/gzip.js?second-instance')
+
+/** Inputs of every size class, from the corpus, random and repetitive. */
+function mixedInputs() {
+    const r = rng(2024)
+    const xs = loadCorpus().map((c) => enc(c.text))
+    for (const n of [0, 1, 2, 3, 50, 300, 4095, 4096, 4097, 8192, 8193, 32768, 70000]) {
+        xs.push(randomBytes(r, n))
+        xs.push(enc('{"a":[1,2,3],"b":"text"}'.repeat(Math.ceil(n / 24)).slice(0, n)))
+    }
+    return xs
+}
+
+test('reuse: interleaved calls give the same bytes whatever came before', () => {
+    const xs = mixedInputs()
+    const forward = xs.map((b) => Buffer.from(gzipBytes(b)))
+    const backward = xs.slice().reverse().map((b) => Buffer.from(other.gzipBytes(b))).reverse()
+    xs.forEach((b, i) => {
+        assert.ok(forward[i].equals(backward[i]), `input ${i} (${b.length} bytes)`)
+        check(forward[i], b, `input ${i}`)
+    })
+    // Shuffled, the same input several times in a row and again later.
+    const r = rng(77)
+    for (let k = 0; k < 200; k++) {
+        const i = (r() * xs.length) | 0
+        assert.ok(Buffer.from(gzipBytes(xs[i])).equals(forward[i]), `shuffled ${k}: input ${i}`)
+    }
+})
+
+test('reuse: a large call followed by small ones', () => {
+    const small = [enc('[]'), enc('[{"id":12,"value":"hello"}]'), randomBytes(rng(1), 700), enc('x'.repeat(5000))]
+    const fresh = small.map((b) => Buffer.from(other.gzipBytes(b)))
+    for (const big of [enc('y'.repeat(2e6)), randomBytes(rng(9), 300000), enc(loadCorpus().pop().text)]) {
+        check(gzipBytes(big), big, `big ${big.length}`)
+        small.forEach((b, i) => assert.ok(Buffer.from(gzipBytes(b)).equals(fresh[i]), `small ${i} after ${big.length}`))
+    }
+})
+
+test('reuse: results never alias the kept output buffer', () => {
+    const a = gzipSync('first '.repeat(50))
+    const copy = Buffer.from(a)
+    const b = gzipSync('second, different and longer '.repeat(80))
+    assert.ok(Buffer.from(a).equals(copy), 'first result unchanged by the second call')
+    assert.notEqual(a.buffer, b.buffer)
+    check(a, enc('first '.repeat(50)))
+})
+
+test('reuse: an error midway through a call does not affect later calls', () => {
+    const xs = mixedInputs()
+    const expected = xs.map((b) => Buffer.from(other.gzipBytes(b)))
+    for (const failAt of [10, 3000, 40000, 900000]) {
+        const real = enc(loadCorpus().pop().text) // > 1 MB
+        let reads = 0
+        // Indexed reads throw after `failAt` of them: the encoder stops in the middle.
+        const failing = new Proxy(real, {
+            get(target, key) {
+                if (typeof key === 'string' && /^\d+$/.test(key) && ++reads > failAt) throw new Error('read failed')
+                const v = Reflect.get(target, key)
+                return typeof v === 'function' ? v.bind(target) : v
+            },
+        })
+        assert.throws(() => gzipBytes(failing), /read failed/)
+        xs.forEach((b, i) => assert.ok(Buffer.from(gzipBytes(b)).equals(expected[i]), `input ${i} after failing at ${failAt}`))
+    }
+})
+
+test('reuse: position offsets wrap without stale matches', () => {
+    const b = enc(loadCorpus().find((x) => x.name === '$snapshot medium (raw)').text)
+    const expected = Buffer.from(other.gzipBytes(b))
+    gzipBytes(b)
+    const st = encoderStateForTest()
+    st.base = 0x3fffffff - 10 // the next call must start from cleared tables
+    assert.ok(Buffer.from(gzipBytes(b)).equals(expected))
+    assert.equal(encoderStateForTest().base, b.length)
+    assert.ok(Buffer.from(gzipBytes(b)).equals(expected))
+})
+
+test('reuse: large buffers are released after an idle period', () => {
+    const realNow = Date.now
+    let now = realNow()
+    Date.now = () => now
+    try {
+        const st = () => encoderStateForTest()
+        gzipBytes(randomBytes(rng(4), 50000))
+        assert.equal(st().bits, 15)
+        now += 5000
+        gzipSync('{"small":true}')
+        assert.equal(st().bits, 15, 'kept while large calls are recent')
+        now += 11000
+        const small = gzipSync('{"small":true}')
+        assert.equal(st().bits, 12, 'hash tables back to 4096 entries')
+        assert.equal(st().head.length, 4096)
+        assert.ok(!st().out || st().out.length <= 4096, 'output buffer released')
+        check(small, enc('{"small":true}'))
+        // Kept: two 4096-entry tables, 8192 symbols and at most a 4 KB output buffer.
+        const kept = st().head.byteLength + st().prev.byteLength + st().syms.byteLength + (st().out ? st().out.byteLength : 0)
+        assert.ok(kept <= 72 * 1024, `${kept} bytes kept`)
+    } finally {
+        Date.now = realNow
+    }
 })
