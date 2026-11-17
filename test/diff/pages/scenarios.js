@@ -1822,3 +1822,42 @@
     gzip_native_not_readable: run,
   })
 })()
+
+// ---- Lone surrogates in synchronously gzipped bodies -------------------------------------
+// Upstream gzips send_instantly captures and unload beacons synchronously, with fflate's
+// strToU8 (TextEncoder when present: a lone surrogate becomes U+FFFD). A lone surrogate
+// reaches that encoder only in engines whose JSON.stringify predates ES2019's well-formed
+// stringify (Chrome escapes them as \udXXX); the scenario restores that older output
+// before the SDK loads, for both SDKs.
+;(function () {
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms) }) }
+  var scenario = new URLSearchParams(location.search).get('scenario')
+
+  if (scenario === 'gzip_lone_surrogate') {
+    var nativeStringify = JSON.stringify
+    // A \udXXX escape not itself escaped (preceded by an even run of backslashes).
+    var ESCAPED_SURROGATE = /(?<=(?:^|[^\\])(?:\\\\)*)\\u(d[89a-f][0-9a-f]{2})/g
+    JSON.stringify = function () {
+      var s = nativeStringify.apply(JSON, arguments)
+      return typeof s === 'string' && s.indexOf('\\ud') !== -1
+        ? s.replace(ESCAPED_SURROGATE, function (_m, hex) { return String.fromCharCode(parseInt(hex, 16)) }) : s
+    }
+  }
+
+  var PROPS = {
+    high: 'a\ud800b', low: 'a\udc00b', trailing_high: 'x\ud83d', reversed_pair: '\ude00\ud83d',
+    pair: '😀', text: 'héllo ✓', not_a_surrogate: '\\ud800 stays text',
+  }
+
+  window.SCENARIOS.gzip_lone_surrogate = async function (ph, h) {
+    // The longest flush interval (5 s): 'queued' is still in the queue when the runner
+    // unloads the page, which sends it by sendBeacon.
+    ph.init(h.token, h.config({ autocapture: false, capture_pageview: false, disable_surveys: true,
+      request_queue_config: { flush_interval_ms: 5000 } }))
+    await sleep(600) // remote config: gzip-js
+    ph.capture('instant', PROPS, { send_instantly: true })
+    await sleep(300)
+    ph.capture('queued', PROPS)
+    window.__flagResults = { stringify: JSON.stringify(['\ud800', '\\ud800']) }
+  }
+})()
