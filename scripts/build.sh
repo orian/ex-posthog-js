@@ -17,6 +17,9 @@
 #                               needs deadclicks.js.
 #   dist/chunks/replay.js        session replay (needs only core.js); also part of
 #                               posthog.full.js. rrweb is loaded at runtime.
+#   dist/recorder.js, dist/{chunks,lazy}/recorder.js
+#                               rrweb (PostHog's fork + plugins) for replay, next to each
+#                               build; scripts/build-recorder.sh (esbuild, not Closure).
 #   dist/chunks/webvitals.js     web vitals with Google's web-vitals 6.2.1 compiled in
 #                               (needs only core.js); also part of posthog.full.js.
 #   dist/chunks/tracingheaders.js tracing headers (needs only core.js); also part of
@@ -72,7 +75,7 @@ CORE_FILES=(
   src/core/storage.js src/core/event-utils.js src/core/persistence.js src/core/session.js
   src/core/session-props.js src/core/scroll-manager.js src/core/page-view.js src/core/gzip.js
   src/core/request.js src/core/request-queue.js src/core/rate-limiter.js src/core/request-router.js
-  src/core/consent.js src/core/script-loader.js src/core/remote-config.js src/core/history-autocapture.js
+  src/core/consent.js src/core/script-loader.js src/core/script-base.js src/core/remote-config.js src/core/history-autocapture.js
   src/core/rageclick.js src/core/lazy.js src/core/extensions.js src/core/posthog.js src/entry/core.js
 )
 FLAGS_FILES=(src/flags/feature-flags.js src/flags/index.js)
@@ -92,7 +95,8 @@ DEADCLICKS_LAZY_FILES=(src/dead-clicks/detector.js)
 DEADCLICKS_FILES=("${DEADCLICKS_SHELL_FILES[@]}" "${DEADCLICKS_LAZY_FILES[@]}" src/dead-clicks/shell.js src/dead-clicks/index.js)
 HEATMAPS_FILES=(src/heatmaps/heatmaps.js src/heatmaps/index.js)
 DOM_MODULE_FILES=("${DOM_FILES[@]}" "${AUTOCAPTURE_FILES[@]}" "${DEADCLICKS_FILES[@]}" "${HEATMAPS_FILES[@]}")
-# Session replay (needs only core; rrweb itself is loaded at runtime from /static/recorder.js).
+# Session replay (needs only core; rrweb itself is loaded at runtime from recorder.js, built
+# from third_party/posthog-rrweb by scripts/build-recorder.sh at the end).
 REPLAY_SHELL_FILES=(src/replay/constants.js src/replay/session-recording.js)
 REPLAY_LAZY_FILES=(
   src/replay/sampling.js src/replay/trigger-matching.js src/replay/recording-strategies.js
@@ -218,6 +222,9 @@ closure "${args[@]}" \
   --create_source_map "%outname%.map"
 # Source maps for the profiler (test/bench/profile.mjs). The comment is only read by devtools.
 for f in dist/lazy/*.js; do echo "//# sourceMappingURL=$(basename "$f").map" >> "$f"; done
+
+# rrweb: PostHog's fork, built with esbuild (not Closure) next to each build that loads it.
+"$ROOT/scripts/build-recorder.sh"
 
 echo
 ls -l dist dist/chunks dist/lazy | grep '\.js$' | awk '{printf "%8d  %s\n", $5, $NF}'

@@ -262,7 +262,11 @@ function vlq(s) {
 export function makeLocator(root, vendorDist, upstream) {
     const official = (raw) => (upstream ? path.resolve(upstream, 'packages/browser/dist', raw) : null)
     return (p) => {
-        if (p.startsWith('/sdk/ours/')) return { file: path.join(root, 'dist', p.slice('/sdk/ours/'.length)), ours: true, sourceFile: (raw) => path.join(root, raw) }
+        if (p.startsWith('/sdk/ours/')) {
+            const file = path.join(root, 'dist', p.slice('/sdk/ours/'.length))
+            // Closure's maps are relative to the repo root; esbuild's (recorder.js) to the map.
+            return { file, ours: true, sourceFile: (raw) => (raw.startsWith('../') ? path.resolve(path.dirname(file), raw) : path.join(root, raw)) }
+        }
         if (p.startsWith('/sdk/official/') || p.startsWith('/static/')) return { file: path.join(vendorDist, path.basename(p)), ours: false, sourceFile: official }
         return null
     }
@@ -380,7 +384,13 @@ export class Attributor {
         let file = r.source
         let fn = r.name || `(anonymous) ${path.basename(file)}:${r.line}`
         let rr = null
-        if (/rrweb-record\.js$/.test(file)) {
+        const vendored = /third_party\/posthog-rrweb\/[^/]+\/packages\/(.*)$/.exec(file)
+        if (vendored) {
+            // Our recorder.js, built from the vendored fork: its map names the TypeScript files.
+            bucket = 'rrweb'
+            file = vendored[1]
+            rr = { file, fn: r.name, near: null }
+        } else if (/rrweb-record\.js$/.test(file)) {
             bucket = 'rrweb'
             const t = this.rrwebFile(b, r.line, r.name)
             rr = { file: t.file, fn: r.name, near: t.near }
