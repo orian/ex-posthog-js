@@ -202,7 +202,18 @@ type BaseMethod<K extends keyof BasePrototypeCache> = (
   ...args: unknown[]
 ) => unknown;
 
-const untaintedMethodCache: Record<string, BaseMethod<any>> = {};
+// Grouped by prototype like the accessors, so the hot paths below can call a
+// cached method directly instead of building a `${key}.${method}` key and
+// binding a new function on every call.
+const untaintedMethodCache: Record<
+  keyof BasePrototypeCache,
+  Record<string, BaseMethod<any>>
+> = Object.create(null);
+untaintedMethodCache.Node = Object.create(null);
+untaintedMethodCache.ShadowRoot = Object.create(null);
+untaintedMethodCache.MutationObserver = Object.create(null);
+untaintedMethodCache.Element = Object.create(null);
+
 export function getUntaintedMethod<
   K extends keyof BasePrototypeCache,
   T extends keyof BasePrototypeCache[K],
@@ -211,35 +222,45 @@ export function getUntaintedMethod<
   instance: BasePrototypeCache[K],
   method: T,
 ): BasePrototypeCache[K][T] {
-  const cacheKey = `${key}.${String(method)}`;
-  if (untaintedMethodCache[cacheKey])
-    return untaintedMethodCache[cacheKey].bind(
-      instance,
-    ) as BasePrototypeCache[K][T];
+  const cache = untaintedMethodCache[key];
+  const cached = cache[method as string];
+  if (cached) return cached.bind(instance) as BasePrototypeCache[K][T];
 
   const untaintedPrototype = getUntaintedPrototype(key);
   const untaintedMethod = untaintedPrototype[method];
 
   if (typeof untaintedMethod !== 'function') return instance[method];
 
-  untaintedMethodCache[cacheKey] = untaintedMethod as BaseMethod<K>;
+  cache[method as string] = untaintedMethod as BaseMethod<K>;
 
   return untaintedMethod.bind(instance) as BasePrototypeCache[K][T];
 }
 
+// The accessors below read their cached getter directly (the same function
+// getUntaintedAccessor would call), and fall back to it until it is cached.
+const nodeAccessorCache = untaintedAccessorCache.Node;
+
 export function childNodes(n: Node): NodeListOf<Node> {
+  const get = nodeAccessorCache.childNodes;
+  if (get) return get.call(n) as NodeListOf<Node>;
   return getUntaintedAccessor('Node', n, 'childNodes');
 }
 
 export function parentNode(n: Node): ParentNode | null {
+  const get = nodeAccessorCache.parentNode;
+  if (get) return get.call(n) as ParentNode | null;
   return getUntaintedAccessor('Node', n, 'parentNode');
 }
 
 export function parentElement(n: Node): HTMLElement | null {
+  const get = nodeAccessorCache.parentElement;
+  if (get) return get.call(n) as HTMLElement | null;
   return getUntaintedAccessor('Node', n, 'parentElement');
 }
 
 export function textContent(n: Node): string | null {
+  const get = nodeAccessorCache.textContent;
+  if (get) return get.call(n) as string | null;
   return getUntaintedAccessor('Node', n, 'textContent');
 }
 
@@ -249,6 +270,8 @@ export function textContent(n: Node): string | null {
  * silently redirect the mutation-buffer drain's sibling walk.
  */
 export function previousSibling(n: Node): ChildNode | null {
+  const get = nodeAccessorCache.previousSibling;
+  if (get) return get.call(n) as ChildNode | null;
   return getUntaintedAccessor('Node', n, 'previousSibling');
 }
 
@@ -257,6 +280,8 @@ export function previousSibling(n: Node): ChildNode | null {
  * {@link previousSibling} for the rationale.
  */
 export function nextSibling(n: Node): ChildNode | null {
+  const get = nodeAccessorCache.nextSibling;
+  if (get) return get.call(n) as ChildNode | null;
   return getUntaintedAccessor('Node', n, 'nextSibling');
 }
 
@@ -265,6 +290,8 @@ export function nextSibling(n: Node): ChildNode | null {
  * {@link previousSibling} for the rationale.
  */
 export function lastChild(n: Node): ChildNode | null {
+  const get = nodeAccessorCache.lastChild;
+  if (get) return get.call(n) as ChildNode | null;
   return getUntaintedAccessor('Node', n, 'lastChild');
 }
 
@@ -286,11 +313,17 @@ export function isConnected(n: Node): boolean | undefined {
   return isConnectedGetter?.call(n);
 }
 
+// Once the untainted method is cached, call it directly: same function, same
+// receiver and arguments as calling the bound copy getUntaintedMethod returns.
 export function contains(n: Node, other: Node): boolean {
+  const cached = untaintedMethodCache.Node.contains;
+  if (cached) return cached.call(n, other) as boolean;
   return getUntaintedMethod('Node', n, 'contains')(other);
 }
 
 export function getRootNode(n: Node): Node {
+  const cached = untaintedMethodCache.Node.getRootNode;
+  if (cached) return cached.call(n) as Node;
   return getUntaintedMethod('Node', n, 'getRootNode')();
 }
 
