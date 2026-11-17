@@ -45,9 +45,11 @@ their optional parts on demand, in headless Chrome with 4x CPU throttling
 - **Session replay overhead**: rrweb itself (PostHog's fork, the same code in
   both SDKs) costs the same in both, about 380 ms per minute of a realistic
   session. Everything around it is cheaper in ours: event size estimates
-  without a `Blob` per event (308 -> 22 ms), gzip validation with one read and
-  a faster CRC-32 (436 -> 233 ms), and no redundant storage writes (195 -> 100
-  ms), all without changing a single byte sent or stored. See
+  without a `Blob` per event (308 -> 22 ms), compression (436 -> about 150
+  ms: gzip validation with one read, a faster CRC-32, and short replay fields
+  through our own encoder instead of a CompressionStream round trip), and no
+  redundant storage writes (195 -> 100 ms), with the same data sent and
+  stored. See
   [Benchmarks](#benchmarks) and the CPU profile there.
 - **Pick what you load**: `posthog.core.js` alone is 36.8 KB gzip; every module
   is also a separate chunk, so core + flags is about 46 KB.
@@ -305,7 +307,10 @@ How to read it:
   for that `$pageview` and `$pageleave`; it used to be 18% larger, see
   [Sync gzip benchmark](#sync-gzip-benchmark)); every
   CompressionStream-compressed request is the same size within
-  a few bytes. Same data and same rrweb also mean the same first full snapshot
+  a few bytes. (Since 640282e, replay fields up to 8 KB are gzipped by our
+  encoder rather than CompressionStream, so `$snapshot` bodies differ by a
+  few bytes per field either way, see
+  [Where compression time goes](#where-compression-time-goes).) Same data and same rrweb also mean the same first full snapshot
   time: about 6.6 s from navigation at 4x throttling (load, remote config, the
   recorder script, the snapshot of a 1,450-node page, then the first flush).
 - **Most of the cost is session replay, and it is the same code.** About 4%
@@ -605,7 +610,9 @@ key-list JSON cache, measured +1,435 / +813 ms (ours) and +1,505 / +840 ms
 What remains is native work that upstream does too:
 
 - `Response.blob()` and the blob read, CompressionStream setup and
-  `close()`, and serialising the fields;
+  `close()` for replay fields over 8 KB and for request bodies, and
+  serialising the fields (see
+  [Where compression time goes](#where-compression-time-goes));
 - `request.js` compresses `/e/` bodies with CompressionStream (~25 ms; it
   now also validates the output like upstream, with the same single read,
   see [Fixed differences](#scope));
@@ -613,6 +620,111 @@ What remains is native work that upstream does too:
   later reads within the task);
 - the persistence fingerprint's `JSON.stringify`.
 
+
+#### Where compression time goes
+
+Compression was still the largest SDK-side activity (about 240 ms per 60 s
+session at 4x throttling). Measured at cde1352 (3 profiled session runs,
+`test/bench/activities.mjs --detail`, other agents' Chrome jobs running),
+by function:
+
+| Compression, ours, ms per session | ms |
+|---|---:|
+| `Response.blob()` (CompressionStream output collected) | 63 |
+| `blob.arrayBuffer()` (the validation read) | 36 |
+| `CompressionStream` constructor | 32 |
+| `writer.close()` | 32 |
+| `serializeForCompression` (`JSON.stringify` of each field) | 25 |
+| `gzipCompress` itself (stream plumbing, promises) | 18 |
+| `TextEncoder.encode` (native path input) | 14 |
+| CRC-32 (validation) | 6 |
+| `Response`, `getWriter`, `write`, `TextEncoder` constructor | 7 |
+| latin1 conversion | 3 |
+| sync encoder (unload, `send_instantly`; mostly outside the window) | 1 |
+| **total** | **244** |
+
+Zlib's own work inside CompressionStream runs in natives with no JS caller
+and is not in the table; the per-call numbers below include it. A session
+gzips about 280 strings: 249 replay fields (plus 244 empty arrays, which
+`gzipField` caches), 15 `/e/` and 17 `/s/` bodies. Per call, in Chrome at 4x
+(`node test/bench/gzip-chrome.mjs --log <dump>`, the session's own inputs;
+"native" is the validated CompressionStream path plus latin1, started in
+bursts of four like replay's fields):
+
+| size | fields | bodies | sync encoder | native |
+|---|---:|---:|---:|---:|
+| < 64 B | 102 | 0 | 0.051 ms | 0.54 ms |
+| < 256 B | 24 | 0 | 0.050 ms | 0.41 ms |
+| < 1 KB | 109 | 0 | 0.097 ms | 0.49 ms |
+| < 4 KB | 4 | 12 | 0.28 ms | 0.56 ms |
+| < 16 KB | 3 | 13 | 0.69 ms | 0.76 ms |
+| < 64 KB | 2 | 5 | 4.1 ms | 3.4 ms |
+| >= 64 KB | 5 | 2 | 13.1 ms | 8.8 ms |
+
+A CompressionStream round trip costs about half a millisecond whatever the
+size (sequentially: ~0.16 ms setup, ~0.2 ms until `blob()` resolves, ~0.2 ms
+for the `arrayBuffer()` read), so for the short mutation fields that make up
+most calls the stream plumbing, not the compression, is the cost. Changes
+(each its own commit, outputs still standard self-contained gzip members):
+
+- **Short replay fields use the sync encoder** (640282e). `gzipToStringAsync`
+  compresses serialised fields up to 8,192 UTF-16 units with `gzipSync` and
+  resolves with the result; larger fields and full snapshots still go
+  through CompressionStream with upstream's validation. Events go through
+  the same compression queue in the same order, a few tasks sooner; native
+  failures can now only show up on large fields, and still turn native gzip
+  off. Request bodies are left alone: upstream sends a body uncompressed
+  after a `NotReadableError` (`gzip_native_not_readable`), which a sync fast
+  path would change, and `/e/` bodies (1-4 KB) would save about 4 ms.
+- **Encoder state is reused between calls** (3c9882d). Hash tables, the
+  symbol buffer and a 64 KB output buffer are kept; positions are stored
+  offset by a per-call base, so old entries read as empty and nothing is
+  cleared; bits go through an accumulator, so the output buffer needs no
+  zeroing; results are copied out. Tables over 4,096 entries and the output
+  buffer are dropped by the next call once no large call has been made for
+  10 s (no timers); at rest the encoder keeps about 68 KB. Small inputs got
+  about 2x faster in Node (a 50-byte field 9.0 -> 4.9 us) and 15-20% in
+  Chrome; outputs are byte-identical.
+
+Result, same benchmark (3 profiled runs each, medians):
+
+| | before (cde1352) | after (640282e) |
+|---|---:|---:|
+| Compression, ours | 244 ms | 164 ms |
+| Compression, lazy | 254 ms | 145 ms |
+| of which CompressionStream natives (`blob`, `arrayBuffer`, `close`, constructor) | 163 ms | 55 ms |
+| of which the sync encoder | ~1 ms | ~35 ms |
+| Unload handlers (`--unload-probe`, plain runs, 5 runs) | 29.3 ms | 26.2 ms |
+
+What didn't pay off (measured, not merged):
+
+- **Reusing Huffman tables between blocks.** A block may reuse the previous
+  dynamic block's code lengths only if they cover every symbol it uses; in a
+  session's fields that held for 0-12 of 717 blocks (every block still has
+  to carry its table, and a short field's alphabet rarely fits the last
+  one's), with no measurable time change and 3 bytes more. Smoothing the
+  tables so they cover everything makes the headers larger than the fixed
+  code for short fields. Skipping dynamic Huffman under 128 bytes would
+  produce the same bytes on the session corpus (those blocks always end up
+  fixed) and save ~1 ms per session, but it is not exact in general (a
+  short skewed input can be 5x smaller with a dynamic table).
+- **Incremental compression of `/e/` batches.** The unload body is mostly
+  the `$pageleave` captured in the unload handler itself (3.3 KB, ~0.25 ms
+  at 4x), so there is no prefix worth compressing ahead; unload compression
+  time is the last replay batches (~130 KB of JSON). Replay sends with
+  `timestampMode: 'body'`, which adds `sent_at` to every item at send time,
+  so only the first item's prefix could be compressed ahead there.
+- **Skipping the match search in high-entropy regions** (the latin1 `cv`
+  strings inside a `$snapshot` body compressed synchronously). A miss
+  counter (snappy-style skipping) never triggers: the JSON escapes
+  (`\u00XX`) keep producing short matches. Recognising the strings
+  (`\u001f` + U+008B) and emitting them as literals makes a full-snapshot
+  batch 37% faster but 7% larger; a 4-candidate chain there, 17% faster and
+  1.2% larger. On the real unload batches the gain was under 0.1 ms in Node.
+- **zlib level 6's lazy and nice limits** (no lazy search after a 16-byte
+  match, stop at 128): 2.1% larger over the corpus, no consistent speed
+  gain on unload bodies.
+- **A sync fast path for request bodies**: see above (parity).
 
 #### Sync gzip benchmark
 
@@ -636,27 +748,32 @@ reference).
 
 | input | bytes | before | ours | fflate | zlib -6 | zlib -9 | ours vs fflate | ms: ours / fflate |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| custom event | 296 | 261 | 221 | 221 | 223 | 223 | +0.0% | 0.024 / 0.031 |
-| $identify | 1,860 | 1,095 | 900 | 912 | 908 | 905 | -1.3% | 0.039 / 0.039 |
-| $pageview (send_instantly) | 1,813 | 1,060 | 871 | 882 | 877 | 875 | -1.2% | 0.039 / 0.038 |
-| $pageleave | 3,284 | 1,607 | 1,303 | 1,327 | 1,305 | 1,304 | -1.8% | 0.057 / 0.051 |
-| $autocapture x1 | 3,303 | 1,662 | 1,347 | 1,369 | 1,351 | 1,350 | -1.6% | 0.052 / 0.051 |
-| $autocapture x4 | 12,684 | 2,119 | 1,740 | 1,770 | 1,739 | 1,739 | -1.7% | 0.108 / 0.109 |
-| mixed batch x5 | 16,076 | 2,745 | 2,277 | 2,324 | 2,273 | 2,269 | -2.0% | 0.134 / 0.138 |
-| all 30 events | 93,703 | 7,069 | 5,721 | 5,958 | 5,758 | 5,665 | -4.0% | 0.738 / 0.701 |
-| $snapshot small (cv) | 2,130 | 761 | 607 | 633 | 614 | 607 | -4.1% | 0.052 / 0.037 |
-| $snapshot medium (cv) | 9,121 | 1,589 | 1,207 | 1,298 | 1,238 | 1,206 | -7.0% | 0.089 / 0.092 |
-| $snapshot large (cv) | 84,488 | 28,509 | 23,762 | 24,445 | 23,549 | 23,245 | -2.8% | 1.43 / 1.14 |
-| $snapshot full (cv) | 115,927 | 86,684 | 71,551 | 73,143 | 71,315 | 70,913 | -2.2% | 3.80 / 2.82 |
-| $snapshot all (cv) | 442,551 | 244,188 | 202,163 | 207,872 | 201,848 | 200,137 | -2.7% | 11.4 / 9.33 |
-| $snapshot medium (raw) | 21,091 | 3,300 | 2,580 | 2,873 | 2,721 | 2,566 | -10.2% | 0.245 / 0.209 |
-| $snapshot large (raw) | 54,707 | 4,413 | 3,409 | 3,771 | 3,621 | 3,394 | -9.6% | 0.528 / 0.481 |
-| full snapshot data (field) | 233,251 | 33,164 | 26,917 | 28,740 | 27,941 | 26,569 | -6.3% | 2.97 / 2.83 |
-| $snapshot full (raw) | 485,232 | 66,482 | 53,563 | 56,585 | 55,746 | 52,271 | -5.3% | 6.28 / 6.02 |
-| $snapshot all (raw) | 1,255,757 | 166,630 | 131,645 | 140,145 | 138,659 | 127,536 | -6.1% | 16.6 / 15.2 |
-| **total events** | 133,019 | 17,618 | 14,380 | 14,763 | 14,434 | 14,330 | -2.6% | 1.19 / 1.16 |
-| **total replay** | 2,704,255 | 635,720 | 517,404 | 539,505 | 527,252 | 508,444 | -4.1% | 43.4 / 38.2 |
-| **total** | 2,837,274 | 653,338 | 531,784 | 554,268 | 541,686 | 522,774 | -4.1% | 44.6 / 39.3 |
+| custom event | 296 | 261 | 221 | 221 | 223 | 223 | +0.0% | 0.019 / 0.030 |
+| $identify | 1,860 | 1,095 | 900 | 912 | 908 | 905 | -1.3% | 0.033 / 0.039 |
+| $pageview (send_instantly) | 1,813 | 1,060 | 871 | 882 | 877 | 875 | -1.2% | 0.032 / 0.039 |
+| $pageleave | 3,284 | 1,607 | 1,303 | 1,327 | 1,305 | 1,304 | -1.8% | 0.050 / 0.051 |
+| $autocapture x1 | 3,303 | 1,662 | 1,347 | 1,369 | 1,351 | 1,350 | -1.6% | 0.049 / 0.051 |
+| $autocapture x4 | 12,684 | 2,119 | 1,740 | 1,770 | 1,739 | 1,739 | -1.7% | 0.099 / 0.109 |
+| mixed batch x5 | 16,076 | 2,745 | 2,277 | 2,324 | 2,273 | 2,269 | -2.0% | 0.132 / 0.139 |
+| all 30 events | 93,703 | 7,069 | 5,721 | 5,958 | 5,758 | 5,665 | -4.0% | 0.740 / 0.707 |
+| $snapshot small (cv) | 2,130 | 761 | 607 | 633 | 614 | 607 | -4.1% | 0.031 / 0.036 |
+| $snapshot medium (cv) | 9,121 | 1,589 | 1,207 | 1,298 | 1,238 | 1,206 | -7.0% | 0.085 / 0.093 |
+| $snapshot large (cv) | 84,488 | 28,509 | 23,762 | 24,445 | 23,549 | 23,245 | -2.8% | 1.53 / 1.14 |
+| $snapshot full (cv) | 115,927 | 86,684 | 71,551 | 73,143 | 71,315 | 70,913 | -2.2% | 4.06 / 2.87 |
+| $snapshot all (cv) | 442,551 | 244,188 | 202,163 | 207,872 | 201,848 | 200,137 | -2.7% | 12.1 / 9.08 |
+| $snapshot medium (raw) | 21,091 | 3,300 | 2,580 | 2,873 | 2,721 | 2,566 | -10.2% | 0.246 / 0.217 |
+| $snapshot large (raw) | 54,707 | 4,413 | 3,409 | 3,771 | 3,621 | 3,394 | -9.6% | 0.568 / 0.518 |
+| full snapshot data (field) | 233,251 | 33,164 | 26,917 | 28,740 | 27,941 | 26,569 | -6.3% | 3.13 / 2.68 |
+| $snapshot full (raw) | 485,232 | 66,482 | 53,563 | 56,585 | 55,746 | 52,271 | -5.3% | 7.00 / 6.47 |
+| $snapshot all (raw) | 1,255,757 | 166,630 | 131,645 | 140,145 | 138,659 | 127,536 | -6.1% | 17.7 / 15.5 |
+| **total events** | 133,019 | 17,618 | 14,380 | 14,763 | 14,434 | 14,330 | -2.6% | 1.15 / 1.17 |
+| **total replay** | 2,704,255 | 635,720 | 517,404 | 539,505 | 527,252 | 508,444 | -4.1% | 46.5 / 38.6 |
+| **total** | 2,837,274 | 653,338 | 531,784 | 554,268 | 541,686 | 522,774 | -4.1% | 47.6 / 39.8 |
+
+Times are at f805093: the encoder keeps its tables and buffers between calls
+(see [Where compression time goes](#where-compression-time-goes)), which
+made short inputs 20-30% faster (custom event 0.024 -> 0.020 ms); the large
+`cv` inputs measure a few percent slower in Node (within noise in Chrome).
 
 The encoder does lazy LZ77 matching (zlib's `deflate_slow`, looking for a
 longer match at every position, chains of 64, a 4-byte hash above 8 KB and a
@@ -1045,6 +1162,7 @@ node --test test/gzip-native.test.mjs  # native gzip validation (requests and re
 node --test test/strtou8.test.mjs      # sync gzip's UTF-8 step vs fflate's strToU8
 node --test test/gzip-sync.test.mjs    # sync gzip encoder: corpus, fuzz, boundaries, large inputs vs zlib.gunzipSync
 node test/bench/gzip.mjs               # sync gzip size and speed vs fflate 0.4.9 and zlib
+node test/bench/gzip-chrome.mjs        # per-call cost in Chrome at 4x: CompressionStream vs sync encoder
 ./scripts/build.sh && node test/diff/run.mjs [scenario ...]   # differential test vs official 1.450.0
 DIFF_BUNDLE=lazy/posthog.js node test/diff/run.mjs [scenario ...]   # the same against the lazy build
 node test/sanitizer-chrome.mjs   # html sanitiser vs real DOMPurify 3.4.13 (needs it in /tmp/dp, see the file)
@@ -1322,9 +1440,12 @@ conversations, site apps, WebMCP.
   `__PosthogExtensions__.tracingHeadersPatchFns` are not used or defined.
 - Session replay always loads `recorder.js`: the `scriptConfig.script` remote
   setting (which selects another upstream recorder bundle) is ignored. When
-  the native CompressionStream is missing or fails, and when compressions are
-  drained on unload, events are compressed with the core's encoder instead of
-  fflate (same decoded data, different `$snapshot_bytes`).
+  the native CompressionStream is missing or fails, when compressions are
+  drained on unload, and for fields up to 8,192 characters (where a
+  CompressionStream round trip costs several times the compression, see
+  [Where compression time goes](#where-compression-time-goes)), events are
+  compressed with the core's encoder instead of CompressionStream or fflate
+  (same decoded data, different `$snapshot_bytes`).
 - Console log capture *(compiled-in builds)* is compiled into the `logs` module instead of being
   lazy-loaded from `/static/logs.js`, so it takes over the recorder's buffer
   synchronously when capture is enabled (upstream does it once that script has
