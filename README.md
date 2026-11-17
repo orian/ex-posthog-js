@@ -21,6 +21,44 @@ Two main builds: `posthog.full.js` has everything compiled in, and
 lazy part from `lazy/<kind>.js` where upstream loads `/static/<kind>.js` (see
 [The lazy build](#the-lazy-build)).
 
+## Highlights
+
+Same behaviour as official posthog-js 1.450.0 (every differential scenario
+produces identical traffic), with a smaller and faster SDK. Like-for-like
+numbers: our `lazy/posthog.js` against upstream's CDN `array.js`, both loading
+their optional parts on demand, in headless Chrome with 4x CPU throttling
+(roughly a mid-range phone).
+
+| | official `array.js` | ours `lazy/posthog.js` | gain |
+|---|---|---|---|
+| Main script (gzip) | 122.4 KB | 82.4 KB | **-33%** |
+| Downloaded at startup | 171 KB | 82.4 KB | **-52%** |
+| Downloaded with session replay on | 244 KB | 151 KB | **-38%** |
+| Downloaded with every ported feature on | 272 KB | 165 KB | **-39%** |
+| Script load + parse + eval | 36.8 ms | 21.5 ms | **-42%** |
+| `posthog.init()` | 26.0 ms | 16.5 ms | **-37%** |
+| 1000 `capture()` calls | 495-580 ms | 269-297 ms | **~-50%** |
+| SDK's own main-thread time in a 60 s analytics + autocapture + session replay session (CPU profile, rrweb excluded) | 1,421 ms | 792 ms | **-44%** |
+| Total main-thread time added in that session, rrweb included (vs no SDK) | +2,312 ms | +1,503 ms | **-35%** |
+| Data sent (events, recordings) | same | same | identical |
+
+- **Session replay overhead**: rrweb itself (PostHog's fork, the same code in
+  both SDKs) costs the same in both, about 380 ms per minute of a realistic
+  session. Everything around it is cheaper in ours: event size estimates
+  without a `Blob` per event (308 -> 22 ms), gzip validation with one read and
+  a faster CRC-32 (436 -> 233 ms), and no redundant storage writes (195 -> 100
+  ms), all without changing a single byte sent or stored. See
+  [Benchmarks](#benchmarks) and the CPU profile there.
+- **Pick what you load**: `posthog.core.js` alone is 35.2 KB gzip; every module
+  is also a separate chunk, so core + flags is about 44 KB.
+- **Fewer requests**: no `surveys.js` on every page (surveys are not ported),
+  and no per-feature script unless the feature is on.
+
+Every claim above is reproducible: `./scripts/build.sh`, then
+`node test/diff/bench.mjs` (startup), `npm run bench:session -- --profile`
+(session CPU) and `node test/diff/run.mjs` (parity, also with
+`DIFF_BUNDLE=lazy/posthog.js`). The detailed tables follow.
+
 ## Size and performance vs the official SDK
 
 Measured against official posthog-js 1.450.0 on the same page in headless
