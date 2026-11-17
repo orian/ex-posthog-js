@@ -278,6 +278,15 @@ export { nowTimestamp };
 
 export function getWindowScroll(win: Window): { left: number; top: number } {
   const doc = win.document;
+  // The common case reads `scrollingElement` once rather than once per axis
+  // and per check (a DOM getter each time); same values, same order.
+  const scrollingElement = doc.scrollingElement;
+  if (scrollingElement) {
+    return {
+      left: scrollingElement.scrollLeft,
+      top: scrollingElement.scrollTop,
+    };
+  }
   return {
     left: doc.scrollingElement
       ? doc.scrollingElement.scrollLeft
