@@ -523,6 +523,12 @@ function record<T = eventWithTime>(
     }
   };
 
+  // `Object.assign({ source }, p)` rather than `{ source, ...p }`: the same
+  // own enumerable properties, read the same way, in the same order. Assign
+  // sets where spread defines, which differs only for an own `__proto__` key,
+  // and these payloads are rrweb's own objects with fixed keys. It avoids the
+  // object-spread helper the build emits for the browsers it targets (no
+  // native object spread before iOS 11.3), once per recorded event.
   const wrappedMutationEmit = (m: mutationCallbackParam) => {
     // Clean up removed iframes (same-origin too). Detect reparenting by id
     // AND by element identity — MutationBuffer.emit clears mirror entries
@@ -562,36 +568,24 @@ function record<T = eventWithTime>(
 
     wrappedEmit({
       type: EventType.IncrementalSnapshot,
-      data: {
-        source: IncrementalSource.Mutation,
-        ...m,
-      },
+      data: Object.assign({ source: IncrementalSource.Mutation }, m),
     });
   };
   const wrappedScrollEmit: scrollCallback = (p) =>
     wrappedEmit({
       type: EventType.IncrementalSnapshot,
-      data: {
-        source: IncrementalSource.Scroll,
-        ...p,
-      },
+      data: Object.assign({ source: IncrementalSource.Scroll }, p),
     });
   const wrappedCanvasMutationEmit = (p: canvasMutationParam) =>
     wrappedEmit({
       type: EventType.IncrementalSnapshot,
-      data: {
-        source: IncrementalSource.CanvasMutation,
-        ...p,
-      },
+      data: Object.assign({ source: IncrementalSource.CanvasMutation }, p),
     });
 
   const wrappedAdoptedStyleSheetEmit = (a: adoptedStyleSheetParam) =>
     wrappedEmit({
       type: EventType.IncrementalSnapshot,
-      data: {
-        source: IncrementalSource.AdoptedStyleSheet,
-        ...a,
-      },
+      data: Object.assign({ source: IncrementalSource.AdoptedStyleSheet }, a),
     });
 
   const stylesheetManager = new StylesheetManager({
@@ -919,77 +913,50 @@ function record<T = eventWithTime>(
           mouseInteractionCb: (d) =>
             wrappedEmit({
               type: EventType.IncrementalSnapshot,
-              data: {
-                source: IncrementalSource.MouseInteraction,
-                ...d,
-              },
+              data: Object.assign({ source: IncrementalSource.MouseInteraction }, d),
             }),
           scrollCb: wrappedScrollEmit,
           viewportResizeCb: (d) =>
             wrappedEmit({
               type: EventType.IncrementalSnapshot,
-              data: {
-                source: IncrementalSource.ViewportResize,
-                ...d,
-              },
+              data: Object.assign({ source: IncrementalSource.ViewportResize }, d),
             }),
           inputCb: (v) =>
             wrappedEmit({
               type: EventType.IncrementalSnapshot,
-              data: {
-                source: IncrementalSource.Input,
-                ...v,
-              },
+              data: Object.assign({ source: IncrementalSource.Input }, v),
             }),
           mediaInteractionCb: (p) =>
             wrappedEmit({
               type: EventType.IncrementalSnapshot,
-              data: {
-                source: IncrementalSource.MediaInteraction,
-                ...p,
-              },
+              data: Object.assign({ source: IncrementalSource.MediaInteraction }, p),
             }),
           styleSheetRuleCb: (r) =>
             wrappedEmit({
               type: EventType.IncrementalSnapshot,
-              data: {
-                source: IncrementalSource.StyleSheetRule,
-                ...r,
-              },
+              data: Object.assign({ source: IncrementalSource.StyleSheetRule }, r),
             }),
           styleDeclarationCb: (r) =>
             wrappedEmit({
               type: EventType.IncrementalSnapshot,
-              data: {
-                source: IncrementalSource.StyleDeclaration,
-                ...r,
-              },
+              data: Object.assign({ source: IncrementalSource.StyleDeclaration }, r),
             }),
           canvasMutationCb: wrappedCanvasMutationEmit,
           fontCb: (p) =>
             wrappedEmit({
               type: EventType.IncrementalSnapshot,
-              data: {
-                source: IncrementalSource.Font,
-                ...p,
-              },
+              data: Object.assign({ source: IncrementalSource.Font }, p),
             }),
           selectionCb: (p) => {
             wrappedEmit({
               type: EventType.IncrementalSnapshot,
-              data: {
-                source: IncrementalSource.Selection,
-                ...p,
-              },
+              data: Object.assign({ source: IncrementalSource.Selection }, p),
             });
           },
           customElementCb: (c) => {
             wrappedEmit({
               type: EventType.IncrementalSnapshot,
-              data: {
-                source: IncrementalSource.CustomElement,
-                ...c,
-              },
+              data: Object.assign({ source: IncrementalSource.CustomElement }, c),
             });
           },
           blockClass,

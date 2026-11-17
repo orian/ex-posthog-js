@@ -634,10 +634,9 @@ function initInputObserver({
     ) {
       values.set(target, v);
       const id = mirror.getId(target as Node);
-      callbackWrapper(inputCb)({
-        ...v,
-        id,
-      });
+      // Object.assign rather than `{ ...v, id }`: same keys and order, without
+      // the build's object-spread helpers (see wrappedMutationEmit).
+      callbackWrapper(inputCb)(Object.assign({}, v, { id }));
     }
   }
   const events = sampling.input === 'last' ? ['change'] : ['input', 'change'];
