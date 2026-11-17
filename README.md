@@ -359,10 +359,17 @@ reported in two ways:
   doing. For example, `serializeNodeWithId` under `pushAdd` counts as
   mutations, and under `takeFullSnapshot` as the full snapshot.
 
-Our chunk builds have no source maps (`build.sh` maps the single-file bundles
-only), so a variant loading chunks would show `[unmapped]` SDK frames.
-`dist/lazy/posthog.js` (the `lazy` variant) and its `.map` are used when they
-exist. They didn't exist for these runs, so the variant was skipped.
+`build.sh` writes a source map for every single-file bundle and for the lazy
+build and each of its chunks (`dist/lazy/*.js.map`), so the `lazy` variant's
+frames are attributed too. The `dist/chunks/` build has no maps.
+
+`test/bench/activities.mjs DIR [--root ROOT] [--detail N]` sorts the SDK-only
+time of saved profiles (`--save-profiles DIR`) by activity: size estimates,
+compression, persistence, session ids, autocapture, scroll manager, requests.
+It is inclusive: a sample counts for the innermost frame on its stack that
+belongs to an activity, so the `Blob` constructor and the `JSON.stringify`
+under `estimateSize` both count as size estimates. `--root` points at the
+checkout whose `dist/` was profiled, to compare an older build.
 
 **Results** (5 rounds of plain + profiled runs, 60 s journeys, 4x
 throttling, medians, at c661e53; `--profile-window load` with 3 runs for the
@@ -484,7 +491,79 @@ How to read it:
   `new Blob([json]).size` with a UTF-8 byte count gives the same number
   without the blob allocation (the `Blob` constructor alone is 265-280 ms here; a byte-count loop would cost a fraction of that). Compression could check its
   output more cheaply (two blob reads and a CRC-32 per compressed event). Both are in the shared replay logic, so
-  they would apply to either SDK, and neither changes what is sent.
+  they would apply to either SDK, and neither changes what is sent. These
+  are now done (below).
+
+#### Hot-path optimisations
+
+The SDK-side hot spots above are now cheaper, with the same wire bytes, the
+same persisted state and the same decisions. Both diff suites stay identical,
+and each change is its own commit:
+
+- **Size estimates.** `estimateSize` (every rrweb event), the network
+  plugin's body limit and the request size estimate count UTF-8 bytes with
+  `TextEncoder.encodeInto` into a reused 64 KB buffer (`utf8ByteLength` in
+  `src/core/utils.js`) instead of `new Blob([s]).size`. Blob and TextEncoder
+  both take a USVString, so a lone surrogate counts as U+FFFD (3 bytes) in
+  both. `test/utf8.test.mjs` fuzzes this against Node's `Blob`.
+  `estimateSize` also runs plain `JSON.stringify` first and upstream's
+  circular-reference replacer only when that throws. The replacer changes
+  nothing unless a value is its own ancestor, which plain stringify
+  rejects. `replay.test.mjs` fuzzes this against upstream's expression.
+- **Compression.** Upstream reads CompressionStream's output back three
+  times: header and trailer as blob slices for validation, then the whole
+  blob. We read the whole blob once and run the same checks in the same
+  order on those bytes. The output is still collected with
+  `Response.blob()`, so Safari 16's `NotReadableError`, which turns native
+  gzip off, surfaces as before. `test/gzip-native.test.mjs` runs both
+  validations on corrupted CompressionStream outputs. CRC-32 is now
+  slicing-by-8 over `Int32Array` tables (same value as zlib, about 6x
+  faster).
+- **Persistence.** The trigger matchers call `register_for_session` three
+  times per rrweb event, and each call rewrote the same key list into
+  `sessionStorage`. `WebStore.set` now reads the item first and skips
+  `setItem` when it already holds the value. By spec that `setItem` is a
+  no-op anyway (no storage event, no quota check), and a change made by
+  another frame, tab or the page is still overwritten. The key list's JSON
+  is cached while the list is unchanged, and the persistence blob is
+  written with the JSON its no-op fingerprint already built. Cookie writes
+  are untouched, since each one refreshes the expiry. Two-tab scenarios in
+  `test/scenarios.mjs` share localStorage and a cookie jar between two SDK
+  copies.
+
+Same benchmark, before (at 1344a11) and after (at 05400ea): 5 rounds, 60 s,
+4x throttling, medians. No other `phc-diff` containers were running and the
+load average stayed under 2 on 24 cores. SDK-only self time by activity,
+from `test/bench/activities.mjs`:
+
+| SDK-side activity | official | ours before | ours after | lazy before | lazy after |
+|---|---|---|---|---|---|
+| Size estimates | 308 ms | 304 ms | 22 ms | 299 ms | 22 ms |
+| Compression (replay fields and request bodies) | 436 ms | 344 ms | 235 ms | 354 ms | 233 ms |
+| Persistence (storage, cookies) | 195 ms | 140 ms | 99 ms | 144 ms | 100 ms |
+| **SDK-only total** | **1,421 ms** | **1,218 ms** | **795 ms** | **1,227 ms** | **792 ms** |
+| SDK total incl. rrweb | 1,788 ms | 1,586 ms | 1,153 ms | 1,606 ms | 1,144 ms |
+
+| Plain runs, vs no SDK | official | ours before | ours after | lazy before | lazy after |
+|---|---|---|---|---|---|
+| Δ task | +2,362 / +2,312 ms | +2,057 ms | +1,608 ms | +2,112 ms | +1,503 ms |
+| Δ script | +1,290 / +1,260 ms | +1,164 ms | +880 ms | +1,179 ms | +820 ms |
+
+(official: before / after run.) SDK-only time is down about 35% and is now
+44% below official's. The plain-run overhead dropped by 450-600 ms of task
+time and about 300-350 ms of script time. Requests, events, rrweb event
+counts and replay bytes are unchanged. An intermediate run, without the
+key-list JSON cache, measured +1,435 / +813 ms (ours) and +1,505 / +840 ms
+(lazy), so plain-run Δs move by about ±100 ms between runs.
+
+What remains is native work that upstream does too:
+
+- `Response.blob()` and the blob read, CompressionStream setup and
+  `close()`, and serialising the fields;
+- `request.js` compresses `/e/` bodies through a `Blob` stream (~25 ms);
+- the first `document.cookie` read in each capture (~26 ms; Chrome caches
+  later reads within the task);
+- the persistence fingerprint's `JSON.stringify`.
 
 
 ## Layout
