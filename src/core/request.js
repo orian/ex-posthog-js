@@ -1,7 +1,8 @@
 /**
  * @fileoverview HTTP transports (port of upstream request.ts): fetch, XHR and
- * sendBeacon, gzip (native CompressionStream when async is allowed, the sync
- * encoder in gzip.js otherwise) and base64 form encoding, plus the
+ * sendBeacon, gzip (native CompressionStream with upstream's output
+ * validation when async is allowed, the sync encoder in gzip.js otherwise)
+ * and base64 form encoding, plus the
  * `timestampMode` body/query `sent_at` handling.
  */
 import {
@@ -9,7 +10,7 @@ import {
   removeURLParam, utf8ByteLength, win,
 } from './utils.js';
 import {logger} from './logger.js';
-import {gzipSync} from './gzip.js';
+import {gzipCompress, gzipSync, isNativeAsyncGzipError, isNativeAsyncGzipReadError} from './gzip.js';
 
 /** @const {string} */ export const COMPRESSION_GZIP_JS = 'gzip-js';
 /** @const {string} */ export const COMPRESSION_BASE64 = 'base64';
@@ -114,6 +115,7 @@ function byteSize(s) {
  * @return {!ArrayBuffer}
  */
 function toArrayBuffer(u8) {
+  if (u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength) return /** @type {!ArrayBuffer} */ (u8.buffer);
   return /** @type {!ArrayBuffer} */ (u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength));
 }
 
@@ -500,23 +502,22 @@ function buildRequestURL(url, method, compression, timestampMode) {
 }
 
 /**
- * Upstream gzipCompress over CompressionStream (async).
- * @param {string} input
- * @param {function(?ArrayBuffer, *)} done (buffer, error)
+ * Upstream preEncodeAsync: the body gzipped by the validated native
+ * gzipCompress (core/gzip.js). Rejects with the compression error.
+ * @param {!RequestOptions} options
+ * @return {!Promise<!EncodedBody>}
  */
-function gzipNative(input, done) {
+function preEncodeAsync(options) {
+  let json;
   try {
-    const CS = win['CompressionStream'];
-    const R = win['Response'];
-    const stream = new Blob([input])['stream']()['pipeThrough'](new CS('gzip'));
-    new R(stream)['arrayBuffer']()['then'](function(buf) {
-      done(buf, null);
-    }, function(err) {
-      done(null, err);
-    });
+    json = jsonStringify(options.data);
   } catch (e) {
-    done(null, e);
+    return Promise.reject(e);
   }
+  return gzipCompress(json).then(function(bytes) {
+    const body = toArrayBuffer(bytes);
+    return /** @type {!EncodedBody} */ ({contentType: CONTENT_TYPE_PLAIN, body: body, estimatedSize: body.byteLength});
+  });
 }
 
 /**
@@ -577,13 +578,11 @@ export function request(_options, onResponse) {
   if (transport !== 'sendBeacon' && !options.preferSyncCompression && options.data &&
       options.compression === COMPRESSION_GZIP_JS && win['CompressionStream'] && win['Promise'] &&
       !nativeAsyncGzipDisabled) {
-    gzipNative(jsonStringify(options.data), function(buf, err) {
-      if (buf) {
-        safeTransport(options, {contentType: CONTENT_TYPE_PLAIN, body: buf, estimatedSize: buf.byteLength});
-        return;
-      }
-      const name = err && err['name'];
-      if (name === 'NotReadableError') {
+    preEncodeAsync(options).then(function(encoded) {
+      safeTransport(options, encoded);
+    })['catch'](function(error) {
+      if (isNativeAsyncGzipReadError(error)) {
+        // Safari 16: native gzip is off for good and this body goes uncompressed.
         nativeAsyncGzipDisabled = true;
         const copy = /** @type {!RequestOptions} */ (assign(options));
         copy.compression = undefined;
@@ -591,6 +590,9 @@ export function request(_options, onResponse) {
         safeTransport(copy);
         return;
       }
+      // Invalid native output turns native gzip off; either way this body falls
+      // back to the sync encoder.
+      if (isNativeAsyncGzipError(error)) nativeAsyncGzipDisabled = true;
       safeTransport(options);
     });
   } else {

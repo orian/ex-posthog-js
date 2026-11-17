@@ -1,10 +1,16 @@
 /**
- * @fileoverview Synchronous gzip (RFC 1952) with an LZ77 + fixed-Huffman
- * deflate encoder. Stands in for upstream's fflate `gzipSync`, which upstream
- * uses for beacons, `send_instantly` captures and when CompressionStream is
- * unavailable. The output is standard gzip (any inflater decodes it); the
- * compression ratio is lower than fflate's dynamic-Huffman output.
+ * @fileoverview gzip for request bodies and replay fields.
+ *
+ * - Synchronous gzip (RFC 1952) with an LZ77 + fixed-Huffman deflate encoder.
+ *   Stands in for upstream's fflate `gzipSync`, which upstream uses for
+ *   beacons, `send_instantly` captures and when CompressionStream is
+ *   unavailable or failed. The output is standard gzip (any inflater decodes
+ *   it); the compression ratio is lower than fflate's dynamic-Huffman output.
+ * - Native gzip: posthog core gzip.ts (isGzipSupported, gzipCompress with its
+ *   output validation, isNativeAsyncGzipError / isNativeAsyncGzipReadError),
+ *   used by the request path and by session replay.
  */
+import {win} from './utils.js';
 
 /**
  * CRC-32 lookup tables for slicing-by-8: table k (at k * 256) advances a byte
@@ -239,4 +245,118 @@ export function gzipSync(s) {
   for (let k = 0; k < 4; k++) w.byte((crc >>> (8 * k)) & 0xff);
   for (let k = 0; k < 4; k++) w.byte((size >>> (8 * k)) & 0xff);
   return w.buf.subarray(0, w.pos);
+}
+
+// ---- native gzip (CompressionStream), posthog core gzip.ts -----------------------------
+
+/** @const {string} */
+const NATIVE_GZIP_VALIDATION_ERROR = 'NativeGzipValidationError';
+
+/** @return {boolean} posthog core isGzipSupported */
+export function isGzipSupported() {
+  const R = win ? win['Response'] : undefined;
+  return !!win && 'CompressionStream' in win && 'TextEncoder' in win && 'Response' in win &&
+      typeof R['prototype']['blob'] === 'function';
+}
+
+/**
+ * @param {*} error
+ * @return {string} the error's name, '' when it is not an object
+ */
+function errorName(error) {
+  if (!error || typeof error !== 'object') return '';
+  return 'name' in error ? String(error['name']) : '';
+}
+
+/**
+ * posthog core isNativeAsyncGzipReadError: Safari 16's NotReadableError.
+ * @param {*} error
+ * @return {boolean}
+ */
+export function isNativeAsyncGzipReadError(error) {
+  return errorName(error) === 'NotReadableError';
+}
+
+/**
+ * posthog core isNativeAsyncGzipError: a read error or invalid output.
+ * @param {*} error
+ * @return {boolean}
+ */
+export function isNativeAsyncGzipError(error) {
+  const name = errorName(error);
+  return name === 'NotReadableError' || name === NATIVE_GZIP_VALIDATION_ERROR;
+}
+
+/**
+ * @param {string} reason
+ * @return {!Error}
+ */
+function validationError(reason) {
+  const e = new Error('Native gzip produced invalid output: ' + reason);
+  e.name = NATIVE_GZIP_VALIDATION_ERROR;
+  return e;
+}
+
+/**
+ * Upstream validateNativeGzip(compressed, inputBytes), on the compressed bytes
+ * read back once. Upstream reads the 10-byte header and the 8-byte trailer as
+ * two blob slices, then (in its callers) the whole blob a third time; one read
+ * of the whole blob gives the same bytes, so the same checks run in the same
+ * order and fail with the same errors.
+ * @param {?} compressed Blob
+ * @param {!Uint8Array} inputBytes
+ * @return {!Promise<!Uint8Array>} the compressed bytes
+ */
+function readValidatedNativeGzip(compressed, inputBytes) {
+  if (compressed['size'] < 18) return Promise.reject(validationError('too-short'));
+  return compressed['arrayBuffer']().then(function(buf) {
+    const bytes = new Uint8Array(/** @type {!ArrayBuffer} */ (buf));
+    // The header is bytes 0-9; size >= 18, so upstream's `length >= 2` check holds.
+    if (!(bytes[0] === 0x1f && bytes[1] === 0x8b) || bytes[2] !== 0x08) throw validationError('invalid-header');
+    const trailer = new DataView(/** @type {!ArrayBuffer} */ (buf), bytes.length - 8, 8);
+    if (trailer.getUint32(0, true) !== crc32(inputBytes)) throw validationError('invalid-crc');
+    if (trailer.getUint32(4, true) !== (inputBytes.length >>> 0)) throw validationError('invalid-size');
+    return bytes;
+  });
+}
+
+/**
+ * posthog core gzipCompress(input, isDebug, {rethrow: true}), resolving with
+ * the validated compressed bytes (a view over the whole ArrayBuffer read from
+ * the Blob) rather than the Blob they were read from.
+ * @param {string} input
+ * @return {!Promise<!Uint8Array>}
+ */
+export function gzipCompress(input) {
+  try {
+    const TE = win['TextEncoder'];
+    const inputBytes = /** @type {!Uint8Array} */ (new TE()['encode'](input));
+    const CS = win['CompressionStream'];
+    const stream = new CS('gzip');
+    const writer = stream['writable']['getWriter']();
+    const writePromise = writer['write'](inputBytes)['then'](function() {
+      return writer['close']();
+    })['catch'](function(err) {
+      let aborted;
+      try {
+        aborted = Promise.resolve(writer['abort'](err));
+      } catch (e) {
+        aborted = Promise.resolve();
+      }
+      return aborted.then(function() {
+        throw err;
+      }, function() {
+        throw err;
+      });
+    });
+    // Still collected as a Blob like upstream: Safari 16's NotReadableError,
+    // which turns native gzip off, is a blob read error.
+    const R = win['Response'];
+    const responsePromise = new R(stream['readable'])['blob']();
+    return Promise.all([responsePromise, writePromise]).then(function(results) {
+      return readValidatedNativeGzip(results[0], inputBytes);
+    });
+  } catch (e) {
+    return Promise.reject(e);
+  }
 }

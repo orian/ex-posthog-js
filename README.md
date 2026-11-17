@@ -598,7 +598,9 @@ What remains is native work that upstream does too:
 
 - `Response.blob()` and the blob read, CompressionStream setup and
   `close()`, and serialising the fields;
-- `request.js` compresses `/e/` bodies through a `Blob` stream (~25 ms);
+- `request.js` compresses `/e/` bodies with CompressionStream (~25 ms; it
+  now also validates the output like upstream, with the same single read,
+  see [Fixed differences](#scope));
 - the first `document.cookie` read in each capture (~26 ms; Chrome caches
   later reads within the task);
 - the persistence fingerprint's `JSON.stringify`.
@@ -1256,5 +1258,18 @@ conversations, site apps, WebMCP.
   reads to drop the entry's server timings. recorder.js's plugin has its own
   WeakSet, so our mask function drops those server timings itself (same
   result).
+
+**Fixed differences** (each has a diff scenario that failed before the fix)
+
+- Request compression is validated like upstream. `/e/` (and every other
+  gzip-js) body compressed with CompressionStream is checked with upstream's
+  `validateNativeGzip` (header, CRC-32 and size trailer; the code in
+  `src/core/gzip.js` that session replay also uses). Invalid output turns
+  native gzip off and the body is compressed synchronously; a
+  `NotReadableError` turns it off and sends that body uncompressed; any
+  other error falls back to the sync encoder for that body only. Before,
+  invalid output was sent as is (or uncompressed, without a gzip header).
+  Scenarios `gzip_native_bad_crc`, `gzip_native_bad_header`,
+  `gzip_native_throws_once`, `gzip_native_not_readable`.
 
 PostHog's original license is kept in `LICENSE.upstream`.

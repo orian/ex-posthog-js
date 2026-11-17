@@ -35,9 +35,8 @@ import {
   STYLE_SHEET_RULE_SOURCE_TYPE, UNSTRINGIFIABLE_EVENT_SIZE, buildNetworkRequestOptions, circularReferenceReplacer,
   estimateCompressedEventSize, estimateSize, splitBuffer, truncateLargeConsoleLogs,
 } from './utils.js';
-import {
-  gzipField, gzipFieldAsync, gzipToString, gzipToStringAsync, isGzipSupported, isNativeAsyncGzipError,
-} from './gzip-field.js';
+import {gzipField, gzipFieldAsync, gzipToString, gzipToStringAsync} from './gzip-field.js';
+import {isGzipSupported, isNativeAsyncGzipError} from '../core/gzip.js';
 import {JSON_LD_EVENT_TAG, startJsonLdCapture} from './json-ld.js';
 import {provideLazy} from '../core/lazy.js';
 import {

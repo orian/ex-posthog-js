@@ -1,4 +1,4 @@
-// Native (CompressionStream) gzip of replay event fields: the validated
+// Native (CompressionStream) gzip (core/gzip.js, used by requests and replay event fields): the validated
 // single-read path must make exactly the decisions upstream's validateNativeGzip
 // makes (header and trailer read back as blob slices, then the whole blob
 // read again), with the same output or the same error. Also checks crc32
@@ -8,8 +8,8 @@ import assert from 'node:assert/strict'
 import zlib from 'node:zlib'
 
 globalThis.window = globalThis
-const { crc32, gzipSync } = await import('../src/core/gzip.js')
-const { gzipToStringAsync, gzipFieldAsync, isNativeAsyncGzipError } = await import('../src/replay/gzip-field.js')
+const { crc32, gzipSync, isNativeAsyncGzipError } = await import('../src/core/gzip.js')
+const { gzipToStringAsync, gzipFieldAsync } = await import('../src/replay/gzip-field.js')
 const { circularReferenceReplacer } = await import('../src/replay/utils.js')
 
 function rng(seed) {
