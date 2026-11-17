@@ -31,10 +31,10 @@ their optional parts on demand, in headless Chrome with 4x CPU throttling
 
 | | official `array.js` | ours `lazy/posthog.js` | gain |
 |---|---|---|---|
-| Main script (gzip) | 122.4 KB | 84.0 KB | **-31%** |
-| Downloaded at startup | 171 KB | 84.0 KB | **-51%** |
-| Downloaded with session replay on | 244 KB | 153 KB | **-37%** |
-| Downloaded with every ported feature on | 272 KB | 167 KB | **-39%** |
+| Main script (gzip) | 122.4 KB | 85.5 KB | **-30%** |
+| Downloaded at startup | 171 KB | 85.5 KB | **-50%** |
+| Downloaded with session replay on | 244 KB | 154.6 KB | **-37%** |
+| Downloaded with every ported feature on | 272 KB | 168.6 KB | **-38%** |
 | Script load + parse + eval | 36.8 ms | 21.5 ms | **-42%** |
 | `posthog.init()` | 26.0 ms | 16.5 ms | **-37%** |
 | 1000 `capture()` calls | 495-580 ms | 269-297 ms | **~-50%** |
@@ -834,26 +834,26 @@ upstream/          shallow clone of PostHog/posthog-js, kept for reference only 
 
 | Output | Contents | gzip |
 |---|---|---|
-| `dist/posthog.core.js` | core only | ~37.0 KB |
-| `dist/posthog.core-flags.js` | core + feature flags | ~43.7 KB |
-| `dist/posthog.full.js` | everything: all modules below | ~112.8 KB |
-| `dist/chunks/core.js` | core chunk | ~38.4 KB |
-| `dist/chunks/flags.js` | flags chunk (needs core) | ~7.4 KB |
+| `dist/posthog.core.js` | core only | ~38.6 KB |
+| `dist/posthog.core-flags.js` | core + feature flags | ~45.3 KB |
+| `dist/posthog.full.js` | everything: all modules below | ~114.1 KB |
+| `dist/chunks/core.js` | core chunk | ~40.0 KB |
+| `dist/chunks/flags.js` | flags chunk (needs core) | ~7.3 KB |
 | `dist/chunks/experiments.js` | experiments chunk (needs flags) | ~6.5 KB |
 | `dist/chunks/exceptions.js` | exception capture chunk (needs core) | ~8.5 KB |
 | `dist/chunks/dom.js` | shared DOM helpers (needs core) | ~3.9 KB |
 | `dist/chunks/autocapture.js` | autocapture chunk (needs dom) | ~3.5 KB |
 | `dist/chunks/deadclicks.js` | dead clicks chunk (needs dom) | ~4.5 KB |
 | `dist/chunks/heatmaps.js` | heatmaps chunk (needs deadclicks) | ~1.5 KB |
-| `dist/chunks/replay.js` | session replay chunk (needs core) | ~23.6 KB |
+| `dist/chunks/replay.js` | session replay chunk (needs core) | ~23.1 KB |
 | `dist/chunks/webvitals.js` | web vitals chunk, web-vitals library included (needs core) | ~7.9 KB |
 | `dist/chunks/tracingheaders.js` | tracing headers chunk (needs core) | ~2.7 KB |
 | `dist/chunks/otlp.js` | shared OTLP helpers (needs core) | ~1.9 KB |
 | `dist/chunks/logs.js` | logs and console capture (needs otlp) | ~6.5 KB |
 | `dist/chunks/metrics.js` | metrics (needs otlp) | ~5.3 KB |
 | `dist/chunks/toolbar.js` | toolbar loader (needs core) | ~1.4 KB |
-| `dist/lazy/posthog.js` | the lazy build's main script: like `array.js` (see below) | ~84.0 KB |
-| `dist/lazy/replay.js` | replay recorder logic (upstream `lazy-recorder.js` without rrweb) | ~21.2 KB |
+| `dist/lazy/posthog.js` | the lazy build's main script: like `array.js` (see below) | ~85.5 KB |
+| `dist/lazy/replay.js` | replay recorder logic (upstream `lazy-recorder.js` without rrweb) | ~20.9 KB |
 | `dist/lazy/exception-autocapture.js` | error wrapping functions | ~0.9 KB |
 | `dist/lazy/dead-clicks-autocapture.js` | dead click detector | ~3.9 KB |
 | `dist/lazy/web-vitals.js` | Google's web-vitals, every flavour | ~5.9 KB |
