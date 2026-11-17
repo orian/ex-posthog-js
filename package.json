@@ -11,7 +11,9 @@
     "test:compiled": "node test/run.mjs compiled",
     "test:chrome": "node test/smoke-chrome.mjs",
     "test:replay": "node --test test/replay.test.mjs",
-    "bench:session": "node test/bench/session.mjs"
+    "bench:session": "node test/bench/session.mjs",
+    "build:recorder": "./scripts/build-recorder.sh",
+    "test:recorder-equivalence": "node test/bench/recorder-equivalence.mjs"
   },
   "license": "MIT"
 }

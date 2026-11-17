@@ -914,6 +914,34 @@ file ourselves from PostHog's fork, vendored in
   decoded `$snapshot` payloads, node ids included. That is the evidence that
   the rebuild records exactly what PostHog's build records.
 
+#### Recording equivalence test
+
+The diff suite compares our SDK with the official one on short scenarios.
+Changes to the fork itself are checked against the unmodified fork on the
+session benchmark's journeys:
+
+```sh
+./scripts/build.sh
+npm run test:recorder-equivalence                      # 60 s journeys, 4x CPU, seed 1
+npm run test:recorder-equivalence -- --runs 3 --duration 120 --seed 7
+npm run test:recorder-equivalence -- --self            # original vs original (harness check)
+```
+
+It builds `third_party/posthog-rrweb/original` and `src` into
+`dist/equivalence/`, loads both into the demo app page, then our
+`posthog.full.js` with replay on. The SDK sees one rrweb whose `record`
+starts both recorders with the options it passes (plugins included) and
+forwards `addCustomEvent`, `takeFullSnapshot` and `freezePage` to both, so
+both record the same DOM, input and SDK calls at the same time. Each
+recorder's events are serialised as they are emitted; after the journeys the
+two streams must be identical, event for event, node ids included. Only each
+event's wall-clock `timestamp` is normalised. The two copies run on a shared
+clock (test builds only, `build.mjs --equivalence`): `Date.now` is frozen for
+the duration of a task and timers due at the same moment run in one task, so
+a millisecond ticking between the two copies' handlers can't change a
+throttle decision (mouse moves, scroll). A 60 s run records ~650-750 events
+(~1.2 MB).
+
 ## Closure conventions
 
 - Everything that crosses the SDK boundary uses **quoted keys**, so ADVANCED
