@@ -2,7 +2,7 @@
 // unmodified fork records? Both builds record the same session-bench journeys in the
 // same page at the same time, and their event streams are compared.
 //
-//   npm run test:recorder-equivalence -- [--duration S] [--seed N] [--throttle R] [--runs N] [--no-build]
+//   npm run test:recorder-equivalence -- [--duration S] [--seed N] [--throttle R] [--runs N] [--fuzz B] [--no-build]
 //
 // - Builds third_party/posthog-rrweb/original (PostHog's fork as published in posthog-js
 //   1.450.0) and third_party/posthog-rrweb/src (ours) with scripts/build-recorder.sh
@@ -17,6 +17,12 @@
 // - Every event each recorder emits is serialised when emitted. After the journeys the
 //   two streams must be identical: same events, same order, same node ids. Only the
 //   wall-clock `timestamp` of each event is normalised.
+//
+// - Then, in the same page, a seeded DOM fuzz (`--fuzz B` batches, default 400; 0 = off)
+//   exercises what the journeys rarely do: nodes removed and re-added in one batch, a
+//   removed subtree's children moved elsewhere, nested moves, blocked (ph-no-capture)
+//   containers, text/attribute/style changes, innerHTML replacement, and batches
+//   recorded while the page is frozen (freezePage, unfrozen by a custom event).
 //
 // Why a shared clock: rrweb's throttles (mouse moves, scroll, viewport) decide on
 // Date.now(). The two recorders handle the same event one after the other, and a
@@ -47,6 +53,7 @@ const opts = {
     runs: Number(opt('--runs', 1)),
     build: !args.includes('--no-build'),
     self: args.includes('--self'),
+    fuzz: Number(opt('--fuzz', 400)),
 }
 const VIEWPORT = { width: 1280, height: 800 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
@@ -171,6 +178,13 @@ function injected(CFG) {
     start()
 }
 
+// rrweb's own console warnings (e.g. "[rrweb] dropped N node(s)") are seen by the console
+// plugin of both copies, so each stream gets both copies' warnings, in an order that
+// depends on which copy ran first. They are compared separately (same messages, same
+// count); the recorded DOM data they describe is compared in the streams.
+const isRecorderWarning = (e) => e.type === 6 && e.data && e.data.plugin === 'rrweb/console@1' &&
+    JSON.stringify(e.data.payload && e.data.payload.payload).startsWith('["\\"[rrweb]')
+
 function normalise(json) {
     const e = JSON.parse(json)
     if (typeof e.timestamp === 'number') e.timestamp = '<t>'
@@ -188,6 +202,103 @@ function firstDiff(a, b, p = '') {
         if (d) return d
     }
     return null
+}
+
+// Runs in the page: `batches` tasks of random DOM operations under document.body.
+function domFuzz(seed, batches) {
+    let a = seed >>> 0
+    const rnd = () => {
+        a = (a + 0x6d2b79f5) >>> 0
+        let t = a
+        t = Math.imul(t ^ (t >>> 15), t | 1)
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+    }
+    const pick = (xs) => xs[Math.floor(rnd() * xs.length)]
+    const record = window.__PosthogExtensions__.rrweb.record
+    const root = document.createElement('div')
+    root.id = 'fuzz-root'
+    document.body.appendChild(root)
+    const TAGS = ['div', 'span', 'p', 'ul', 'li', 'section', 'b', 'a', 'input', 'textarea']
+    let made = 0
+    const make = (depth) => {
+        const tag = pick(TAGS)
+        const el = document.createElement(tag)
+        if (rnd() < 0.3) el.className = pick(['x', 'y', 'ph-no-capture', 'ph-mask', 'x y'])
+        if (tag === 'a') el.setAttribute('href', '/p/' + made)
+        if (tag === 'input') el.setAttribute('value', 'v' + made)
+        if (tag !== 'input') {
+            el.appendChild(document.createTextNode('t' + made++))
+            const n = depth > 0 ? Math.floor(rnd() * 4) : 0
+            for (let i = 0; i < n; i++) el.appendChild(make(depth - 1))
+        }
+        return el
+    }
+    for (let i = 0; i < 8; i++) root.appendChild(make(3))
+    const all = () => Array.from(root.querySelectorAll('*')).filter((e) => e.tagName !== 'INPUT' || true)
+    const containers = () => [root, ...all().filter((e) => e.tagName !== 'INPUT')]
+    const op = () => {
+        const els = all()
+        const r = rnd()
+        if (r < 0.15) pick(containers()).appendChild(make(2))
+        else if (r < 0.27 && els.length) { const e = pick(els); e.remove() }
+        else if (r < 0.40 && els.length) {
+            // move: into another container that is not inside it
+            const e = pick(els), to = pick(containers())
+            if (to !== e && !e.contains(to)) to.insertBefore(e, rnd() < 0.5 ? null : to.firstChild)
+        } else if (r < 0.52 && els.length) {
+            // remove a subtree, then move one of its descendants elsewhere (same batch)
+            const e = pick(els)
+            const kids = Array.from(e.querySelectorAll('*'))
+            e.remove()
+            if (kids.length) pick(containers()).appendChild(pick(kids))
+        } else if (r < 0.60 && els.length) {
+            // remove and re-add the same node
+            const e = pick(els), parent = e.parentNode, next = e.nextSibling
+            e.remove()
+            if (parent && (parent === root || root.contains(parent))) parent.insertBefore(e, next && next.parentNode === parent ? next : null)
+        } else if (r < 0.70 && els.length) {
+            const e = pick(els)
+            const tn = Array.from(e.childNodes).find((n) => n.nodeType === 3)
+            if (tn) tn.data = 'c' + made++
+            else e.appendChild(document.createTextNode('n' + made++))
+        } else if (r < 0.80 && els.length) {
+            const e = pick(els)
+            const k = rnd()
+            if (k < 0.3) e.classList.toggle('ph-no-capture')
+            else if (k < 0.6) e.setAttribute('data-k', String(made++))
+            else e.setAttribute('style', 'color: red; margin: ' + Math.floor(rnd() * 9) + 'px')
+        } else if (r < 0.86 && els.length) {
+            const e = pick(els.filter((x) => x.tagName !== 'INPUT')) || root
+            e.innerHTML = '<i>h' + made++ + '</i><b>j<u>k</u></b>'
+        } else if (r < 0.92 && els.length) {
+            // wrap: move a node into a new element inserted in its place
+            const e = pick(els), w = document.createElement('div')
+            if (e.parentNode) { e.parentNode.insertBefore(w, e); w.appendChild(e) }
+        } else if (els.length > 1) {
+            // swap two siblings
+            const e = pick(els)
+            if (e.previousSibling && e.parentNode) e.parentNode.insertBefore(e, e.previousSibling)
+        }
+    }
+    return new Promise((resolve) => {
+        let i = 0
+        let frozen = false
+        const step = () => {
+            if (i++ >= batches) {
+                if (frozen) record.addCustomEvent('fuzz-unfreeze', { i })
+                resolve(made)
+                return
+            }
+            if (!frozen && rnd() < 0.04) { record.freezePage(); frozen = true }
+            else if (frozen && rnd() < 0.2) { record.addCustomEvent('fuzz-unfreeze', { i }); frozen = false }
+            const n = 1 + Math.floor(rnd() * 12)
+            for (let k = 0; k < n; k++) op()
+            if (root.querySelectorAll('*').length > 600) root.innerHTML = ''
+            setTimeout(step, 0)
+        }
+        step()
+    })
 }
 
 async function runOnce(chrome, srv, run) {
@@ -215,12 +326,21 @@ async function runOnce(chrome, srv, run) {
     await sleep(1000)
     const human = new Human(page, opts.seed + run, { budgetMs: opts.duration * 1000, viewport: VIEWPORT })
     await siteSession(human)
+    if (opts.fuzz) await page.evaluate(`(${domFuzz})(${opts.seed + run}, ${opts.fuzz})`)
     await sleep(1000)
     const res = JSON.parse(await page.evaluate(`JSON.stringify({a: __rrEquiv.a, b: __rrEquiv.b, errors: __rrEquiv.errors})`))
     const pageErrors = page.consoleErrors.slice(0, 5)
     await page.close()
-    const a = res.a.map(normalise)
-    const b = res.b.map(normalise)
+    // Each copy's warnings, told apart by the script URL in the stack trace (the console
+    // plugin itself is the original's code, so any frame from current/ means current).
+    const warnings = (copy) => res.a.map((x) => JSON.parse(x)).filter(isRecorderWarning)
+        .filter((e) => JSON.stringify(e.data.payload.trace || []).includes('/equivalence/current/') === (copy === 'current'))
+        .map((e) => JSON.stringify(e.data.payload.payload)).join()
+    const a = res.a.filter((x) => !isRecorderWarning(JSON.parse(x))).map(normalise)
+    const b = res.b.filter((x) => !isRecorderWarning(JSON.parse(x))).map(normalise)
+    if (!opts.self && warnings('original') !== warnings('current')) {
+        res.errors.push(`rrweb console warnings differ: original=${warnings('original').slice(0, 200)} current=${warnings('current').slice(0, 200)}`)
+    }
     const types = {}
     for (const e of res.a) { const t = JSON.parse(e).type; types[t] = (types[t] || 0) + 1 }
     const diffs = []

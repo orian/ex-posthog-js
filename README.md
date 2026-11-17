@@ -939,8 +939,21 @@ event's wall-clock `timestamp` is normalised. The two copies run on a shared
 clock (test builds only, `build.mjs --equivalence`): `Date.now` is frozen for
 the duration of a task and timers due at the same moment run in one task, so
 a millisecond ticking between the two copies' handlers can't change a
-throttle decision (mouse moves, scroll). A 60 s run records ~650-750 events
-(~1.2 MB).
+throttle decision (mouse moves, scroll).
+
+The journeys alone rarely hit some mutation paths (a removed subtree whose
+children are re-added elsewhere in the same batch never happens on the demo
+app), so after them the same page runs a seeded DOM fuzz (`--fuzz B`, 400
+batches by default, `0` turns it off): one task per batch of random appends,
+removes, moves, remove-then-move-a-descendant, remove-and-re-add, wraps,
+sibling swaps, `innerHTML` replacement, text, attribute, style and
+`ph-no-capture`/`ph-mask` class changes, with some batches recorded while
+the page is frozen (`freezePage`, then a custom event unfreezes it). rrweb's
+own console warnings (`[rrweb] dropped N node(s)`) are captured by both
+copies' console plugins, so they are compared per copy (told apart by the
+stack trace) rather than in stream order. A 60 s run records about 1,050
+events (1.8 MB). A build that ignores removed parents fails within 5 s of
+fuzz; the original against itself (`--self`) is identical.
 
 ## Closure conventions
 
