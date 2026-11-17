@@ -31,10 +31,10 @@ their optional parts on demand, in headless Chrome with 4x CPU throttling
 
 | | official `array.js` | ours `lazy/posthog.js` | gain |
 |---|---|---|---|
-| Main script (gzip) | 122.4 KB | 82.4 KB | **-33%** |
-| Downloaded at startup | 171 KB | 82.4 KB | **-52%** |
-| Downloaded with session replay on | 244 KB | 151 KB | **-38%** |
-| Downloaded with every ported feature on | 272 KB | 165 KB | **-39%** |
+| Main script (gzip) | 122.4 KB | 84.0 KB | **-31%** |
+| Downloaded at startup | 171 KB | 84.0 KB | **-51%** |
+| Downloaded with session replay on | 244 KB | 153 KB | **-37%** |
+| Downloaded with every ported feature on | 272 KB | 167 KB | **-39%** |
 | Script load + parse + eval | 36.8 ms | 21.5 ms | **-42%** |
 | `posthog.init()` | 26.0 ms | 16.5 ms | **-37%** |
 | 1000 `capture()` calls | 495-580 ms | 269-297 ms | **~-50%** |
@@ -49,8 +49,8 @@ their optional parts on demand, in headless Chrome with 4x CPU throttling
   a faster CRC-32 (436 -> 233 ms), and no redundant storage writes (195 -> 100
   ms), all without changing a single byte sent or stored. See
   [Benchmarks](#benchmarks) and the CPU profile there.
-- **Pick what you load**: `posthog.core.js` alone is 35.2 KB gzip; every module
-  is also a separate chunk, so core + flags is about 44 KB.
+- **Pick what you load**: `posthog.core.js` alone is 36.8 KB gzip; every module
+  is also a separate chunk, so core + flags is about 46 KB.
 - **Fewer requests**: no `surveys.js` on every page (surveys are not ported),
   and no per-feature script unless the feature is on.
 
@@ -77,17 +77,17 @@ are gzip -9; "downloaded" is every SDK script the page loaded.
 
 | | official `array.js` | ours `lazy/posthog.js` |
 |---|---|---|
-| Main script | `array.js` 122.4 KB (372 KB raw) | `posthog.js` 82.4 KB (231 KB raw), ~0.67x |
-| Downloaded at startup, default setup | 171 KB: `array.js` + `surveys.js` 48.7 (fetched even with surveys off; not ported here) | 82.4 KB, ~0.48x (0.67x without `surveys.js`) |
-| Downloaded with session replay on | 244 KB: + `lazy-recorder.js` 72.5 | 151 KB: + `replay.js` 21.2 + PostHog's `recorder.js` 46.5, ~0.62x |
-| Downloaded with replay, exceptions, dead clicks, web vitals, tracing headers and console logs on | 272 KB: + `web-vitals-with-attribution.js` 7.0, `exception-autocapture.js` 6.5, `dead-clicks-autocapture.js` 8.5, `logs.js` 2.8, `tracing-headers.js` 2.6 | 165 KB: + `web-vitals.js` 5.9, `exception-autocapture.js` 0.9, `dead-clicks-autocapture.js` 3.9, `logs.js` 1.6, `tracing-headers.js` 2.2, ~0.61x |
+| Main script | `array.js` 122.4 KB (372 KB raw) | `posthog.js` 84.0 KB (234 KB raw), ~0.69x |
+| Downloaded at startup, default setup | 171 KB: `array.js` + `surveys.js` 48.7 (fetched even with surveys off; not ported here) | 84.0 KB, ~0.49x (0.69x without `surveys.js`) |
+| Downloaded with session replay on | 244 KB: + `lazy-recorder.js` 72.5 | 153 KB: + `replay.js` 21.2 + PostHog's `recorder.js` 46.5, ~0.63x |
+| Downloaded with replay, exceptions, dead clicks, web vitals, tracing headers and console logs on | 272 KB: + `web-vitals-with-attribution.js` 7.0, `exception-autocapture.js` 6.5, `dead-clicks-autocapture.js` 8.5, `logs.js` 2.8, `tracing-headers.js` 2.6 | 167 KB: + `web-vitals.js` 5.9, `exception-autocapture.js` 0.9, `dead-clicks-autocapture.js` 3.9, `logs.js` 1.6, `tracing-headers.js` 2.2, ~0.61x |
 | Script download + parse + eval (default setup) | 36.8 ms (1x) | 21.5 ms (~0.58x) |
 | `posthog.init()` (default / everything on) | 26.0 / 30.8 ms | 16.5 / 20.7 ms (~0.65x) |
 | 1000 `capture()` calls (incl. client rate limiting) | 495-580 ms | 269-297 ms (~0.5x) |
 | Long tasks during the test | 1 (540-626 ms) | 1 (293-327 ms) |
 
 Without `surveys.js` (not ported), the like-for-like gaps are the main script
-(82.4 vs 122.4 KB) and each lazy part (ours are smaller: e.g. our
+(84.0 vs 122.4 KB) and each lazy part (ours are smaller: e.g. our
 `exception-autocapture.js` reuses the stack parser already in `posthog.js`,
 where upstream's bundles its own copy; `replay.js` + `recorder.js` is 67.7 KB
 vs `lazy-recorder.js` 72.5 KB). Our lazy build makes the same number of
@@ -99,19 +99,19 @@ loads `lazy-recorder.js`.
 
 | | official | ours |
 |---|---|---|
-| Core only | `module.slim` 54.0 KB (npm build) | `posthog.core.js` 35.4 KB |
-| Everything in one main script | `array.full.js` 231 KB (also includes surveys; still lazy-loads some parts) | `posthog.full.js` 111.3 KB; only `recorder.js` (46.5) is downloaded, when replay is on |
+| Core only | `module.slim` 54.0 KB (npm build) | `posthog.core.js` 37.0 KB |
+| Everything in one main script | `array.full.js` 231 KB (also includes surveys; still lazy-loads some parts) | `posthog.full.js` 112.8 KB; only `recorder.js` (46.5) is downloaded, when replay is on |
 
 | default setup | load + eval | `init()` | 1000 captures | downloaded |
 |---|---|---|---|---|
 | official `array.js` | 36.8 ms | 26.0 ms | 495 ms | 171 KB |
-| ours `posthog.full.js` | 23.1 ms | 17.1 ms | 282 ms | 111 KB (158 KB with replay or everything on) |
-| ours `lazy/posthog.js` | 21.5 ms | 16.5 ms | 269 ms | 82 KB |
-| ours `posthog.core.js` | 17.7 ms | 11.8 ms | 269 ms | 35 KB |
+| ours `posthog.full.js` | 23.1 ms | 17.1 ms | 282 ms | 113 KB (160 KB with replay or everything on) |
+| ours `lazy/posthog.js` | 21.5 ms | 16.5 ms | 269 ms | 84 KB |
+| ours `posthog.core.js` | 17.7 ms | 11.8 ms | 269 ms | 37 KB |
 
 Surveys, product tours and conversations are not ported, so part of
 upstream's size has no counterpart here. Per-module chunk sizes are in the
-Build section; core + flags alone is about 44 KB.
+Build section; core + flags alone is about 46 KB.
 
 Other differences besides size and speed:
 
@@ -128,8 +128,10 @@ Other differences besides size and speed:
 - **Pick what you load.** Each module is also a Closure chunk; `posthog.core.js`
   plus only the chunks you need is smaller than any upstream CDN build.
 - **Synchronous gzip** (beacons on unload, `send_instantly`, browsers without
-  `CompressionStream`) uses our compact encoder instead of fflate: same decoded
-  payload, somewhat larger request bodies.
+  `CompressionStream`, replay's unload drain) uses our own deflate encoder
+  instead of fflate: same decoded payload, 0-10% smaller bodies (4% over the
+  corpus in [Sync gzip benchmark](#sync-gzip-benchmark)) in about the same
+  time.
 - **Lazy assets are pinned.** PostHog CDN assets are requested for the upstream
   version we track (`UPSTREAM_VERSION`, currently 1.450.0), e.g.
   `/static/1.450.0/recorder.js`, never for our own version. The diff test fails
@@ -147,6 +149,9 @@ see `test/diff/chrome.mjs`) against the fake PostHog server:
 - `npm run bench:session` (`test/bench/session.mjs`) measures a whole user
   session with analytics, autocapture and session replay on, on a realistic
   single page app, against a no-SDK baseline.
+
+A third, `node test/bench/gzip.mjs`, runs in Node: the sync gzip encoder
+against fflate (see [Sync gzip benchmark](#sync-gzip-benchmark)).
 
 #### Session benchmark
 
@@ -291,12 +296,15 @@ How to read it:
   (`$lib_version`); replay bodies within 0.1-1% (the recorded DOM contains the
   SDK and recorder `<script>` URLs, which differ by design, and mouse and
   scroll samples follow timing). The rrweb event count wobbles by ±1-2 between
-  runs in both. The 0.6 KB / 3.9 KB more on the wire
-  comes entirely from the three requests compressed synchronously: the initial
-  `$pageview` (`send_instantly`), the `$pageleave` and the last replay batch on
-  unload, which upstream gzips with fflate's dynamic Huffman and we with our
-  smaller fixed-Huffman encoder (868 vs 1,061, 1,313 vs 1,608 and 24.7 KB vs
-  29.0 KB); every CompressionStream-compressed request is the same size within
+  runs in both. On the wire the two are within about 0.3 KB (21.9 vs 22.0
+  KB of events, 203.6 vs 203.3 KB of replay in a 3-run median). The only
+  bodies that differ in size are the three compressed synchronously: the
+  initial `$pageview` (`send_instantly`), the `$pageleave` and the last
+  replay batch on unload, which upstream gzips with fflate and we with our
+  own encoder, a little smaller (e.g. 871 vs 882 and 1,303 vs 1,327 bytes
+  for that `$pageview` and `$pageleave`; it used to be 18% larger, see
+  [Sync gzip benchmark](#sync-gzip-benchmark)); every
+  CompressionStream-compressed request is the same size within
   a few bytes. Same data and same rrweb also mean the same first full snapshot
   time: about 6.6 s from navigation at 4x throttling (load, remote config, the
   recorder script, the snapshot of a 1,450-node page, then the first flush).
@@ -606,6 +614,64 @@ What remains is native work that upstream does too:
 - the persistence fingerprint's `JSON.stringify`.
 
 
+#### Sync gzip benchmark
+
+```sh
+node test/bench/gzip.mjs [--rounds N] [--markdown] [--ours path/to/gzip.js]
+```
+
+The synchronous encoder (`gzipSync` in `src/core/gzip.js`: beacons on unload,
+`send_instantly`, browsers without `CompressionStream`, replay's unload drain)
+against what upstream runs there, fflate 0.4.9's `gzipSync(strToU8(s),
+{mtime: 0})` at its default level (a dev-only copy in `test/third_party/`),
+and Node's zlib for reference. The corpus (`test/bench/gzip-corpus.mjs`, from
+a session benchmark log in `test/fixtures/gzip-corpus.json.gz`) is what the
+SDK gzips: `/e/` bodies from one event to a 30-event batch, and `$snapshot`
+batches as sent (`cv: '2024-10'` fields, gzip bytes as latin1) and with those
+fields decoded ("raw"), 296 B to 1.26 MB. Every output is checked with
+`zlib.gunzipSync`. Sizes are bytes; "before" is the previous fixed-Huffman
+encoder; times are ms per call in Node (UTF-8 encoding included, medians of
+21 rounds; zlib is native, so its times, 3-4x faster than fflate, are only a
+reference).
+
+| input | bytes | before | ours | fflate | zlib -6 | zlib -9 | ours vs fflate | ms: ours / fflate |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| custom event | 296 | 261 | 221 | 221 | 223 | 223 | +0.0% | 0.024 / 0.031 |
+| $identify | 1,860 | 1,095 | 900 | 912 | 908 | 905 | -1.3% | 0.039 / 0.039 |
+| $pageview (send_instantly) | 1,813 | 1,060 | 871 | 882 | 877 | 875 | -1.2% | 0.039 / 0.038 |
+| $pageleave | 3,284 | 1,607 | 1,303 | 1,327 | 1,305 | 1,304 | -1.8% | 0.057 / 0.051 |
+| $autocapture x1 | 3,303 | 1,662 | 1,347 | 1,369 | 1,351 | 1,350 | -1.6% | 0.052 / 0.051 |
+| $autocapture x4 | 12,684 | 2,119 | 1,740 | 1,770 | 1,739 | 1,739 | -1.7% | 0.108 / 0.109 |
+| mixed batch x5 | 16,076 | 2,745 | 2,277 | 2,324 | 2,273 | 2,269 | -2.0% | 0.134 / 0.138 |
+| all 30 events | 93,703 | 7,069 | 5,721 | 5,958 | 5,758 | 5,665 | -4.0% | 0.738 / 0.701 |
+| $snapshot small (cv) | 2,130 | 761 | 607 | 633 | 614 | 607 | -4.1% | 0.052 / 0.037 |
+| $snapshot medium (cv) | 9,121 | 1,589 | 1,207 | 1,298 | 1,238 | 1,206 | -7.0% | 0.089 / 0.092 |
+| $snapshot large (cv) | 84,488 | 28,509 | 23,762 | 24,445 | 23,549 | 23,245 | -2.8% | 1.43 / 1.14 |
+| $snapshot full (cv) | 115,927 | 86,684 | 71,551 | 73,143 | 71,315 | 70,913 | -2.2% | 3.80 / 2.82 |
+| $snapshot all (cv) | 442,551 | 244,188 | 202,163 | 207,872 | 201,848 | 200,137 | -2.7% | 11.4 / 9.33 |
+| $snapshot medium (raw) | 21,091 | 3,300 | 2,580 | 2,873 | 2,721 | 2,566 | -10.2% | 0.245 / 0.209 |
+| $snapshot large (raw) | 54,707 | 4,413 | 3,409 | 3,771 | 3,621 | 3,394 | -9.6% | 0.528 / 0.481 |
+| full snapshot data (field) | 233,251 | 33,164 | 26,917 | 28,740 | 27,941 | 26,569 | -6.3% | 2.97 / 2.83 |
+| $snapshot full (raw) | 485,232 | 66,482 | 53,563 | 56,585 | 55,746 | 52,271 | -5.3% | 6.28 / 6.02 |
+| $snapshot all (raw) | 1,255,757 | 166,630 | 131,645 | 140,145 | 138,659 | 127,536 | -6.1% | 16.6 / 15.2 |
+| **total events** | 133,019 | 17,618 | 14,380 | 14,763 | 14,434 | 14,330 | -2.6% | 1.19 / 1.16 |
+| **total replay** | 2,704,255 | 635,720 | 517,404 | 539,505 | 527,252 | 508,444 | -4.1% | 43.4 / 38.2 |
+| **total** | 2,837,274 | 653,338 | 531,784 | 554,268 | 541,686 | 522,774 | -4.1% | 44.6 / 39.3 |
+
+The encoder does lazy LZ77 matching (zlib's `deflate_slow`, looking for a
+longer match at every position, chains of 64, a 4-byte hash above 8 KB and a
+3-byte one below) and writes each 8192-symbol block as dynamic Huffman,
+fixed Huffman or stored, whichever is smallest by exact size. That is about
+zlib -6's output, below fflate's everywhere (fflate is greedy and caps
+blocks differently); the "before" encoder was 18% larger than fflate. The
+replay `cv` strings are the slowest case (up to about 1.4x fflate): their UTF-8
+alternates 0xC2/0xC3 with high bytes, which makes long hash chains; the
+4-byte hash keeps that in check. The encoder adds about 1.6 KB gzip to the
+core (see [Build](#build)). It has to stay in the core, also in the lazy
+build: it runs synchronously on unload (`sendBeacon`, replay's drain), when
+fetching a chunk is no longer possible, and upstream bundles fflate in its
+main script too.
+
 ## Layout
 
 ```
@@ -651,10 +717,10 @@ upstream/          shallow clone of PostHog/posthog-js, kept for reference only 
 
 | Output | Contents | gzip |
 |---|---|---|
-| `dist/posthog.core.js` | core only | ~35.4 KB |
-| `dist/posthog.core-flags.js` | core + feature flags | ~42.1 KB |
-| `dist/posthog.full.js` | everything: all modules below | ~111.3 KB |
-| `dist/chunks/core.js` | core chunk | ~36.9 KB |
+| `dist/posthog.core.js` | core only | ~37.0 KB |
+| `dist/posthog.core-flags.js` | core + feature flags | ~43.7 KB |
+| `dist/posthog.full.js` | everything: all modules below | ~112.8 KB |
+| `dist/chunks/core.js` | core chunk | ~38.4 KB |
 | `dist/chunks/flags.js` | flags chunk (needs core) | ~7.4 KB |
 | `dist/chunks/experiments.js` | experiments chunk (needs flags) | ~6.5 KB |
 | `dist/chunks/exceptions.js` | exception capture chunk (needs core) | ~8.5 KB |
@@ -669,7 +735,7 @@ upstream/          shallow clone of PostHog/posthog-js, kept for reference only 
 | `dist/chunks/logs.js` | logs and console capture (needs otlp) | ~6.5 KB |
 | `dist/chunks/metrics.js` | metrics (needs otlp) | ~5.3 KB |
 | `dist/chunks/toolbar.js` | toolbar loader (needs core) | ~1.4 KB |
-| `dist/lazy/posthog.js` | the lazy build's main script: like `array.js` (see below) | ~82.4 KB |
+| `dist/lazy/posthog.js` | the lazy build's main script: like `array.js` (see below) | ~84.0 KB |
 | `dist/lazy/replay.js` | replay recorder logic (upstream `lazy-recorder.js` without rrweb) | ~21.2 KB |
 | `dist/lazy/exception-autocapture.js` | error wrapping functions | ~0.9 KB |
 | `dist/lazy/dead-clicks-autocapture.js` | dead click detector | ~3.9 KB |
@@ -977,6 +1043,8 @@ node --test test/autocapture.test.mjs   # $elements_chain, value scrubbing, Rage
 node --test test/replay.test.mjs # session replay: status, triggers, sampling, buffering, compression
 node --test test/gzip-native.test.mjs  # native gzip validation (requests and replay), crc32 vs zlib
 node --test test/strtou8.test.mjs      # sync gzip's UTF-8 step vs fflate's strToU8
+node --test test/gzip-sync.test.mjs    # sync gzip encoder: corpus, fuzz, boundaries, large inputs vs zlib.gunzipSync
+node test/bench/gzip.mjs               # sync gzip size and speed vs fflate 0.4.9 and zlib
 ./scripts/build.sh && node test/diff/run.mjs [scenario ...]   # differential test vs official 1.450.0
 DIFF_BUNDLE=lazy/posthog.js node test/diff/run.mjs [scenario ...]   # the same against the lazy build
 node test/sanitizer-chrome.mjs   # html sanitiser vs real DOMPurify 3.4.13 (needs it in /tmp/dp, see the file)
@@ -1197,10 +1265,16 @@ conversations, site apps, WebMCP.
   `cookieWinsOnConflict` cross-subdomain identity reconciliation, cross-tab
   feature-flag merging, `/flags` timing metrics (`metrics.flags`),
   `rewriteRequestPath` ingestion-endpoint tracking (the rewrite itself works).
-- Sync gzip (beacons, `send_instantly`, no CompressionStream) uses a compact
-  LZ77 + fixed-Huffman encoder instead of fflate: same decoded payload
-  (the input is UTF-8 encoded by a port of fflate's `strToU8`), somewhat
-  larger bodies.
+- Sync gzip (beacons, `send_instantly`, no CompressionStream, replay's
+  unload drain) uses our own deflate encoder instead of fflate 0.4.9: same
+  decoded payload (the input is UTF-8 encoded like fflate's `strToU8`, see
+  above), different bytes. Lazy matching and per-block dynamic Huffman,
+  fixed or stored blocks make the bodies 4.1% smaller than fflate's over a
+  corpus of real payloads (2.6% for `/e/` bodies, 0-2% for single
+  events, 2-10% for `$snapshot` batches; never larger), within about 1.0-1.4x
+  of fflate's encode time (see [Sync gzip benchmark](#sync-gzip-benchmark)).
+  The replay batching that depends on compressed sizes on that path follows
+  fflate's sizes more closely than before.
 - Compiled in vs lazy-loaded. The items below marked *(compiled-in builds)*
   apply to `posthog.full.js` and the per-module chunks, where the lazy parts
   are compiled in. The lazy build (`lazy/posthog.js`) loads them where and
