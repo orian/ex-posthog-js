@@ -6,18 +6,21 @@
  *
  * Upstream lazy-loads `lazy-recorder.js` (rrweb + the recorder logic). Here
  * the recorder logic is the lazy part `replay` (recorder.js) and rrweb comes
- * from PostHog's `recorder.js` (rrweb + its plugins). In the bundles and chunks
- * the recorder logic is compiled in and only `recorder.js` is loaded; the lazy
- * build loads the `replay` chunk and `recorder.js` together where upstream
- * loads `lazy-recorder.js`. The `scriptConfig.script` remote override (which
- * picks another upstream bundle) is ignored.
+ * from our `recorder.js` (PostHog's rrweb fork + its plugins, built from
+ * third_party/posthog-rrweb), next to the SDK script, or from PostHog's CDN
+ * `recorder.js` with `closure_recorder_url: 'posthog'`. In the bundles and
+ * chunks the recorder logic is compiled in and only `recorder.js` is loaded;
+ * the lazy build loads the `replay` chunk and `recorder.js` together where
+ * upstream loads `lazy-recorder.js`. The `scriptConfig.script` remote
+ * override (which picks another upstream bundle) is ignored.
  */
 import {PostHog} from '../core/posthog.js';
 import {Extension} from '../core/extensions.js';
 import {logger as baseLogger} from '../core/logger.js';
 import {Config, UPSTREAM_VERSION} from '../core/constants.js';
 import {loadScript} from '../core/script-loader.js';
-import {lazyPart, loadLazy} from '../core/lazy.js';
+import {lazyChunksEnabled, lazyPart, loadLazy} from '../core/lazy.js';
+import {lazyChunksBase, sdkScriptBase} from '../core/script-base.js';
 import {addEventListener, doc, isNullish, isNumber, isObject, isUndefined, win} from '../core/utils.js';
 import {
   AWAITING_CONFIG, DISABLED, LAZY_LOADING, MISSING_CONFIG, RECORDING_REMOTE_CONFIG_TTL_MS,
@@ -98,8 +101,45 @@ const LOGGER_PREFIX = '[SessionRecording]';
 const logger = baseLogger.createLogger(LOGGER_PREFIX);
 const scriptLogger = baseLogger.createLogger('[ExternalScriptsLoader]');
 
-/** The rrweb-only bundle published with every posthog-js release. */
+/** The rrweb-only bundle published with every posthog-js release (and ours). */
 const RECORDER_SCRIPT = 'recorder';
+
+/**
+ * Config key: where rrweb (`recorder.js`) is loaded from. Unset: our build,
+ * `recorder.js?v=<our version>` next to the SDK script (the lazy build: next
+ * to its chunks, so `closure_lazy_chunks_url` moves it too); when that
+ * directory is unknown, PostHog's. A URL: that script. `'posthog'`: PostHog's
+ * `/static/<upstream version>/recorder.js` from the assets host, as upstream
+ * requests its lazy scripts. Upstream has no `closure_*` keys.
+ * @const {string}
+ */
+export const RECORDER_URL_CONFIG = 'closure_recorder_url';
+
+/** @const {string} `closure_recorder_url` value selecting PostHog's CDN recorder.js */
+export const POSTHOG_RECORDER = 'posthog';
+
+/**
+ * @param {!Object} config PostHog config (quoted keys)
+ * @return {?string} our recorder.js URL, or null for PostHog's
+ */
+export function recorderUrl(config) {
+  const configured = config[RECORDER_URL_CONFIG];
+  if (configured === POSTHOG_RECORDER) return null;
+  if (typeof configured === 'string' && configured) return configured;
+  const base = lazyChunksEnabled() ? lazyChunksBase(config) : sdkScriptBase();
+  return base ? base + RECORDER_SCRIPT + '.js?v=' + Config.LIB_VERSION : null;
+}
+
+/**
+ * Loads rrweb: our recorder.js, or PostHog's (see `closure_recorder_url`).
+ * @param {!PostHog} instance
+ * @param {function((string|!Event|undefined)=)} callback
+ */
+function loadRecorder(instance, callback) {
+  const url = recorderUrl(instance.config);
+  if (url) loadScript(instance.config, url, callback);
+  else loadExternalDependency(instance, RECORDER_SCRIPT, callback);
+}
 
 const SESSION_DEBUG_PROPERTY_KEYS = [
   SDK_DEBUG_RECORDING_SCRIPT_NOT_LOADED, SDK_DEBUG_REPLAY_STALE_CONFIG, SDK_DEBUG_REPLAY_EVENT_TRIGGER_STATUS,
@@ -342,7 +382,7 @@ export class SessionRecording {
         self.onScriptLoaded_(startReason);
       };
       if (needsRecorderLogic) loadLazy(this.instance_, REPLAY_KIND, loaded);
-      if (needsRRWeb) loadExternalDependency(this.instance_, RECORDER_SCRIPT, loaded);
+      if (needsRRWeb) loadRecorder(this.instance_, loaded);
     } else {
       this.onScriptLoaded_(startReason);
     }

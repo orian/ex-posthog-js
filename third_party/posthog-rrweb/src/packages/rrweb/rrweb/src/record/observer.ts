@@ -1,0 +1,1961 @@
+import {
+  type MaskInputOptions,
+  maskInputValue,
+  Mirror,
+  getInputType,
+  stringifyStylesheet,
+  rememberStyleRuleSource,
+  rememberStylesheetSource,
+  invalidateStyleRuleSource,
+  toLowerCase,
+} from '@posthog/rrweb-snapshot';
+import type { FontFaceSet } from 'css-font-loading-module';
+import {
+  throttle,
+  on,
+  callAllSafely,
+  hookSetter,
+  getDeferral,
+  getWindowScroll,
+  getWindowHeight,
+  getWindowWidth,
+  isBlocked,
+  isBlockedIncludingShadowHosts,
+  inDom,
+  legacy_isTouchEvent,
+  StyleSheetMirror,
+  nowTimestamp,
+} from '../utils';
+import { patch } from '@posthog/rrweb-utils';
+import type { observerParam, MutationBufferParam } from '../types';
+import {
+  IncrementalSource,
+  MouseInteractions,
+  PointerTypes,
+  MediaInteractions,
+} from '@posthog/rrweb-types';
+import type {
+  mutationCallBack,
+  mousemoveCallBack,
+  mousePosition,
+  mouseInteractionCallBack,
+  listenerHandler,
+  scrollCallback,
+  styleSheetRuleCallback,
+  viewportResizeCallback,
+  inputValue,
+  inputCallback,
+  hookResetter,
+  hooksParam,
+  Arguments,
+  mediaInteractionCallback,
+  canvasMutationCallback,
+  fontCallback,
+  fontParam,
+  styleDeclarationCallback,
+  IWindow,
+  SelectionRange,
+  selectionCallback,
+  customElementCallback,
+} from '@posthog/rrweb-types';
+import MutationBuffer, { registerSelectMutationObserver } from './mutation';
+import { callbackWrapper } from './error-handler';
+import dom, { mutationObserverCtor } from '@posthog/rrweb-utils';
+
+export const mutationBuffers: MutationBuffer[] = [];
+
+// Event.path is non-standard and used in some older browsers
+type NonStandardEvent = Omit<Event, 'composedPath'> & {
+  path: EventTarget[];
+};
+
+function getEventTarget(event: Event | NonStandardEvent): EventTarget | null {
+  try {
+    if ('composedPath' in event) {
+      const path = event.composedPath();
+      if (path.length) {
+        return path[0];
+      }
+    } else if ('path' in event && event.path.length) {
+      return event.path[0];
+    }
+  } catch {
+    // fallback to `event.target` below
+  }
+
+  return event && event.target;
+}
+
+export function initMutationObserver(
+  options: MutationBufferParam,
+  rootEl: Node,
+): { observer: MutationObserver; buffer: MutationBuffer } {
+  const mutationBuffer = new MutationBuffer();
+  // see mutation.ts for details
+  mutationBuffer.init(options);
+  let observer: MutationObserver | undefined;
+  try {
+    observer = new (mutationObserverCtor() as new (
+      callback: MutationCallback,
+    ) => MutationObserver)(
+      callbackWrapper(mutationBuffer.processMutations.bind(mutationBuffer)),
+    );
+    const mutationObserverInit: MutationObserverInit = {
+      attributes: true,
+      attributeOldValue: true,
+      characterData: true,
+      characterDataOldValue: true,
+      childList: true,
+      subtree: true,
+    };
+    // Delegate attribute filtering to the native MutationObserver: unlisted
+    // attributes never fire the callback, so they cost no recording CPU.
+    // An empty array would mean "observe no attributes at all", which is never
+    // what a caller wants and could come from bad config, so treat it as unset.
+    if (options.attributeFilter && options.attributeFilter.length > 0) {
+      mutationObserverInit.attributeFilter = options.attributeFilter;
+    }
+    observer.observe(rootEl, mutationObserverInit);
+    mutationBuffer.readPendingRecordsFrom(observer);
+    mutationBuffers.push(mutationBuffer);
+    return { observer, buffer: mutationBuffer };
+  } catch (error) {
+    try {
+      observer?.disconnect();
+      mutationBuffer.destroy();
+      mutationBuffer.reset();
+    } catch {
+      // Preserve the initialization error if best-effort cleanup also fails.
+    }
+    throw error;
+  }
+}
+
+function initMoveObserver({
+  mousemoveCb,
+  sampling,
+  doc,
+  mirror,
+}: observerParam): listenerHandler {
+  if (sampling.mousemove === false) {
+    return () => {
+      //
+    };
+  }
+
+  const threshold =
+    typeof sampling.mousemove === 'number' ? sampling.mousemove : 50;
+  const callbackThreshold =
+    typeof sampling.mousemoveCallback === 'number'
+      ? sampling.mousemoveCallback
+      : 500;
+
+  let positions: mousePosition[] = [];
+  let timeBaseline: number | null;
+  const wrappedCb = throttle(
+    callbackWrapper(
+      (
+        source:
+          | IncrementalSource.MouseMove
+          | IncrementalSource.TouchMove
+          | IncrementalSource.Drag,
+      ) => {
+        const totalOffset = Date.now() - timeBaseline!;
+        mousemoveCb(
+          positions.map((p) => {
+            p.timeOffset -= totalOffset;
+            return p;
+          }),
+          source,
+        );
+        positions = [];
+        timeBaseline = null;
+      },
+    ),
+    callbackThreshold,
+  );
+  const updatePosition = callbackWrapper(
+    throttle<MouseEvent | TouchEvent | DragEvent>(
+      callbackWrapper((evt) => {
+        const target = getEventTarget(evt);
+        // 'legacy' here as we could switch to https://developer.mozilla.org/en-US/docs/Web/API/Element/pointermove_event
+        const { clientX, clientY } = legacy_isTouchEvent(evt)
+          ? evt.changedTouches[0]
+          : evt;
+        if (!timeBaseline) {
+          timeBaseline = nowTimestamp();
+        }
+        positions.push({
+          x: clientX,
+          y: clientY,
+          id: mirror.getId(target as Node),
+          timeOffset: nowTimestamp() - timeBaseline,
+        });
+        // Classify by event type rather than with `instanceof`: events from a
+        // same-origin iframe are created by the iframe window's constructors,
+        // so `instanceof MouseEvent` against this window's constructor fails.
+        wrappedCb(
+          evt.type === 'drag'
+            ? IncrementalSource.Drag
+            : evt.type === 'touchmove'
+            ? IncrementalSource.TouchMove
+            : IncrementalSource.MouseMove,
+        );
+      }),
+      threshold,
+      {
+        trailing: false,
+      },
+    ),
+  );
+  const handlers = [
+    on('mousemove', updatePosition, doc),
+    on('touchmove', updatePosition, doc),
+    on('drag', updatePosition, doc),
+  ];
+  return callbackWrapper(() => {
+    handlers.forEach((h) => h());
+  });
+}
+
+function initMouseInteractionObserver({
+  mouseInteractionCb,
+  doc,
+  mirror,
+  blockClass,
+  blockSelector,
+  sampling,
+}: observerParam): listenerHandler {
+  if (sampling.mouseInteraction === false) {
+    return () => {
+      //
+    };
+  }
+  const disableMap: Record<string, boolean | undefined> =
+    sampling.mouseInteraction === true ||
+    sampling.mouseInteraction === undefined
+      ? {}
+      : sampling.mouseInteraction;
+
+  const handlers: listenerHandler[] = [];
+  let currentPointerType: PointerTypes | null = null;
+  const getHandler = (eventKey: keyof typeof MouseInteractions) => {
+    return (event: MouseEvent | TouchEvent | PointerEvent) => {
+      const target = getEventTarget(event) as Node;
+      if (isBlocked(target, blockClass, blockSelector, true)) {
+        return;
+      }
+      let pointerType: PointerTypes | null = null;
+      let thisEventKey = eventKey;
+      if ('pointerType' in event) {
+        switch (event.pointerType) {
+          case 'mouse':
+            pointerType = PointerTypes.Mouse;
+            break;
+          case 'touch':
+            pointerType = PointerTypes.Touch;
+            break;
+          case 'pen':
+            pointerType = PointerTypes.Pen;
+            break;
+        }
+        if (pointerType === PointerTypes.Touch) {
+          if (MouseInteractions[eventKey] === MouseInteractions.MouseDown) {
+            // we are actually listening on 'pointerdown'
+            thisEventKey = 'TouchStart';
+          } else if (
+            MouseInteractions[eventKey] === MouseInteractions.MouseUp
+          ) {
+            // we are actually listening on 'pointerup'
+            thisEventKey = 'TouchEnd';
+          }
+        } else if (pointerType === PointerTypes.Pen) {
+          // TODO: these will get incorrectly emitted as MouseDown/MouseUp
+        }
+      } else if (legacy_isTouchEvent(event)) {
+        pointerType = PointerTypes.Touch;
+      }
+      if (pointerType !== null) {
+        currentPointerType = pointerType;
+        if (
+          (thisEventKey.startsWith('Touch') &&
+            pointerType === PointerTypes.Touch) ||
+          (thisEventKey.startsWith('Mouse') &&
+            pointerType === PointerTypes.Mouse)
+        ) {
+          // don't output redundant info
+          pointerType = null;
+        }
+      } else if (MouseInteractions[eventKey] === MouseInteractions.Click) {
+        pointerType = currentPointerType;
+        currentPointerType = null; // cleanup as we've used it
+      }
+      const e = legacy_isTouchEvent(event) ? event.changedTouches[0] : event;
+      if (!e) {
+        return;
+      }
+      const id = mirror.getId(target);
+      const { clientX, clientY } = e;
+      callbackWrapper(mouseInteractionCb)({
+        type: MouseInteractions[thisEventKey],
+        id,
+        x: clientX,
+        y: clientY,
+        ...(pointerType !== null && { pointerType }),
+      });
+    };
+  };
+  Object.keys(MouseInteractions)
+    .filter(
+      (key) =>
+        Number.isNaN(Number(key)) &&
+        !key.endsWith('_Departed') &&
+        disableMap[key] !== false,
+    )
+    .forEach((eventKey: keyof typeof MouseInteractions) => {
+      let eventName = toLowerCase(eventKey);
+      const handler = getHandler(eventKey);
+      if (window.PointerEvent) {
+        switch (MouseInteractions[eventKey]) {
+          case MouseInteractions.MouseDown:
+          case MouseInteractions.MouseUp:
+            eventName = eventName.replace(
+              'mouse',
+              'pointer',
+            ) as unknown as typeof eventName;
+            break;
+          case MouseInteractions.TouchStart:
+          case MouseInteractions.TouchEnd:
+            // these are handled by pointerdown/pointerup
+            return;
+        }
+      }
+      handlers.push(on(eventName, handler, doc));
+    });
+  return callbackWrapper(() => {
+    handlers.forEach((h) => h());
+  });
+}
+
+export function initScrollObserver({
+  scrollCb,
+  doc,
+  mirror,
+  blockClass,
+  blockSelector,
+  sampling,
+}: Pick<
+  observerParam,
+  'scrollCb' | 'doc' | 'mirror' | 'blockClass' | 'blockSelector' | 'sampling'
+>): listenerHandler {
+  // Dedupe scroll and scrollend — both fire for one gesture.
+  const lastEmitted = new Map<number, string>();
+  const emitScrollPosition = (evt: Event) => {
+    const target = getEventTarget(evt);
+    if (!target || isBlocked(target as Node, blockClass, blockSelector, true)) {
+      return;
+    }
+    const id = mirror.getId(target as Node);
+    let x: number;
+    let y: number;
+    if (target === doc && doc.defaultView) {
+      const scrollLeftTop = getWindowScroll(doc.defaultView);
+      x = scrollLeftTop.left;
+      y = scrollLeftTop.top;
+    } else {
+      x = (target as HTMLElement).scrollLeft;
+      y = (target as HTMLElement).scrollTop;
+    }
+    const key = `${x},${y}`;
+    if (lastEmitted.get(id) === key) {
+      return;
+    }
+    lastEmitted.set(id, key);
+    scrollCb({ id, x, y });
+  };
+  // A shared throttle drops one element's resting offset when another scrolls in the same window.
+  const emit = callbackWrapper(emitScrollPosition);
+  const throttledByTarget = new WeakMap<EventTarget, (evt: UIEvent) => void>();
+  const updatePosition = callbackWrapper((evt: UIEvent) => {
+    const target = evt.target;
+    if (!target) {
+      return;
+    }
+    let throttled = throttledByTarget.get(target);
+    if (!throttled) {
+      throttled = throttle<UIEvent>(emit, sampling.scroll || 100);
+      throttledByTarget.set(target, throttled);
+    }
+    throttled(evt);
+  });
+  const handlers: listenerHandler[] = [on('scroll', updatePosition, doc)];
+  // scrollend captures the resting offset when scroll alone recorded 0.
+  if ('onscrollend' in doc) {
+    handlers.push(on('scrollend', callbackWrapper(emitScrollPosition), doc));
+  }
+  return () => handlers.forEach((h) => h());
+}
+
+function initViewportResizeObserver(
+  { viewportResizeCb }: observerParam,
+  { win }: { win: IWindow },
+): listenerHandler {
+  let lastH = -1;
+  let lastW = -1;
+  const updateDimension = callbackWrapper(
+    throttle(
+      callbackWrapper(() => {
+        const height = getWindowHeight();
+        const width = getWindowWidth();
+        if (lastH !== height || lastW !== width) {
+          viewportResizeCb({
+            width: Number(width),
+            height: Number(height),
+          });
+          lastH = height;
+          lastW = width;
+        }
+      }),
+      200,
+    ),
+  );
+  return on('resize', updateDimension, win);
+}
+
+// `knownDocs` matches buffers whose iframe.contentDocument has been swapped
+// before removal — bufferBelongsToIframe alone misses them.
+export function findAndRemoveIframeBuffer(
+  iframeEl: HTMLIFrameElement,
+  knownDocs?: Set<Document>,
+): void {
+  for (let i = mutationBuffers.length - 1; i >= 0; i--) {
+    const buf = mutationBuffers[i];
+    if (!buf) continue;
+    let match = buf.bufferBelongsToIframe(iframeEl);
+    if (!match && knownDocs && knownDocs.has(buf.bufferDoc())) {
+      match = true;
+    }
+    if (match) {
+      buf.reset();
+      mutationBuffers.splice(i, 1);
+    }
+  }
+}
+
+export const INPUT_TAGS: string[] = ['INPUT', 'TEXTAREA', 'SELECT'];
+const lastInputValueMap: WeakMap<EventTarget, inputValue> = new WeakMap();
+let lastSelectInputValueMap: WeakMap<EventTarget, inputValue> = new WeakMap();
+
+export function resetSelectInputDeduplication(): void {
+  lastSelectInputValueMap = new WeakMap();
+}
+
+function initInputObserver({
+  inputCb,
+  doc,
+  mirror,
+  blockClass,
+  blockSelector,
+  ignoreClass,
+  ignoreSelector,
+  maskInputOptions,
+  maskInputFn,
+  sampling,
+  userTriggeredOnInput,
+}: observerParam): listenerHandler {
+  let active = true;
+  const pendingSelects = new Map<HTMLElement, boolean>();
+  let selectFlushScheduled = false;
+
+  function getInputTarget(target: HTMLElement | null): HTMLElement | null {
+    // Reading a native accessor (tagName/value/checked/type) on a non-native
+    // `this` — e.g. a proxy, custom element, or cross-realm object reaching us
+    // through a hooked setter — throws 'Illegal invocation'.
+    // Bail out unless the target is a genuine element in this document's realm.
+    const view = doc.defaultView;
+    if (target && view && !(target instanceof view.HTMLElement)) {
+      return null;
+    }
+    if (target && target.tagName === 'OPTION') {
+      target = dom.parentElement(target);
+      if (target && target.tagName === 'OPTGROUP') {
+        target = dom.parentElement(target);
+      }
+    }
+    return target;
+  }
+
+  function eventHandler(event: Event) {
+    processInput(
+      getInputTarget(getEventTarget(event) as HTMLElement | null),
+      event.isTrusted,
+    );
+  }
+
+  function getSelectedOptions(select: HTMLSelectElement) {
+    return Array.from(select.selectedOptions).filter(
+      (option) => !isBlocked(option, blockClass, blockSelector, true),
+    );
+  }
+
+  function processInput(
+    target: HTMLElement | null,
+    userTriggered: boolean,
+    deferred = false,
+  ) {
+    const tagName = target && target.tagName;
+    if (
+      !target ||
+      !tagName ||
+      INPUT_TAGS.indexOf(tagName) < 0 ||
+      isBlocked(target as Node, blockClass, blockSelector, true)
+    ) {
+      return;
+    }
+
+    if (
+      target.classList.contains(ignoreClass) ||
+      (ignoreSelector && target.matches(ignoreSelector))
+    ) {
+      return;
+    }
+    const type: Lowercase<string> = getInputType(target) || '';
+    const shouldMaskInput =
+      maskInputOptions[tagName.toLowerCase() as keyof MaskInputOptions] ||
+      maskInputOptions[type as keyof MaskInputOptions];
+    let selectedOptions =
+      tagName === 'SELECT'
+        ? getSelectedOptions(target as HTMLSelectElement)
+        : undefined;
+    if (
+      selectedOptions &&
+      (mirror.getId(target) <= 0 ||
+        selectedOptions.some((option) => mirror.getId(option) <= 0))
+    ) {
+      // Input normally unfreezes mutations at emission, too late for ID lookup.
+      if (mutationBuffers[0]?.isFrozen()) {
+        mutationBuffers.forEach((buffer) => buffer.unfreeze());
+        if (!active) return;
+        // Emission callbacks can change the selection or its blocking rules.
+        selectedOptions = getSelectedOptions(target as HTMLSelectElement);
+      }
+      if (!deferred) {
+        queueSelect(target, userTriggered);
+        return;
+      }
+      // Scalar masked events need the select ID, but do not transmit option IDs.
+      if (
+        mirror.getId(target) <= 0 ||
+        (!shouldMaskInput &&
+          selectedOptions.some((option) => mirror.getId(option) <= 0))
+      )
+        return;
+    }
+    let text = selectedOptions
+      ? selectedOptions[0]?.value || ''
+      : (target as HTMLInputElement).value;
+    let isChecked = false;
+    let selectedOptionIds: number[] | undefined;
+
+    if (type === 'radio' || type === 'checkbox') {
+      isChecked = (target as HTMLInputElement).checked;
+    } else if (shouldMaskInput) {
+      text = maskInputValue({
+        element: target,
+        maskInputOptions,
+        tagName,
+        type,
+        value: text,
+        maskInputFn,
+      });
+    } else if (selectedOptions) {
+      selectedOptionIds = selectedOptions.map((option) => mirror.getId(option));
+    }
+    const value: inputValue = { text, isChecked };
+    if (selectedOptionIds) value.selectedOptionIds = selectedOptionIds;
+    if (userTriggeredOnInput) value.userTriggered = userTriggered;
+    cbWithDedup(target, value);
+    // if a radio was checked
+    // the other radios with the same name attribute will be unchecked.
+    const name: string | undefined = (target as HTMLInputElement).name;
+    if (type === 'radio' && name && isChecked) {
+      doc
+        .querySelectorAll(`input[type="radio"][name="${name}"]`)
+        .forEach((el) => {
+          if (el !== target) {
+            const text = (el as HTMLInputElement).value;
+            cbWithDedup(
+              el,
+              userTriggeredOnInput
+                ? { text, isChecked: !isChecked, userTriggered: false }
+                : { text, isChecked: !isChecked },
+            );
+          }
+        });
+    }
+  }
+  function queueSelect(select: HTMLElement, userTriggered: boolean) {
+    pendingSelects.set(
+      select,
+      userTriggered || pendingSelects.get(select) || false,
+    );
+    if (!selectFlushScheduled) {
+      selectFlushScheduled = true;
+      // Mutation delivery and already-deferred setter callbacks finish first.
+      defer(flushPendingSelects);
+    }
+  }
+
+  function flushPendingSelects() {
+    selectFlushScheduled = false;
+    const selects = Array.from(pendingSelects);
+    pendingSelects.clear();
+    callAllSafely(
+      selects.map(([select, userTriggered]) => () => {
+        if (active) callbackWrapper(processInput)(select, userTriggered, true);
+      }),
+    );
+  }
+
+  function cbWithDedup(target: EventTarget, v: inputValue) {
+    const values =
+      (target as HTMLElement).tagName === 'SELECT'
+        ? lastSelectInputValueMap
+        : lastInputValueMap;
+    const lastInputValue = values.get(target);
+    if (
+      !lastInputValue ||
+      lastInputValue.text !== v.text ||
+      lastInputValue.isChecked !== v.isChecked ||
+      lastInputValue.selectedOptionIds?.length !== v.selectedOptionIds?.length ||
+      v.selectedOptionIds?.some(
+        (id, index) => id !== lastInputValue.selectedOptionIds?.[index],
+      )
+    ) {
+      values.set(target, v);
+      const id = mirror.getId(target as Node);
+      // Object.assign rather than `{ ...v, id }`: same keys and order, without
+      // the build's object-spread helpers (see wrappedMutationEmit).
+      callbackWrapper(inputCb)(Object.assign({}, v, { id }));
+    }
+  }
+  const events = sampling.input === 'last' ? ['change'] : ['input', 'change'];
+  const handlers: Array<listenerHandler | hookResetter> = events.map(
+    (eventName) => on(eventName, callbackWrapper(eventHandler), doc),
+  );
+  const currentWindow = doc.defaultView;
+  if (!currentWindow) {
+    return () => {
+      handlers.forEach((h) => h());
+    };
+  }
+  const defer = getDeferral(currentWindow);
+  const propertyDescriptor = currentWindow.Object.getOwnPropertyDescriptor(
+    currentWindow.HTMLInputElement.prototype,
+    'value',
+  );
+  const hookProperties: Array<[HTMLElement, string]> = [
+    [currentWindow.HTMLInputElement.prototype, 'value'],
+    [currentWindow.HTMLInputElement.prototype, 'checked'],
+    [currentWindow.HTMLSelectElement.prototype, 'value'],
+    [currentWindow.HTMLTextAreaElement.prototype, 'value'],
+    // Some UI library use selectedIndex to set select value
+    [currentWindow.HTMLSelectElement.prototype, 'selectedIndex'],
+    [currentWindow.HTMLOptionElement.prototype, 'selected'],
+  ];
+  if (propertyDescriptor && propertyDescriptor.set) {
+    handlers.push(
+      ...hookProperties.map((p) =>
+        hookSetter<HTMLElement>(
+          p[0],
+          p[1],
+          {
+            set() {
+              if (!active) return;
+              const target = callbackWrapper(getInputTarget)(this);
+              if (!target) return;
+              if (target.tagName === 'SELECT') {
+                queueSelect(target, false);
+              } else {
+                callbackWrapper(processInput)(target, false);
+              }
+            },
+          },
+          false,
+          currentWindow,
+        ),
+      ),
+    );
+  }
+  handlers.unshift(
+    registerSelectMutationObserver(
+      doc,
+      callbackWrapper((select) => {
+        if (
+          mirror.getId(select) <= 0 ||
+          !inDom(select) ||
+          isBlockedIncludingShadowHosts(select, blockClass, blockSelector)
+        )
+          return;
+        processInput(select, false);
+      }),
+    ),
+  );
+  return callbackWrapper(() => {
+    // Flush while the select and option IDs are still in the mirror.
+    callAllSafely([flushPendingSelects]);
+    active = false;
+    pendingSelects.clear();
+    // the hook resetters below restore shared DOM prototype accessors through a
+    // bare `Object.defineProperty`, which throws if the page made one of them
+    // non-configurable after we hooked it. Run them all: a leaked hook keeps
+    // intercepting every `value`/`checked` write for the life of the page.
+    callAllSafely(handlers);
+  });
+}
+
+type GroupingCSSRule =
+  | CSSGroupingRule
+  | CSSMediaRule
+  | CSSSupportsRule
+  | CSSConditionRule;
+type GroupingCSSRuleTypes =
+  | typeof CSSGroupingRule
+  | typeof CSSMediaRule
+  | typeof CSSSupportsRule
+  | typeof CSSConditionRule;
+
+function getNestedCSSRulePositions(rule: CSSRule): number[] {
+  const positions: number[] = [];
+  function recurse(childRule: CSSRule, pos: number[]) {
+    if (
+      (hasNestedCSSRule('CSSGroupingRule') &&
+        childRule.parentRule instanceof CSSGroupingRule) ||
+      (hasNestedCSSRule('CSSMediaRule') &&
+        childRule.parentRule instanceof CSSMediaRule) ||
+      (hasNestedCSSRule('CSSSupportsRule') &&
+        childRule.parentRule instanceof CSSSupportsRule) ||
+      (hasNestedCSSRule('CSSConditionRule') &&
+        childRule.parentRule instanceof CSSConditionRule)
+    ) {
+      const rules = Array.from(
+        (childRule.parentRule as GroupingCSSRule).cssRules,
+      );
+      const index = rules.indexOf(childRule);
+      pos.unshift(index);
+      return recurse(childRule.parentRule, pos);
+    } else if (childRule.parentStyleSheet) {
+      const rules = Array.from(childRule.parentStyleSheet.cssRules);
+      const index = rules.indexOf(childRule);
+      pos.unshift(index);
+    }
+    return pos;
+  }
+  return recurse(rule, positions);
+}
+
+/**
+ * For StyleSheets in Element, this function retrieves id of its host element.
+ * For adopted StyleSheets, this function retrieves its styleId from a styleMirror.
+ */
+function getIdAndStyleId(
+  sheet: CSSStyleSheet | undefined | null,
+  mirror: Mirror,
+  styleMirror: StyleSheetMirror,
+): {
+  styleId?: number;
+  id?: number;
+} {
+  let id, styleId;
+  if (!sheet) return {};
+  if (sheet.ownerNode) id = mirror.getId(sheet.ownerNode as Node);
+  else styleId = styleMirror.getId(sheet);
+  return {
+    styleId,
+    id,
+  };
+}
+
+type QueuedStyleSheetMutation = {
+  emit?: () => void;
+  ready: boolean;
+};
+
+type StyleSheetMutationQueue = ReturnType<
+  typeof createStyleSheetMutationQueue
+>;
+
+const STYLESHEET_REPLACE_TIMEOUT = 5_000;
+
+function createStyleSheetMutationQueue(win: IWindow) {
+  const queuedMutations = new Map<
+    CSSStyleSheet,
+    QueuedStyleSheetMutation[]
+  >();
+  const pendingTimeouts = new Set<number>();
+  let active = true;
+  const safeEmit = (emit: () => void) => {
+    if (!active) return;
+    try {
+      emit();
+    } catch {
+      // Recorder errors must not affect native CSSOM operations.
+    }
+  };
+  const flush = (sheet: CSSStyleSheet) => {
+    const queue = queuedMutations.get(sheet);
+    if (!queue) return;
+
+    while (queue[0]?.ready) {
+      const mutation = queue.shift();
+      if (mutation?.emit) safeEmit(mutation.emit);
+    }
+    if (queue.length === 0) queuedMutations.delete(sheet);
+  };
+  const queueMutation = (
+    sheet: CSSStyleSheet | null | undefined,
+    emit: () => void,
+  ) => {
+    if (!sheet) {
+      safeEmit(emit);
+      return;
+    }
+    const queue = queuedMutations.get(sheet);
+    if (!queue) {
+      safeEmit(emit);
+      return;
+    }
+    queue.push({ emit, ready: true });
+    flush(sheet);
+  };
+  const queuePendingMutation = (
+    sheet: CSSStyleSheet,
+    emit: () => void,
+    emitLate: () => void,
+  ) => {
+    if (!active) return () => undefined;
+    let queue = queuedMutations.get(sheet);
+    if (!queue) {
+      queue = [];
+      queuedMutations.set(sheet, queue);
+    }
+    const mutation: QueuedStyleSheetMutation = { emit, ready: false };
+    queue.push(mutation);
+    let expired = false;
+    let settled = false;
+    let timeoutId: number | undefined;
+    const expire = () => {
+      if (expired || settled) return;
+      expired = true;
+      if (timeoutId !== undefined) pendingTimeouts.delete(timeoutId);
+      mutation.ready = true;
+      mutation.emit = undefined;
+      flush(sheet);
+    };
+    const complete = (success: boolean) => {
+      if (settled || !active) return;
+      settled = true;
+      if (timeoutId !== undefined) {
+        win.clearTimeout(timeoutId);
+        pendingTimeouts.delete(timeoutId);
+      }
+      if (expired) {
+        if (success) safeEmit(emitLate);
+        return;
+      }
+      mutation.ready = true;
+      if (!success) mutation.emit = undefined;
+      flush(sheet);
+    };
+    try {
+      timeoutId = win.setTimeout(expire, STYLESHEET_REPLACE_TIMEOUT);
+      if (expired || settled) win.clearTimeout(timeoutId);
+      else pendingTimeouts.add(timeoutId);
+    } catch {
+      expire();
+    }
+    return complete;
+  };
+  const reset = () => {
+    active = false;
+    pendingTimeouts.forEach((timeoutId) => win.clearTimeout(timeoutId));
+    pendingTimeouts.clear();
+    queuedMutations.clear();
+  };
+  return { queueMutation, queuePendingMutation, reset };
+}
+
+function initStyleSheetObserver(
+  { styleSheetRuleCb, mirror, stylesheetManager }: observerParam,
+  {
+    win,
+    mutationQueue,
+  }: { win: IWindow; mutationQueue: StyleSheetMutationQueue },
+): listenerHandler {
+  if (!win.CSSStyleSheet || !win.CSSStyleSheet.prototype) {
+    // If, for whatever reason, CSSStyleSheet is not available, we skip the observation of stylesheets.
+    return () => {
+      // Do nothing
+    };
+  }
+
+  const insertRule = win.CSSStyleSheet.prototype.insertRule;
+  win.CSSStyleSheet.prototype.insertRule = new Proxy(insertRule, {
+    apply: callbackWrapper(
+      (
+        target: typeof insertRule,
+        thisArg: CSSStyleSheet,
+        argumentsList: [string, number | undefined],
+      ) => {
+        const [rule] = argumentsList;
+
+        const insertedIndex = target.apply(thisArg, argumentsList);
+        rememberStyleRuleSource(thisArg.cssRules[insertedIndex], rule);
+
+        // A pending budget-deferred inlining of this sheet must not emit its
+        // defer-time text over the successful mutation.
+        stylesheetManager.onCssomSheetMutation(thisArg);
+
+        const { id, styleId } = getIdAndStyleId(
+          thisArg,
+          mirror,
+          stylesheetManager.styleMirror,
+        );
+
+        if ((id && id !== -1) || (styleId && styleId !== -1)) {
+          mutationQueue.queueMutation(thisArg, () =>
+            styleSheetRuleCb({
+              id,
+              styleId,
+              adds: [{ rule, index: insertedIndex }],
+            }),
+          );
+        }
+        return insertedIndex;
+      },
+      'host',
+    ),
+  });
+
+  // Support for deprecated addRule method
+  win.CSSStyleSheet.prototype.addRule = function (
+    this: CSSStyleSheet,
+    selector: string,
+    styleBlock: string,
+    index: number = this.cssRules.length,
+  ) {
+    const rule = `${selector} { ${styleBlock} }`;
+    return win.CSSStyleSheet.prototype.insertRule.apply(this, [rule, index]);
+  };
+
+  const deleteRule = win.CSSStyleSheet.prototype.deleteRule;
+  win.CSSStyleSheet.prototype.deleteRule = new Proxy(deleteRule, {
+    apply: callbackWrapper(
+      (
+        target: typeof deleteRule,
+        thisArg: CSSStyleSheet,
+        argumentsList: [number],
+      ) => {
+        const [index] = argumentsList;
+
+        const result = target.apply(thisArg, argumentsList);
+
+        stylesheetManager.onCssomSheetMutation(thisArg);
+
+        const { id, styleId } = getIdAndStyleId(
+          thisArg,
+          mirror,
+          stylesheetManager.styleMirror,
+        );
+
+        if ((id && id !== -1) || (styleId && styleId !== -1)) {
+          mutationQueue.queueMutation(thisArg, () =>
+            styleSheetRuleCb({
+              id,
+              styleId,
+              removes: [{ index }],
+            }),
+          );
+        }
+        return result;
+      },
+      'host',
+    ),
+  });
+
+  // Support for deprecated removeRule method
+  win.CSSStyleSheet.prototype.removeRule = function (
+    this: CSSStyleSheet,
+    index: number,
+  ) {
+    return win.CSSStyleSheet.prototype.deleteRule.apply(this, [index]);
+  };
+
+  let replace: (text: string) => Promise<CSSStyleSheet>;
+
+  if (win.CSSStyleSheet.prototype.replace) {
+    replace = win.CSSStyleSheet.prototype.replace;
+    win.CSSStyleSheet.prototype.replace = new Proxy(replace, {
+      apply: callbackWrapper(
+        (
+          target: typeof replace,
+          thisArg: CSSStyleSheet,
+          argumentsList: [string],
+        ) => {
+          const [text] = argumentsList;
+          const result = target.apply(thisArg, argumentsList);
+
+          try {
+            const then = result?.then;
+            if (
+              thisArg.ownerNode ||
+              !result ||
+              typeof then !== 'function'
+            ) {
+              return result;
+            }
+
+            const revision = stylesheetManager.onCssomSheetMutation(thisArg);
+            const { id, styleId } = getIdAndStyleId(
+              thisArg,
+              mirror,
+              stylesheetManager.styleMirror,
+            );
+            const tracked = (id && id !== -1) || (styleId && styleId !== -1);
+            const completeMutation = tracked
+              ? mutationQueue.queuePendingMutation(
+                  thisArg,
+                  () =>
+                    styleSheetRuleCb({
+                      id,
+                      styleId,
+                      replace: text,
+                    }),
+                  () => {
+                    const lateStyleSheetText = stringifyStylesheet(thisArg);
+                    if (lateStyleSheetText !== null) {
+                      styleSheetRuleCb({
+                        id,
+                        styleId,
+                        replace: lateStyleSheetText,
+                      });
+                    }
+                  },
+                )
+              : undefined;
+            try {
+              // Observing fulfillment requires a rejection handler; omitting it
+              // creates a second unhandled rejection even when the caller handles
+              // the original promise. Prefer not to introduce a new host error.
+              void then.call(
+                result,
+                () => {
+                  if (
+                    stylesheetManager.isCurrentCssomMutation(thisArg, revision)
+                  ) {
+                    rememberStylesheetSource(thisArg, text);
+                  }
+                  completeMutation?.(true);
+                },
+                () => completeMutation?.(false),
+              );
+            } catch {
+              completeMutation?.(false);
+            }
+          } catch {
+            // Recorder errors must not affect the native promise result.
+          }
+          return result;
+        },
+        'host',
+      ),
+    });
+  }
+
+  let replaceSync: (text: string) => void;
+  if (win.CSSStyleSheet.prototype.replaceSync) {
+    replaceSync = win.CSSStyleSheet.prototype.replaceSync;
+    win.CSSStyleSheet.prototype.replaceSync = new Proxy(replaceSync, {
+      apply: callbackWrapper(
+        (
+          target: typeof replaceSync,
+          thisArg: CSSStyleSheet,
+          argumentsList: [string],
+        ) => {
+          const [text] = argumentsList;
+          const result = target.apply(thisArg, argumentsList);
+          rememberStylesheetSource(thisArg, text);
+
+          stylesheetManager.onCssomSheetMutation(thisArg);
+          const { id, styleId } = getIdAndStyleId(
+            thisArg,
+            mirror,
+            stylesheetManager.styleMirror,
+          );
+
+          if ((id && id !== -1) || (styleId && styleId !== -1)) {
+            mutationQueue.queueMutation(thisArg, () =>
+              styleSheetRuleCb({
+                id,
+                styleId,
+                replaceSync: text,
+              }),
+            );
+          }
+          return result;
+        },
+        'host',
+      ),
+    });
+  }
+
+  const supportedNestedCSSRuleTypes: {
+    [key: string]: GroupingCSSRuleTypes;
+  } = {};
+  if (canMonkeyPatchNestedCSSRule('CSSGroupingRule')) {
+    supportedNestedCSSRuleTypes.CSSGroupingRule = win.CSSGroupingRule;
+  } else {
+    // Some browsers (Safari) don't support CSSGroupingRule
+    // https://caniuse.com/?search=cssgroupingrule
+    // fall back to monkey patching classes that would have inherited from CSSGroupingRule
+
+    if (canMonkeyPatchNestedCSSRule('CSSMediaRule')) {
+      supportedNestedCSSRuleTypes.CSSMediaRule = win.CSSMediaRule;
+    }
+    if (canMonkeyPatchNestedCSSRule('CSSConditionRule')) {
+      supportedNestedCSSRuleTypes.CSSConditionRule = win.CSSConditionRule;
+    }
+    if (canMonkeyPatchNestedCSSRule('CSSSupportsRule')) {
+      supportedNestedCSSRuleTypes.CSSSupportsRule = win.CSSSupportsRule;
+    }
+  }
+
+  const unmodifiedFunctions: {
+    [key: string]: {
+      insertRule: (rule: string, index?: number) => number;
+      deleteRule: (index: number) => void;
+    };
+  } = {};
+
+  Object.entries(supportedNestedCSSRuleTypes).forEach(([typeKey, type]) => {
+    unmodifiedFunctions[typeKey] = {
+      insertRule: type.prototype.insertRule,
+      deleteRule: type.prototype.deleteRule,
+    };
+
+    type.prototype.insertRule = new Proxy(
+      unmodifiedFunctions[typeKey].insertRule,
+      {
+        apply: callbackWrapper(
+          (
+            target: typeof insertRule,
+            thisArg: CSSRule,
+            argumentsList: [string, number | undefined],
+          ) => {
+            const [rule] = argumentsList;
+
+            const insertedIndex = target.apply(thisArg, argumentsList);
+            rememberStyleRuleSource(
+              (thisArg as CSSGroupingRule).cssRules[insertedIndex],
+              rule,
+            );
+
+            stylesheetManager.onCssomSheetMutation(thisArg.parentStyleSheet);
+
+            const { id, styleId } = getIdAndStyleId(
+              thisArg.parentStyleSheet,
+              mirror,
+              stylesheetManager.styleMirror,
+            );
+
+            if (
+              thisArg.parentStyleSheet &&
+              ((id && id !== -1) || (styleId && styleId !== -1))
+            ) {
+              const index = [
+                ...getNestedCSSRulePositions(thisArg),
+                insertedIndex,
+              ];
+              mutationQueue.queueMutation(thisArg.parentStyleSheet, () =>
+                styleSheetRuleCb({
+                  id,
+                  styleId,
+                  adds: [{ rule, index }],
+                }),
+              );
+            }
+            return insertedIndex;
+          },
+          'host',
+        ),
+      },
+    );
+
+    type.prototype.deleteRule = new Proxy(
+      unmodifiedFunctions[typeKey].deleteRule,
+      {
+        apply: callbackWrapper(
+          (
+            target: typeof deleteRule,
+            thisArg: CSSRule,
+            argumentsList: [number],
+          ) => {
+            const [index] = argumentsList;
+
+            const result = target.apply(thisArg, argumentsList);
+            invalidateStyleRuleSource(thisArg);
+
+            stylesheetManager.onCssomSheetMutation(thisArg.parentStyleSheet);
+
+            const { id, styleId } = getIdAndStyleId(
+              thisArg.parentStyleSheet,
+              mirror,
+              stylesheetManager.styleMirror,
+            );
+
+            if (
+              thisArg.parentStyleSheet &&
+              ((id && id !== -1) || (styleId && styleId !== -1))
+            ) {
+              const nestedIndex = [
+                ...getNestedCSSRulePositions(thisArg),
+                index,
+              ];
+              mutationQueue.queueMutation(thisArg.parentStyleSheet, () =>
+                styleSheetRuleCb({
+                  id,
+                  styleId,
+                  removes: [{ index: nestedIndex }],
+                }),
+              );
+            }
+            return result;
+          },
+          'host',
+        ),
+      },
+    );
+  });
+
+  return callbackWrapper(() => {
+    win.CSSStyleSheet.prototype.insertRule = insertRule;
+    win.CSSStyleSheet.prototype.deleteRule = deleteRule;
+    replace && (win.CSSStyleSheet.prototype.replace = replace);
+    replaceSync && (win.CSSStyleSheet.prototype.replaceSync = replaceSync);
+    Object.entries(supportedNestedCSSRuleTypes).forEach(([typeKey, type]) => {
+      type.prototype.insertRule = unmodifiedFunctions[typeKey].insertRule;
+      type.prototype.deleteRule = unmodifiedFunctions[typeKey].deleteRule;
+    });
+  });
+}
+
+// Setter results are ignored by assignments but propagate through chained hooks.
+const REJECTED_ADOPTED_STYLESHEET_ASSIGNMENT = Symbol.for(
+  'rrweb.adoptedStyleSheets.rejected',
+);
+
+type AdoptedStyleSheetObserver = {
+  stylesheetManager: observerParam['stylesheetManager'] | undefined;
+  previousDescriptor: PropertyDescriptor | undefined;
+  get: PropertyDescriptor['get'];
+};
+
+const adoptedStyleSheetObservers = new WeakMap<
+  NonNullable<PropertyDescriptor['set']>,
+  AdoptedStyleSheetObserver
+>();
+
+export function initAdoptedStyleSheetObserver(
+  {
+    mirror,
+    stylesheetManager,
+  }: Pick<observerParam, 'mirror' | 'stylesheetManager'>,
+  host: Document | ShadowRoot,
+): listenerHandler {
+  let hostId: number | null = null;
+  // host of adoptedStyleSheets is outermost document or IFrame's document
+  if (host.nodeName === '#document') hostId = mirror.getId(host);
+  // The host is a ShadowRoot.
+  else hostId = mirror.getId(dom.host(host as ShadowRoot));
+
+  const patchTarget =
+    host.nodeName === '#document'
+      ? (host as Document).defaultView?.Document
+      : host.ownerDocument?.defaultView?.ShadowRoot;
+  const ownPropertyDescriptor = Object.getOwnPropertyDescriptor(
+    host,
+    'adoptedStyleSheets',
+  );
+  const originalPropertyDescriptor =
+    ownPropertyDescriptor ??
+    (patchTarget?.prototype
+      ? Object.getOwnPropertyDescriptor(
+          patchTarget.prototype,
+          'adoptedStyleSheets',
+        )
+      : undefined);
+  if (
+    hostId === null ||
+    hostId === -1 ||
+    !patchTarget ||
+    ownPropertyDescriptor?.configurable === false ||
+    !originalPropertyDescriptor?.get ||
+    !originalPropertyDescriptor?.set
+  )
+    return () => {
+      //
+    };
+
+  const observer: AdoptedStyleSheetObserver = {
+    stylesheetManager,
+    previousDescriptor: ownPropertyDescriptor,
+    get: undefined,
+  };
+  const patchedPropertyDescriptor: PropertyDescriptor = {
+    configurable: true,
+    enumerable: originalPropertyDescriptor.enumerable,
+    get(): CSSStyleSheet[] {
+      return originalPropertyDescriptor.get?.call(this) as CSSStyleSheet[];
+    },
+    set(sheets: CSSStyleSheet[]) {
+      let result: unknown;
+      try {
+        result = originalPropertyDescriptor.set?.call(this, sheets);
+      } catch (e) {
+        // Assigning a `CSSStyleSheet` that was constructed in a different
+        // document/realm makes the browser reject the assignment with
+        // `NotAllowedError` ("Sharing constructed stylesheets in multiple
+        // documents is not allowed"). That is the host page's own invalid
+        // operation, but because our patched setter sits on the call stack
+        // the exception would otherwise be attributed to the recorder and
+        // churn fingerprints in error tracking. The browser rejects the
+        // stylesheet, so recording simply degrades (we skip the
+        // adoption below). Contain only this specific, unactionable case;
+        // re-throw everything else so genuine host-page failures are
+        // preserved (mirrors `callSafely` in ../utils).
+        //
+        // Match on the standardized `name` rather than `instanceof
+        // DOMException`: when this observer is installed on a (same-origin)
+        // iframe document the native setter throws the iframe realm's
+        // `DOMException`, which fails an `instanceof` check against the
+        // recorder realm's constructor. The cross-document sharing error we
+        // want to contain is exactly that cross-realm case, so a name check
+        // is what keeps iframe recordings protected too.
+        if (
+          !!e &&
+          typeof e === 'object' &&
+          (e as { name?: unknown }).name === 'NotAllowedError'
+        ) {
+          return REJECTED_ADOPTED_STYLESHEET_ASSIGNMENT;
+        }
+        throw e;
+      }
+      if (result === REJECTED_ADOPTED_STYLESHEET_ASSIGNMENT) return result;
+      if (observer.stylesheetManager && hostId !== null && hostId !== -1) {
+        try {
+          observer.stylesheetManager.adoptStyleSheets(sheets, hostId);
+        } catch (e) {
+          // for safety
+        }
+      }
+      return result;
+    },
+  };
+  try {
+    Object.defineProperty(
+      host,
+      'adoptedStyleSheets',
+      patchedPropertyDescriptor,
+    );
+  } catch {
+    return () => {};
+  }
+
+  observer.get = patchedPropertyDescriptor.get;
+  adoptedStyleSheetObservers.set(patchedPropertyDescriptor.set!, observer);
+
+  return callbackWrapper(() => {
+    observer.stylesheetManager = undefined;
+    const current = Object.getOwnPropertyDescriptor(host, 'adoptedStyleSheets');
+    // A later recorder or polyfill may have replaced or locked our hook.
+    if (
+      !current?.configurable ||
+      current.get !== patchedPropertyDescriptor.get ||
+      current.set !== patchedPropertyDescriptor.set
+    )
+      return;
+    let previousDescriptor = ownPropertyDescriptor;
+    while (previousDescriptor?.set) {
+      const previousObserver = adoptedStyleSheetObservers.get(
+        previousDescriptor.set,
+      );
+      if (
+        !previousObserver ||
+        previousObserver.stylesheetManager ||
+        previousObserver.get !== previousDescriptor.get
+      )
+        break;
+      previousDescriptor = previousObserver.previousDescriptor;
+    }
+    if (previousDescriptor) {
+      Object.defineProperty(host, 'adoptedStyleSheets', previousDescriptor);
+    } else {
+      delete (host as { adoptedStyleSheets?: CSSStyleSheet[] })
+        .adoptedStyleSheets;
+    }
+  });
+}
+
+function initStyleDeclarationObserver(
+  {
+    styleDeclarationCb,
+    mirror,
+    ignoreCSSAttributes,
+    stylesheetManager,
+  }: observerParam,
+  {
+    win,
+    mutationQueue,
+  }: { win: IWindow; mutationQueue: StyleSheetMutationQueue },
+): listenerHandler {
+  const setProperty = win.CSSStyleDeclaration.prototype.setProperty;
+  win.CSSStyleDeclaration.prototype.setProperty = new Proxy(setProperty, {
+    apply: callbackWrapper(
+      (
+        target: typeof setProperty,
+        thisArg: CSSStyleDeclaration,
+        argumentsList: [string, string, string],
+      ) => {
+        const [property, value, priority] = argumentsList;
+
+        const result = target.apply(thisArg, argumentsList);
+        invalidateStyleRuleSource(thisArg.parentRule);
+
+        // ignore this mutation if we do not care about this css attribute
+        if (ignoreCSSAttributes.has(property)) {
+          return result;
+        }
+        const sheet = thisArg.parentRule?.parentStyleSheet;
+        stylesheetManager.onCssomSheetMutation(sheet);
+        const { id, styleId } = getIdAndStyleId(
+          sheet,
+          mirror,
+          stylesheetManager.styleMirror,
+        );
+        if ((id && id !== -1) || (styleId && styleId !== -1)) {
+          const index = getNestedCSSRulePositions(thisArg.parentRule!);
+          mutationQueue.queueMutation(sheet, () =>
+            styleDeclarationCb({
+              id,
+              styleId,
+              set: {
+                property,
+                value,
+                priority,
+              },
+              index,
+            }),
+          );
+        }
+        return result;
+      },
+      'host',
+    ),
+  });
+
+  const removeProperty = win.CSSStyleDeclaration.prototype.removeProperty;
+  win.CSSStyleDeclaration.prototype.removeProperty = new Proxy(removeProperty, {
+    apply: callbackWrapper(
+      (
+        target: typeof removeProperty,
+        thisArg: CSSStyleDeclaration,
+        argumentsList: [string],
+      ) => {
+        const [property] = argumentsList;
+
+        const result = target.apply(thisArg, argumentsList);
+        invalidateStyleRuleSource(thisArg.parentRule);
+
+        // ignore this mutation if we do not care about this css attribute
+        if (ignoreCSSAttributes.has(property)) {
+          return result;
+        }
+        const sheet = thisArg.parentRule?.parentStyleSheet;
+        stylesheetManager.onCssomSheetMutation(sheet);
+        const { id, styleId } = getIdAndStyleId(
+          sheet,
+          mirror,
+          stylesheetManager.styleMirror,
+        );
+        if ((id && id !== -1) || (styleId && styleId !== -1)) {
+          const index = getNestedCSSRulePositions(thisArg.parentRule!);
+          mutationQueue.queueMutation(sheet, () =>
+            styleDeclarationCb({
+              id,
+              styleId,
+              remove: {
+                property,
+              },
+              index,
+            }),
+          );
+        }
+        return result;
+      },
+      'host',
+    ),
+  });
+
+  return callbackWrapper(() => {
+    win.CSSStyleDeclaration.prototype.setProperty = setProperty;
+    win.CSSStyleDeclaration.prototype.removeProperty = removeProperty;
+  });
+}
+
+function initMediaInteractionObserver({
+  mediaInteractionCb,
+  blockClass,
+  blockSelector,
+  mirror,
+  sampling,
+  doc,
+}: observerParam): listenerHandler {
+  const handler = callbackWrapper((type: MediaInteractions) =>
+    throttle(
+      callbackWrapper((event: Event) => {
+        const target = getEventTarget(event);
+        if (
+          !target ||
+          isBlocked(target as Node, blockClass, blockSelector, true)
+        ) {
+          return;
+        }
+        const { currentTime, volume, muted, playbackRate, loop } =
+          target as HTMLMediaElement;
+        mediaInteractionCb({
+          type,
+          id: mirror.getId(target as Node),
+          currentTime,
+          volume,
+          muted,
+          playbackRate,
+          loop,
+        });
+      }),
+      sampling.media || 500,
+    ),
+  );
+  const handlers = [
+    on('play', handler(MediaInteractions.Play), doc),
+    on('pause', handler(MediaInteractions.Pause), doc),
+    on('seeked', handler(MediaInteractions.Seeked), doc),
+    on('volumechange', handler(MediaInteractions.VolumeChange), doc),
+    on('ratechange', handler(MediaInteractions.RateChange), doc),
+  ];
+  return callbackWrapper(() => {
+    handlers.forEach((h) => h());
+  });
+}
+
+function initFontObserver({ fontCb, doc }: observerParam): listenerHandler {
+  const win = doc.defaultView as IWindow;
+  if (!win) {
+    return () => {
+      //
+    };
+  }
+
+  const handlers: listenerHandler[] = [];
+
+  const fontMap = new WeakMap<FontFace, fontParam>();
+
+  const originalFontFace = win.FontFace;
+  win.FontFace = function FontFace(
+    family: string,
+    source: string | ArrayBufferLike,
+    descriptors?: FontFaceDescriptors,
+  ) {
+    const fontFace = new originalFontFace(
+      family,
+      source as string | BufferSource,
+      descriptors,
+    );
+    fontMap.set(fontFace, {
+      family,
+      buffer: typeof source !== 'string',
+      descriptors,
+      fontSource:
+        typeof source === 'string'
+          ? source
+          : JSON.stringify(Array.from(new Uint8Array(source))),
+    });
+    return fontFace;
+  } as unknown as typeof FontFace;
+
+  const restoreHandler = patch(
+    doc.fonts,
+    'add',
+    function (original: (font: FontFace) => void) {
+      return function (this: FontFaceSet, fontFace: FontFace) {
+        setTimeout(
+          callbackWrapper(() => {
+            const p = fontMap.get(fontFace);
+            if (p) {
+              fontCb(p);
+              fontMap.delete(fontFace);
+            }
+          }),
+          0,
+        );
+        return original.apply(this, [fontFace]);
+      };
+    },
+  );
+
+  handlers.push(() => {
+    win.FontFace = originalFontFace;
+  });
+  handlers.push(restoreHandler);
+
+  return callbackWrapper(() => {
+    handlers.forEach((h) => h());
+  });
+}
+
+function initSelectionObserver(param: observerParam): listenerHandler {
+  const { doc, mirror, blockClass, blockSelector, selectionCb } = param;
+  let collapsed = true;
+
+  const updateSelection = callbackWrapper(() => {
+    const selection = doc.getSelection();
+
+    if (!selection || (collapsed && selection?.isCollapsed)) return;
+
+    collapsed = selection.isCollapsed || false;
+
+    const ranges: SelectionRange[] = [];
+    const count = selection.rangeCount || 0;
+
+    for (let i = 0; i < count; i++) {
+      const range = selection.getRangeAt(i);
+
+      const { startContainer, startOffset, endContainer, endOffset } = range;
+
+      const blocked =
+        isBlocked(startContainer, blockClass, blockSelector, true) ||
+        isBlocked(endContainer, blockClass, blockSelector, true);
+
+      if (blocked) continue;
+
+      ranges.push({
+        start: mirror.getId(startContainer),
+        startOffset,
+        end: mirror.getId(endContainer),
+        endOffset,
+      });
+    }
+
+    selectionCb({ ranges });
+  });
+
+  updateSelection();
+
+  return on('selectionchange', updateSelection);
+}
+
+function initCustomElementObserver({
+  doc,
+  customElementCb,
+}: observerParam): listenerHandler {
+  const win = doc.defaultView as IWindow;
+  if (!win || !win.customElements) return () => {};
+  const restoreHandler = patch(
+    win.customElements,
+    'define',
+    function (
+      original: (
+        name: string,
+        constructor: CustomElementConstructor,
+        options?: ElementDefinitionOptions,
+      ) => void,
+    ) {
+      return function (
+        name: string,
+        constructor: CustomElementConstructor,
+        options?: ElementDefinitionOptions,
+      ) {
+        try {
+          customElementCb({
+            define: {
+              name,
+            },
+          });
+        } catch (e) {
+          console.warn(`Custom element callback failed for ${name}`);
+        }
+        return original.apply(this, [name, constructor, options]);
+      };
+    },
+  );
+  return restoreHandler;
+}
+
+function mergeHooks(o: observerParam, hooks: hooksParam) {
+  const {
+    mutationCb,
+    mousemoveCb,
+    mouseInteractionCb,
+    scrollCb,
+    viewportResizeCb,
+    inputCb,
+    mediaInteractionCb,
+    styleSheetRuleCb,
+    styleDeclarationCb,
+    canvasMutationCb,
+    fontCb,
+    selectionCb,
+    customElementCb,
+  } = o;
+  o.mutationCb = (...p: Arguments<mutationCallBack>) => {
+    if (hooks.mutation) {
+      hooks.mutation(...p);
+    }
+    mutationCb(...p);
+  };
+  o.mousemoveCb = (...p: Arguments<mousemoveCallBack>) => {
+    if (hooks.mousemove) {
+      hooks.mousemove(...p);
+    }
+    mousemoveCb(...p);
+  };
+  o.mouseInteractionCb = (...p: Arguments<mouseInteractionCallBack>) => {
+    if (hooks.mouseInteraction) {
+      hooks.mouseInteraction(...p);
+    }
+    mouseInteractionCb(...p);
+  };
+  o.scrollCb = (...p: Arguments<scrollCallback>) => {
+    if (hooks.scroll) {
+      hooks.scroll(...p);
+    }
+    scrollCb(...p);
+  };
+  o.viewportResizeCb = (...p: Arguments<viewportResizeCallback>) => {
+    if (hooks.viewportResize) {
+      hooks.viewportResize(...p);
+    }
+    viewportResizeCb(...p);
+  };
+  o.inputCb = (...p: Arguments<inputCallback>) => {
+    if (hooks.input) {
+      hooks.input(...p);
+    }
+    inputCb(...p);
+  };
+  o.mediaInteractionCb = (...p: Arguments<mediaInteractionCallback>) => {
+    if (hooks.mediaInteaction) {
+      hooks.mediaInteaction(...p);
+    }
+    mediaInteractionCb(...p);
+  };
+  o.styleSheetRuleCb = (...p: Arguments<styleSheetRuleCallback>) => {
+    if (hooks.styleSheetRule) {
+      hooks.styleSheetRule(...p);
+    }
+    styleSheetRuleCb(...p);
+  };
+  o.styleDeclarationCb = (...p: Arguments<styleDeclarationCallback>) => {
+    if (hooks.styleDeclaration) {
+      hooks.styleDeclaration(...p);
+    }
+    styleDeclarationCb(...p);
+  };
+  o.canvasMutationCb = (...p: Arguments<canvasMutationCallback>) => {
+    if (hooks.canvasMutation) {
+      hooks.canvasMutation(...p);
+    }
+    canvasMutationCb(...p);
+  };
+  o.fontCb = (...p: Arguments<fontCallback>) => {
+    if (hooks.font) {
+      hooks.font(...p);
+    }
+    fontCb(...p);
+  };
+  o.selectionCb = (...p: Arguments<selectionCallback>) => {
+    if (hooks.selection) {
+      hooks.selection(...p);
+    }
+    selectionCb(...p);
+  };
+  o.customElementCb = (...c: Arguments<customElementCallback>) => {
+    if (hooks.customElement) {
+      hooks.customElement(...c);
+    }
+    customElementCb(...c);
+  };
+}
+
+/**
+ * Observers whose setup threw, for the lifetime of the page. An error handler that
+ * swallows the failure otherwise leaves it invisible: the recorder keeps running and
+ * reports itself as healthy while it captures less than it should. A set, because a
+ * broken host API breaks the same observer again on every restart and in every frame,
+ * and undefined while empty, so the healthy page allocates nothing.
+ */
+const observerInitFailures = new Set<string>();
+
+export function getObserverInitFailures(): string[] | undefined {
+  return observerInitFailures.size
+    ? Array.from(observerInitFailures)
+    : undefined;
+}
+
+export function initObservers(
+  o: observerParam,
+  hooks: hooksParam = {},
+): listenerHandler {
+  const currentWindow = o.doc.defaultView; // basically document.window
+  if (!currentWindow) {
+    return () => {
+      //
+    };
+  }
+
+  mergeHooks(o, hooks);
+  let mutationObserver: MutationObserver | undefined;
+  let mutationBuffer: MutationBuffer | undefined;
+  const handlers: listenerHandler[] = [];
+
+  const cleanup = callbackWrapper(() => {
+    try {
+      // Clean up this observer's mutation buffer
+      if (mutationBuffer) {
+        try {
+          mutationBuffer.destroy();
+          mutationBuffer.reset();
+        } finally {
+          // Remove only this buffer from the global array. In a finally: a throw
+          // above would otherwise leave it pinned there, holding this document
+          // and its canvas manager alive.
+          const index = mutationBuffers.indexOf(mutationBuffer);
+          if (index !== -1) {
+            mutationBuffers.splice(index, 1);
+          }
+        }
+      }
+      // Disconnect the shadow observers owned by this document (e.g. an iframe being
+      // torn down) without touching the rest of the page's shadow observation.
+      o.shadowDomManager.resetForDoc(o.doc);
+      mutationObserver?.disconnect();
+    } finally {
+      // Releasing this document's listeners and patched APIs is the whole point
+      // of teardown, so it runs even when a step above throws.
+      callAllSafely(handlers);
+    }
+  });
+
+  // One observer that cannot start must not silence the ones that can. A third-party
+  // script or a restricted host API breaks a single observer on some pages, and the
+  // frame must degrade to partial recording instead of no recording at all. The error
+  // still reaches the configured error handler, which decides whether to swallow it.
+  const startObserver = (
+    name: string,
+    start: () => listenerHandler | void,
+  ): void => {
+    const handler = callbackWrapper(() => {
+      try {
+        return start();
+      } catch (error) {
+        observerInitFailures.add(name);
+        throw error;
+      }
+    })();
+    if (typeof handler === 'function') {
+      handlers.push(handler);
+    }
+  };
+
+  try {
+    if (o.recordDOM) {
+      startObserver('mutation', () => {
+        const result = initMutationObserver(o, o.doc);
+        mutationObserver = result.observer;
+        mutationBuffer = result.buffer;
+      });
+    }
+    startObserver('move', () => initMoveObserver(o));
+    startObserver('mouseInteraction', () => initMouseInteractionObserver(o));
+    startObserver('scroll', () => initScrollObserver(o));
+    startObserver('viewportResize', () =>
+      initViewportResizeObserver(o, {
+        win: currentWindow,
+      }),
+    );
+    startObserver('input', () => initInputObserver(o));
+    startObserver('mediaInteraction', () => initMediaInteractionObserver(o));
+
+    if (o.recordDOM) {
+      const styleSheetMutationQueue =
+        createStyleSheetMutationQueue(currentWindow);
+      handlers.push(styleSheetMutationQueue.reset);
+      startObserver('styleSheet', () =>
+        initStyleSheetObserver(o, {
+          win: currentWindow,
+          mutationQueue: styleSheetMutationQueue,
+        }),
+      );
+      startObserver('adoptedStyleSheet', () =>
+        initAdoptedStyleSheetObserver(o, o.doc),
+      );
+      startObserver('styleDeclaration', () =>
+        initStyleDeclarationObserver(o, {
+          win: currentWindow,
+          mutationQueue: styleSheetMutationQueue,
+        }),
+      );
+      if (o.collectFonts) {
+        startObserver('font', () => initFontObserver(o));
+      }
+    }
+    startObserver('selection', () => initSelectionObserver(o));
+    startObserver('customElement', () => initCustomElementObserver(o));
+
+    // plugins
+    for (const plugin of o.plugins) {
+      startObserver(`plugin:${plugin.name}`, () =>
+        plugin.observer(plugin.callback, currentWindow, plugin.options),
+      );
+    }
+  } catch (error) {
+    try {
+      cleanup();
+    } catch {
+      // Preserve the initialization error if best-effort cleanup also fails.
+    }
+    throw error;
+  }
+
+  return cleanup;
+}
+
+type CSSGroupingProp =
+  | 'CSSGroupingRule'
+  | 'CSSMediaRule'
+  | 'CSSSupportsRule'
+  | 'CSSConditionRule';
+
+function hasNestedCSSRule(prop: CSSGroupingProp): boolean {
+  return typeof window[prop] !== 'undefined';
+}
+
+function canMonkeyPatchNestedCSSRule(prop: CSSGroupingProp): boolean {
+  return Boolean(
+    typeof window[prop] !== 'undefined' &&
+      // Note: Generally, this check _shouldn't_ be necessary
+      // However, in some scenarios (e.g. jsdom) this can sometimes fail, so we check for it here
+      window[prop].prototype &&
+      'insertRule' in window[prop].prototype &&
+      'deleteRule' in window[prop].prototype,
+  );
+}

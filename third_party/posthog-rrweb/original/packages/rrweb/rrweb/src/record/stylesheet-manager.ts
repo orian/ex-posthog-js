@@ -1,0 +1,654 @@
+import {
+  countStylesheetRules,
+  createStylesheetTextCursor,
+  getSuspensionGeneration,
+  maskAttributeValue,
+  nowMs,
+  onceLinkStylesheetUpToDate,
+  recordDeferredStylesheetFailure,
+  recordDeferredStylesheetsAbandoned,
+  recordDeferredStylesheetSlice,
+  recordStylesheetCost,
+  resetStylesheetLoadTracking,
+  runNonDeferrableStylesheetWork,
+  stringifyRule,
+} from '@posthog/rrweb-snapshot';
+import type {
+  MaskAttributeFn,
+  StylesheetTextCursor,
+} from '@posthog/rrweb-snapshot';
+import type {
+  blockClass,
+  elementNode,
+  serializedNodeWithId,
+  adoptedStyleSheetCallback,
+  adoptedStyleSheetParam,
+  attributeMutation,
+  mutationCallBack,
+} from '@posthog/rrweb-types';
+import { StyleSheetMirror, isBlockedIncludingShadowHosts } from '../utils';
+import {
+  type IdleDeadline,
+  type IdleTask,
+  whenIdle,
+  DEFERRED_STYLESHEET_RULES_PER_SLICE,
+  DEFERRED_STYLESHEET_SLICES_PER_FALLBACK_TICK,
+} from './idle';
+
+/** Resumable inlining of one deferred stylesheet; see {@link StylesheetManager.beginDeferredLinkInlining}. */
+export type DeferredLinkInliningTask = {
+  /**
+   * Stringify up to `maxRules` more rules of the sheet. Returns true once the
+   * sheet is finished (its mutation emitted, or nothing to emit).
+   */
+  advance: (maxRules: number) => boolean;
+  /** Lower bound on the rules still to stringify; see {@link StylesheetTextCursor.remainingRules}. */
+  remainingRules: () => number;
+  /**
+   * Callers dropping the task without draining it must call this, so the
+   * manager stops tracking its sheet for mutation invalidation.
+   */
+  discard: () => void;
+};
+
+/** Inlining of one changed link's sheet; see {@link StylesheetManager.inlineLinkStylesheetAfterChange}. */
+type ChangedLinkJob = {
+  remainingRules: () => number;
+  /** Returns true once the job is done or dropped. */
+  runSlice: () => boolean;
+  drop: () => void;
+};
+
+/** One pending deferral's captured root sheet plus its cancellation hook. */
+type PendingDeferredSheet = {
+  sheet: CSSStyleSheet;
+  invalidate: () => void;
+};
+
+// Replay rebuilds the link from the attributes recorded for it before, when
+// `_cssText` arrives, so attributes changed since (such as `media`) must
+// travel with the CSS, and removed ones as null. `rel` and `href` go, as when
+// a snapshot inlines a link.
+function attributesReplacingPrevious(serialization: {
+  previous: serializedNodeWithId | null;
+  current: serializedNodeWithId | null;
+}): attributeMutation['attributes'] {
+  const attributes: attributeMutation['attributes'] = {};
+  for (const name of Object.keys(
+    (serialization.previous as elementNode | null)?.attributes ?? {},
+  )) {
+    attributes[name] = null;
+  }
+  Object.assign(
+    attributes,
+    (serialization.current as elementNode | null)?.attributes,
+  );
+  delete attributes.rel;
+  delete attributes.href;
+  return attributes;
+}
+
+type ChangedLinkRecorderView = {
+  currentId: () => number;
+  reserializeWithoutCss: () => {
+    previous: serializedNodeWithId | null;
+    current: serializedNodeWithId | null;
+  };
+  lastSerialization: () => serializedNodeWithId | null;
+  /** Records the link as removed and added again, in order with the mutations the recorder still holds. */
+  readdAsMove: () => void;
+};
+
+// bounds the rework when the page keeps changing a sheet through the CSSOM
+const CHANGED_LINK_RESTARTS_AFTER_SHEET_MUTATION = 3;
+
+export class StylesheetManager {
+  private trackedLinkElements: WeakSet<HTMLLinkElement> = new WeakSet();
+  private pendingDeferredSheets: Set<PendingDeferredSheet> = new Set();
+  // A fulfilled replace must not overwrite source from a newer CSSOM write.
+  private cssomRevisions = new WeakMap<CSSStyleSheet, number>();
+  // a restarted recorder refills the shared mirror, so mirror membership
+  // cannot tell a stopped recorder's pending work from the new recorder's
+  private stopped = false;
+  private changedLinkJobs = new Map<HTMLLinkElement, ChangedLinkJob>();
+  // replay shows these as a `<style>` since it got their `_cssText`
+  private linksInlinedSinceSnapshot = new WeakSet<HTMLLinkElement>();
+  private mutationCb: mutationCallBack;
+  private adoptedStyleSheetCb: adoptedStyleSheetCallback;
+  private maskAllElementAttributes: boolean;
+  private maskAttributeFn: MaskAttributeFn | undefined;
+  private blockClass: blockClass;
+  private blockSelector: string | null;
+  public styleMirror: StyleSheetMirror = new StyleSheetMirror();
+
+  constructor(options: {
+    mutationCb: mutationCallBack;
+    adoptedStyleSheetCb: adoptedStyleSheetCallback;
+    maskAllElementAttributes?: boolean;
+    maskAttributeFn?: MaskAttributeFn;
+    blockClass?: blockClass;
+    blockSelector?: string | null;
+  }) {
+    this.mutationCb = options.mutationCb;
+    this.adoptedStyleSheetCb = options.adoptedStyleSheetCb;
+    this.maskAllElementAttributes = options.maskAllElementAttributes ?? false;
+    this.maskAttributeFn = options.maskAttributeFn;
+    this.blockClass = options.blockClass ?? 'rr-block';
+    this.blockSelector = options.blockSelector ?? null;
+  }
+
+  // Every path here emits a link's CSS after it was serialized, and the link
+  // or an ancestor can be blocked in between.
+  private isLinkBlocked(linkEl: HTMLLinkElement): boolean {
+    return isBlockedIncludingShadowHosts(
+      linkEl,
+      this.blockClass,
+      this.blockSelector,
+    );
+  }
+
+  public attachLinkElement(
+    linkEl: HTMLLinkElement,
+    childSn: serializedNodeWithId,
+    previousSn: serializedNodeWithId | null = null,
+  ): void {
+    if (
+      !this.stopped &&
+      '_cssText' in (childSn as elementNode).attributes &&
+      !this.isLinkBlocked(linkEl)
+    ) {
+      this.mutationCb({
+        adds: [],
+        removes: [],
+        texts: [],
+        attributes: [
+          {
+            id: childSn.id,
+            attributes: attributesReplacingPrevious({
+              previous: previousSn,
+              current: childSn,
+            }),
+          },
+        ],
+      });
+      this.linksInlinedSinceSnapshot.add(linkEl);
+    }
+
+    this.trackLinkElement(linkEl);
+  }
+
+  /**
+   * Inline a `<link rel=stylesheet>` that the full snapshot skipped because it
+   * ran out of stylesheet budget. The returned task stringifies a bounded rule
+   * range per `advance` call, accumulating across calls, and emits ONE
+   * attribute mutation carrying the complete `_cssText` when the last slice
+   * finishes - a partial sheet never reaches the wire, and dropping the task
+   * mid-sheet emits nothing and leaks nothing. Same mutation shape as
+   * {@link attachLinkElement} - the replayer swaps the link for a `<style>`
+   * carrying `_cssText`. Returns null when there is nothing to inline.
+   */
+  public beginDeferredLinkInlining(
+    linkEl: HTMLLinkElement,
+    id: number,
+    options: {
+      emitCssText?: (cssText: string) => void;
+      onInvalidatedBySheetMutation?: () => void;
+      /** The sheet is unreadable or empty, so replay has to load it from its href. */
+      onUninlinable?: () => void;
+    } = {},
+  ): DeferredLinkInliningTask | null {
+    const emitCssText =
+      options.emitCssText ??
+      ((cssText: string) => this.emitCssTextMutation(linkEl, id, cssText));
+    if (id === -1 || !linkEl.isConnected) {
+      // never made it into the mirror (slimDOM dropped it), or detached while we
+      // were queued - either way a mutation for it would only make the replayer warn
+      return null;
+    }
+    let cursor: StylesheetTextCursor | null = null;
+    let capturedSheet: CSSStyleSheet | null = null;
+    try {
+      capturedSheet = linkEl.sheet;
+      if (capturedSheet) {
+        cursor = createStylesheetTextCursor(capturedSheet);
+      }
+    } catch (e) {
+      //
+    }
+    if (!cursor || !capturedSheet) {
+      // the sheet is unreadable, so the link keeps its href and replay must
+      // load the CSS remotely - a fidelity risk worth counting, not hiding
+      recordDeferredStylesheetFailure();
+      options.onUninlinable?.();
+      return null;
+    }
+    const readyCursor = cursor;
+    // Registered so the recorder's CSSOM observers can cancel this task; see
+    // onCssomSheetMutation for why an unnoticed mutation would corrupt replay.
+    let invalidatedByMutation = false;
+    const pendingEntry: PendingDeferredSheet = {
+      sheet: capturedSheet,
+      invalidate: () => {
+        invalidatedByMutation = true;
+      },
+    };
+    this.pendingDeferredSheets.add(pendingEntry);
+    let completed = false;
+    return {
+      advance: (maxRules: number) => {
+        // a flush() re-entered from inside this sheet's own emit (a full
+        // snapshot or recorder stop taken from within the consumer's emit)
+        // advances the already-done cursor again; the terminal block below,
+        // the emit included, must run exactly once
+        if (completed) {
+          return true;
+        }
+        // deferred work runs outside the snapshot's tracking window, so the
+        // snapshot timers miss it; measure each slice (emit included) here
+        const startedAt = nowMs();
+        const startGeneration = getSuspensionGeneration();
+        let finished = true;
+        try {
+          if (invalidatedByMutation) {
+            completed = true;
+            if (options.onInvalidatedBySheetMutation) {
+              options.onInvalidatedBySheetMutation();
+            } else {
+              // emitting the defer-time text now would overwrite the mutation's
+              // already-recorded StyleSheetRule/StyleDeclaration event in replay;
+              // the link keeps its href, a counted fidelity loss
+              recordDeferredStylesheetFailure();
+            }
+            return true;
+          }
+          if (!readyCursor.advance(maxRules)) {
+            finished = false;
+            return false;
+          }
+          completed = true;
+          const cssText = readyCursor.text();
+          if (!linkEl.isConnected) {
+            // the link left the DOM while we were slicing; the replay drops it too
+            return true;
+          }
+          let currentSheet: CSSStyleSheet | null = null;
+          try {
+            currentSheet = linkEl.sheet;
+          } catch (e) {
+            //
+          }
+          if (currentSheet !== capturedSheet) {
+            // the link's href was swapped while we were slicing (an SPA style
+            // change): emitting the old sheet's CSS now would override the new
+            // stylesheet in replay, which arrives via its own mutation flow.
+            // The old CSS is lost, so count it like any other failed deferral.
+            recordDeferredStylesheetFailure();
+            return true;
+          }
+          if (!cssText) {
+            // stringification produced nothing: the link keeps its href and replay
+            // must load the CSS remotely - a fidelity risk worth counting, not hiding
+            recordDeferredStylesheetFailure();
+            options.onUninlinable?.();
+            return true;
+          }
+          if (this.isLinkBlocked(linkEl)) {
+            return true;
+          }
+          emitCssText(cssText);
+          return true;
+        } finally {
+          if (finished) {
+            this.pendingDeferredSheets.delete(pendingEntry);
+          }
+          recordDeferredStylesheetSlice(nowMs() - startedAt, startGeneration);
+        }
+      },
+      remainingRules: () => readyCursor.remainingRules(),
+      discard: () => {
+        this.pendingDeferredSheets.delete(pendingEntry);
+      },
+    };
+  }
+
+  /**
+   * Recorder hook: application code mutated `sheet` through the CSSOM
+   * (insertRule/deleteRule/setProperty/removeProperty). A pending deferral
+   * whose captured root sheet is `sheet` must never emit: the mutation was
+   * already recorded as a StyleSheetRule/StyleDeclaration event, and a later
+   * `_cssText` mutation carrying the defer-time text would overwrite it in
+   * replay. Cancelling keeps the link's href-only fallback, and the loss is
+   * counted when the task next advances. Mutations to `@import`ed sheets
+   * inside a captured chain deliberately do NOT invalidate: an imported sheet
+   * has no ownerNode and is not in the style mirror, so the observers cannot
+   * attribute (and never emit) an event for it - there is nothing the
+   * defer-time text could overwrite, and that text is exactly what a
+   * synchronous pass at defer time would have recorded.
+   */
+  public onCssomSheetMutation(
+    sheet: CSSStyleSheet | null | undefined,
+  ): number | undefined {
+    if (!sheet) return;
+    const revision = (this.cssomRevisions.get(sheet) ?? 0) + 1;
+    this.cssomRevisions.set(sheet, revision);
+    for (const pending of this.pendingDeferredSheets) {
+      if (pending.sheet === sheet) {
+        this.pendingDeferredSheets.delete(pending);
+        pending.invalidate();
+      }
+    }
+    return revision;
+  }
+
+  public isCurrentCssomMutation(
+    sheet: CSSStyleSheet,
+    revision: number | undefined,
+  ): boolean {
+    return !this.stopped && this.cssomRevisions.get(sheet) === revision;
+  }
+
+  /**
+   * Inline the sheet that a `<link>` loads after a `rel` or `href` change, so
+   * replay does not keep the previous sheet or depend on fetching the new one.
+   */
+  public inlineLinkStylesheetAfterChange(
+    linkEl: HTMLLinkElement,
+    recorderView: ChangedLinkRecorderView,
+  ): void {
+    // a stop from inside the consumer's emit has already reset the mirror
+    if (this.stopped || recorderView.currentId() === -1) {
+      return;
+    }
+    onceLinkStylesheetUpToDate(linkEl, () =>
+      this.inlineChangedLinkStylesheet(
+        linkEl,
+        recorderView,
+        CHANGED_LINK_RESTARTS_AFTER_SHEET_MUTATION,
+      ),
+    );
+  }
+
+  private inlineChangedLinkStylesheet(
+    linkEl: HTMLLinkElement,
+    recorderView: ChangedLinkRecorderView,
+    restartsLeftAfterSheetMutation: number,
+  ): void {
+    const id = recorderView.currentId();
+    if (
+      this.stopped ||
+      !linkEl.isConnected ||
+      id === -1 ||
+      this.isLinkBlocked(linkEl)
+    ) {
+      return;
+    }
+    // a newer change supersedes the work still in flight for this link
+    this.changedLinkJobs.get(linkEl)?.drop();
+    let sheetMutatedWhileInlining = false;
+    const task = this.beginDeferredLinkInlining(linkEl, id, {
+      emitCssText: (cssText) =>
+        this.emitCssTextMutation(
+          linkEl,
+          id,
+          cssText,
+          attributesReplacingPrevious(recorderView.reserializeWithoutCss()),
+        ),
+      onInvalidatedBySheetMutation: () => {
+        sheetMutatedWhileInlining = true;
+      },
+      onUninlinable: () => this.readdAsPlainLink(linkEl, recorderView),
+    });
+    if (!task) {
+      return;
+    }
+    let pendingIdle: IdleTask | null = null;
+    // a page frozen before the idle callback runs must not keep the job and its CSS alive
+    const release = () => {
+      task.discard();
+      pendingIdle?.cancel();
+      pendingIdle = null;
+      if (this.changedLinkJobs.get(linkEl) === job) {
+        this.changedLinkJobs.delete(linkEl);
+      }
+    };
+    const job: ChangedLinkJob = {
+      remainingRules: () => task.remainingRules(),
+      runSlice: () => {
+        try {
+          // a stop resets the mirror
+          if (
+            this.stopped ||
+            this.changedLinkJobs.get(linkEl) !== job ||
+            recorderView.currentId() === -1 ||
+            this.isLinkBlocked(linkEl)
+          ) {
+            release();
+            return true;
+          }
+          if (!task.advance(DEFERRED_STYLESHEET_RULES_PER_SLICE)) {
+            return false;
+          }
+          release();
+          if (!sheetMutatedWhileInlining) {
+            return true;
+          }
+          if (restartsLeftAfterSheetMutation > 0) {
+            // replay keeps the previous sheet until this CSS arrives, and the
+            // mutated sheet's text already includes the recorded CSSOM change
+            this.inlineChangedLinkStylesheet(
+              linkEl,
+              recorderView,
+              restartsLeftAfterSheetMutation - 1,
+            );
+          } else {
+            recordDeferredStylesheetFailure();
+          }
+          return true;
+        } catch (e) {
+          // runs from an idle callback or a pagehide flush: a throwing consumer
+          // emit or mask callback must not surface on the customer's page
+          release();
+          return true;
+        }
+      },
+      drop: release,
+    };
+    this.changedLinkJobs.set(linkEl, job);
+    const step = (deadline?: IdleDeadline) => {
+      pendingIdle = null;
+      let slices = 0;
+      let done: boolean;
+      do {
+        done = job.runSlice();
+        slices += 1;
+      } while (
+        !done &&
+        (deadline
+          ? !deadline.didTimeout && deadline.timeRemaining() > 5
+          : slices < DEFERRED_STYLESHEET_SLICES_PER_FALLBACK_TICK)
+      );
+      if (!done) {
+        pendingIdle = whenIdle(step);
+      }
+    };
+    pendingIdle = whenIdle(step);
+  }
+
+  /**
+   * Synchronously finish the pending changed-link CSS, for a page that is
+   * going away before its idle callbacks run. A sheet that cannot finish in
+   * what is left of `maxSlices` is dropped and counted, so it cannot starve
+   * the ones behind it. Returns the slices used.
+   */
+  public flushChangedLinkInlining(maxSlices: number): number {
+    let slices = 0;
+    // a restart after a CSSOM change adds its job to the map, and this loop visits it too
+    for (const job of this.changedLinkJobs.values()) {
+      let done = false;
+      while (!done) {
+        const slicesNeeded =
+          Math.floor(job.remainingRules() / DEFERRED_STYLESHEET_RULES_PER_SLICE) +
+          1;
+        if (slicesNeeded > maxSlices - slices) {
+          job.drop();
+          recordDeferredStylesheetsAbandoned(1);
+          break;
+        }
+        done = job.runSlice();
+        slices += 1;
+      }
+    }
+    return slices;
+  }
+
+  /** One-call variant of {@link beginDeferredLinkInlining}: the whole sheet in a single slice. */
+  public inlineDeferredLinkElement(linkEl: HTMLLinkElement, id: number): void {
+    this.beginDeferredLinkInlining(linkEl, id)?.advance(Infinity);
+  }
+
+  private emitCssTextMutation(
+    linkEl: HTMLLinkElement,
+    id: number,
+    cssText: string,
+    otherAttributes: attributeMutation['attributes'] = {},
+  ) {
+    if (this.stopped) {
+      return;
+    }
+    // The snapshot path masks _cssText inside serializeElementNode; this path
+    // builds the value itself, so it has to mask it too.
+    this.mutationCb({
+      adds: [],
+      removes: [],
+      texts: [],
+      attributes: [
+        {
+          id,
+          attributes: {
+            ...otherAttributes,
+            _cssText: maskAttributeValue({
+              element: linkEl,
+              name: '_cssText',
+              value: cssText,
+              maskAllElementAttributes: this.maskAllElementAttributes,
+              maskAttributeFn: this.maskAttributeFn,
+            }),
+          },
+        },
+      ],
+    });
+    this.linksInlinedSinceSnapshot.add(linkEl);
+  }
+
+  // Replay cannot turn the `<style>` it built from earlier CSS back into a
+  // `<link>`, so the link goes out as a remove and an add, as a moved node
+  // does, and replay builds a `<link>` that loads the new href.
+  private readdAsPlainLink(
+    linkEl: HTMLLinkElement,
+    recorderView: ChangedLinkRecorderView,
+  ): void {
+    try {
+      if (this.stopped || !linkEl.isConnected || this.isLinkBlocked(linkEl)) {
+        return;
+      }
+      const replayShowsStyle =
+        this.linksInlinedSinceSnapshot.has(linkEl) ||
+        '_cssText' in
+          ((recorderView.lastSerialization() as elementNode | null)
+            ?.attributes ?? {});
+      if (!replayShowsStyle) {
+        return;
+      }
+      this.linksInlinedSinceSnapshot.delete(linkEl);
+      recorderView.readdAsMove();
+    } catch (e) {
+      // runs from a load event, timer or idle callback: a throwing consumer
+      // emit or mask callback must not surface on the customer's page
+    }
+  }
+
+  public trackLinkElement(linkEl: HTMLLinkElement): void {
+    if (this.trackedLinkElements.has(linkEl)) return;
+
+    this.trackedLinkElements.add(linkEl);
+    this.trackStylesheetInLinkElement(linkEl);
+  }
+
+  public adoptStyleSheets(
+    sheets: CSSStyleSheet[] | readonly CSSStyleSheet[],
+    hostId: number,
+  ): void {
+    if (sheets.length === 0) return;
+    const adoptedStyleSheetData: adoptedStyleSheetParam = {
+      id: hostId,
+      styleIds: [] as number[],
+    };
+    const styles: NonNullable<adoptedStyleSheetParam['styles']> = [];
+    for (const sheet of sheets) {
+      let styleId: number;
+      if (!this.styleMirror.has(sheet)) {
+        const newStyleId = this.styleMirror.add(sheet);
+        styleId = newStyleId;
+        // synchronous stringification with no deferral path: charge it to the
+        // css counters (never-deferrable, so it never charges the budget); the
+        // no-op outside a full snapshot's tracking window keeps the
+        // incremental adoption path unmeasured, as before
+        const startedAt = nowMs();
+        try {
+          runNonDeferrableStylesheetWork(() => {
+            try {
+              const sheetRules = sheet.rules || sheet.cssRules;
+              if (sheetRules) {
+                countStylesheetRules(sheetRules);
+              }
+            } catch (e) {
+              //
+            }
+            styles.push({
+              styleId: newStyleId,
+              rules: Array.from(sheet.rules || CSSRule, (r, index) => ({
+                rule: stringifyRule(r, sheet.href),
+                index,
+              })),
+            });
+          });
+        } finally {
+          recordStylesheetCost(nowMs() - startedAt);
+        }
+      } else styleId = this.styleMirror.getId(sheet);
+      adoptedStyleSheetData.styleIds.push(styleId);
+    }
+    if (styles.length > 0) adoptedStyleSheetData.styles = styles;
+    this.adoptedStyleSheetCb(adoptedStyleSheetData);
+  }
+
+  /** Ends all delayed stylesheet work of this recorder; a stopped manager emits nothing. */
+  public stop(): void {
+    this.stopped = true;
+    this.dropChangedLinkJobs();
+    resetStylesheetLoadTracking();
+  }
+
+  private dropChangedLinkJobs(): void {
+    Array.from(this.changedLinkJobs.values()).forEach((job) => job.drop());
+  }
+
+  public reset(): void {
+    this.styleMirror.reset();
+    this.trackedLinkElements = new WeakSet();
+    // any surviving deferral registrations belong to tasks the recorder
+    // cancelled at the snapshot boundary; drop them so they don't pin sheets
+    this.pendingDeferredSheets.clear();
+    // the full snapshot inlines each changed link's current sheet itself
+    this.dropChangedLinkJobs();
+    this.linksInlinedSinceSnapshot = new WeakSet();
+    resetStylesheetLoadTracking({ keepChangedLinks: true });
+  }
+
+  // TODO: take snapshot on stylesheet reload by applying event listener
+  private trackStylesheetInLinkElement(_linkEl: HTMLLinkElement) {
+    // linkEl.addEventListener('load', () => {
+    //   // re-loaded, maybe take another snapshot?
+    // });
+  }
+}

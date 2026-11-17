@@ -1,0 +1,505 @@
+// Portions of this file are derived from getsentry/sentry-javascript
+// Copyright (c) 2012 Functional Software, Inc. dba Sentry
+// Licensed under the MIT License: https://github.com/getsentry/sentry-javascript/blob/develop/LICENSE
+
+import { isWebKit } from '@posthog/core';
+
+type PrototypeOwner = Node | ShadowRoot | MutationObserver | Element;
+type TypeofPrototypeOwner =
+  | typeof Node
+  | typeof ShadowRoot
+  | typeof MutationObserver
+  | typeof Element;
+
+type BasePrototypeCache = {
+  Node: typeof Node.prototype;
+  ShadowRoot: typeof ShadowRoot.prototype;
+  MutationObserver: typeof MutationObserver.prototype;
+  Element: typeof Element.prototype;
+};
+
+const testableAccessors = {
+  Node: [
+    'childNodes',
+    'parentNode',
+    'parentElement',
+    'textContent',
+    'previousSibling',
+    'nextSibling',
+    'lastChild',
+  ] as const,
+  ShadowRoot: ['host', 'styleSheets'] as const,
+  Element: ['shadowRoot'] as const,
+  MutationObserver: [] as const,
+} as const;
+
+const testableMethods = {
+  Node: ['contains', 'getRootNode'] as const,
+  ShadowRoot: ['getSelection'],
+  Element: ['querySelector', 'querySelectorAll'],
+  MutationObserver: ['constructor'],
+} as const;
+
+const untaintedBasePrototype: Partial<BasePrototypeCache> = {};
+
+type WindowWithZone = typeof globalThis & {
+  Zone?: {
+    __symbol__?: (key: string) => string;
+  };
+};
+
+type WindowWithUnpatchedSymbols = typeof globalThis &
+  Record<string, TypeofPrototypeOwner>;
+
+/*
+Angular zone patches many things and can pass the untainted checks below, causing performance issues
+Angular zone, puts the unpatched originals on the window, and the names for hose on the zone object.
+So, we get the unpatched versions from the window object if they exist.
+You can rename Zone, but this is a good enough proxy to avoid going to an iframe to get the untainted versions.
+see: https://github.com/angular/angular/issues/26948
+*/
+function angularZoneUnpatchedAlternative(key: keyof BasePrototypeCache) {
+  const angularUnpatchedVersionSymbol = (
+    globalThis as WindowWithZone
+  )?.Zone?.__symbol__?.(key);
+  if (
+    angularUnpatchedVersionSymbol &&
+    (globalThis as WindowWithUnpatchedSymbols)[angularUnpatchedVersionSymbol]
+  ) {
+    return (globalThis as WindowWithUnpatchedSymbols)[
+      angularUnpatchedVersionSymbol
+    ];
+  } else {
+    return undefined;
+  }
+}
+
+export function getUntaintedPrototype<T extends keyof BasePrototypeCache>(
+  key: T,
+): BasePrototypeCache[T] {
+  if (untaintedBasePrototype[key])
+    return untaintedBasePrototype[key] as BasePrototypeCache[T];
+
+  const candidate =
+    angularZoneUnpatchedAlternative(key) ||
+    (globalThis[key] as TypeofPrototypeOwner);
+  const defaultPrototype = candidate.prototype as BasePrototypeCache[T];
+
+  // use list of testable accessors to check if the prototype is tainted
+  const accessorNames =
+    key in testableAccessors ? testableAccessors[key] : undefined;
+  const isUntaintedAccessors = Boolean(
+    accessorNames &&
+      // @ts-expect-error 2345
+      accessorNames.every((accessor: keyof typeof defaultPrototype) =>
+        Boolean(
+          Object.getOwnPropertyDescriptor(defaultPrototype, accessor)
+            ?.get?.toString()
+            .includes('[native code]'),
+        ),
+      ),
+  );
+
+  const methodNames = key in testableMethods ? testableMethods[key] : undefined;
+  const isUntaintedMethods = Boolean(
+    methodNames &&
+      methodNames.every(
+        // @ts-expect-error 2345
+        (method: keyof typeof defaultPrototype) =>
+          typeof defaultPrototype[method] === 'function' &&
+          defaultPrototype[method]?.toString().includes('[native code]'),
+      ),
+  );
+
+  if (isUntaintedAccessors && isUntaintedMethods) {
+    untaintedBasePrototype[key] = candidate.prototype as BasePrototypeCache[T];
+    return candidate.prototype as BasePrototypeCache[T];
+  }
+
+  const iframeEl = document.createElement('iframe');
+  iframeEl.style.display = 'none';
+  let keepIframeAttached = false;
+  try {
+    document.body.appendChild(iframeEl);
+    const win = iframeEl.contentWindow;
+    if (!win) return candidate.prototype as BasePrototypeCache[T];
+
+    const untaintedObject = (win as any)[key]
+      .prototype as BasePrototypeCache[T];
+
+    if (!untaintedObject) return defaultPrototype;
+
+    // WebKit tears down an iframe's ScriptExecutionContext when it is detached
+    // from the DOM, and MutationObserver.deliver() silently drops callbacks when
+    // its scriptExecutionContext() is null (webkit.org/b/179224), so prototypes
+    // taken from a detached iframe stop working on WebKit.
+    // Adapted from upstream rrweb #1854, with one difference: the iframe stays
+    // attached for the lifetime of the page instead of being removed on recorder
+    // teardown. Observers are torn down per-document here (e.g. a same-origin
+    // iframe being removed), and the cached prototype must outlive any one of
+    // them; removing the shared iframe on the first teardown - or reusing the
+    // cache after a stop/restart cycle - would silently break the survivors.
+    if (isWebKit(navigator.userAgent)) {
+      // both the upstream default block class and the PostHog one, so the
+      // recorder never serializes this iframe whichever config is in use
+      iframeEl.classList.add('rr-block', 'ph-no-capture');
+      iframeEl.setAttribute('__rrwebUntaintedPrototype', key);
+      keepIframeAttached = true;
+    }
+
+    return (untaintedBasePrototype[key] = untaintedObject);
+  } catch {
+    return defaultPrototype;
+  } finally {
+    if (!keepIframeAttached && iframeEl.parentNode) {
+      document.body.removeChild(iframeEl);
+    }
+  }
+}
+
+// Group by prototype so every node access can reuse the property key instead
+// of allocating `${key}.${String(accessor)}` on the serialization hot path.
+// Both levels have null prototypes: neither prototype names nor accessor names
+// like `constructor` may resolve to inherited objects or functions.
+type AccessorCache = Record<
+  string,
+  (this: PrototypeOwner, ...args: unknown[]) => unknown
+>;
+const untaintedAccessorCache: Record<keyof BasePrototypeCache, AccessorCache> =
+  Object.create(null);
+untaintedAccessorCache.Node = Object.create(null);
+untaintedAccessorCache.ShadowRoot = Object.create(null);
+untaintedAccessorCache.MutationObserver = Object.create(null);
+untaintedAccessorCache.Element = Object.create(null);
+
+export function getUntaintedAccessor<
+  K extends keyof BasePrototypeCache,
+  T extends keyof BasePrototypeCache[K],
+>(
+  key: K,
+  instance: BasePrototypeCache[K],
+  accessor: T,
+): BasePrototypeCache[K][T] {
+  const cache: AccessorCache = untaintedAccessorCache[key];
+  const cached = cache[accessor as string];
+  if (cached) return cached.call(instance) as BasePrototypeCache[K][T];
+
+  const untaintedPrototype = getUntaintedPrototype(key);
+  const untaintedAccessor = Object.getOwnPropertyDescriptor(
+    untaintedPrototype,
+    accessor,
+  )?.get;
+
+  if (!untaintedAccessor) return instance[accessor];
+
+  cache[accessor as string] = untaintedAccessor;
+
+  return untaintedAccessor.call(instance) as BasePrototypeCache[K][T];
+}
+
+type BaseMethod<K extends keyof BasePrototypeCache> = (
+  this: BasePrototypeCache[K],
+  ...args: unknown[]
+) => unknown;
+
+// Grouped by prototype like the accessors, so the hot paths below can call a
+// cached method directly instead of building a `${key}.${method}` key and
+// binding a new function on every call.
+const untaintedMethodCache: Record<
+  keyof BasePrototypeCache,
+  Record<string, BaseMethod<any>>
+> = Object.create(null);
+untaintedMethodCache.Node = Object.create(null);
+untaintedMethodCache.ShadowRoot = Object.create(null);
+untaintedMethodCache.MutationObserver = Object.create(null);
+untaintedMethodCache.Element = Object.create(null);
+
+export function getUntaintedMethod<
+  K extends keyof BasePrototypeCache,
+  T extends keyof BasePrototypeCache[K],
+>(
+  key: K,
+  instance: BasePrototypeCache[K],
+  method: T,
+): BasePrototypeCache[K][T] {
+  const cache = untaintedMethodCache[key];
+  const cached = cache[method as string];
+  if (cached) return cached.bind(instance) as BasePrototypeCache[K][T];
+
+  const untaintedPrototype = getUntaintedPrototype(key);
+  const untaintedMethod = untaintedPrototype[method];
+
+  if (typeof untaintedMethod !== 'function') return instance[method];
+
+  cache[method as string] = untaintedMethod as BaseMethod<K>;
+
+  return untaintedMethod.bind(instance) as BasePrototypeCache[K][T];
+}
+
+// The accessors below read their cached getter directly (the same function
+// getUntaintedAccessor would call), and fall back to it until it is cached.
+const nodeAccessorCache = untaintedAccessorCache.Node;
+
+export function childNodes(n: Node): NodeListOf<Node> {
+  const get = nodeAccessorCache.childNodes;
+  if (get) return get.call(n) as NodeListOf<Node>;
+  return getUntaintedAccessor('Node', n, 'childNodes');
+}
+
+export function parentNode(n: Node): ParentNode | null {
+  const get = nodeAccessorCache.parentNode;
+  if (get) return get.call(n) as ParentNode | null;
+  return getUntaintedAccessor('Node', n, 'parentNode');
+}
+
+export function parentElement(n: Node): HTMLElement | null {
+  const get = nodeAccessorCache.parentElement;
+  if (get) return get.call(n) as HTMLElement | null;
+  return getUntaintedAccessor('Node', n, 'parentElement');
+}
+
+export function textContent(n: Node): string | null {
+  const get = nodeAccessorCache.textContent;
+  if (get) return get.call(n) as string | null;
+  return getUntaintedAccessor('Node', n, 'textContent');
+}
+
+/**
+ * Returns `node.previousSibling` through an untainted-prototype accessor so
+ * Angular Zone or any third-party monkey-patch of `Node.prototype` cannot
+ * silently redirect the mutation-buffer drain's sibling walk.
+ */
+export function previousSibling(n: Node): ChildNode | null {
+  const get = nodeAccessorCache.previousSibling;
+  if (get) return get.call(n) as ChildNode | null;
+  return getUntaintedAccessor('Node', n, 'previousSibling');
+}
+
+/**
+ * Returns `node.nextSibling` through an untainted-prototype accessor. See
+ * {@link previousSibling} for the rationale.
+ */
+export function nextSibling(n: Node): ChildNode | null {
+  const get = nodeAccessorCache.nextSibling;
+  if (get) return get.call(n) as ChildNode | null;
+  return getUntaintedAccessor('Node', n, 'nextSibling');
+}
+
+/**
+ * Returns `node.lastChild` through an untainted-prototype accessor. See
+ * {@link previousSibling} for the rationale.
+ */
+export function lastChild(n: Node): ChildNode | null {
+  const get = nodeAccessorCache.lastChild;
+  if (get) return get.call(n) as ChildNode | null;
+  return getUntaintedAccessor('Node', n, 'lastChild');
+}
+
+let isConnectedGetter: PropertyDescriptor['get'] | null | undefined;
+
+export function isConnected(n: Node): boolean | undefined {
+  if (isConnectedGetter === undefined) {
+    const getter = Object.getOwnPropertyDescriptor(
+      getUntaintedPrototype('Node'),
+      'isConnected',
+    )?.get;
+    // The prototype may have been cached before this optional getter was
+    // patched. Validate the function at first use, then cache only that function.
+    // Non-native or unavailable implementations retain the old containment path.
+    isConnectedGetter = getter?.toString().includes('[native code]')
+      ? getter
+      : null;
+  }
+  return isConnectedGetter?.call(n);
+}
+
+// Once the untainted method is cached, call it directly: same function, same
+// receiver and arguments as calling the bound copy getUntaintedMethod returns.
+export function contains(n: Node, other: Node): boolean {
+  const cached = untaintedMethodCache.Node.contains;
+  if (cached) return cached.call(n, other) as boolean;
+  return getUntaintedMethod('Node', n, 'contains')(other);
+}
+
+export function getRootNode(n: Node): Node {
+  const cached = untaintedMethodCache.Node.getRootNode;
+  if (cached) return cached.call(n) as Node;
+  return getUntaintedMethod('Node', n, 'getRootNode')();
+}
+
+export function host(n: ShadowRoot): Element | null {
+  if (!n || !('host' in n)) return null;
+  return getUntaintedAccessor('ShadowRoot', n, 'host');
+}
+
+export function styleSheets(n: ShadowRoot): StyleSheetList {
+  return n.styleSheets;
+}
+
+export function shadowRoot(n: Node): ShadowRoot | null {
+  if (!n || !('shadowRoot' in n)) return null;
+  return getUntaintedAccessor('Element', n as Element, 'shadowRoot');
+}
+
+export function querySelector(n: Element, selectors: string): Element | null {
+  return getUntaintedMethod('Element', n, 'querySelector')(selectors);
+}
+
+export function querySelectorAll(
+  n: Element,
+  selectors: string,
+): NodeListOf<Element> {
+  return getUntaintedMethod('Element', n, 'querySelectorAll')(selectors);
+}
+
+export function mutationObserverCtor(): (typeof MutationObserver)['prototype']['constructor'] {
+  return getUntaintedPrototype('MutationObserver').constructor;
+}
+
+// Each call to `patch` installs a "layer" in the wrapper chain. A wrapper calls
+// down through its layer's mutable `next` reference rather than closing over the
+// original directly, so that any layer can later be spliced out of the chain —
+// even when newer wrappers sit on top of it.
+//
+// Without this, restoring a patch only worked when it was still on top of the
+// chain (`source[name] === wrapped`). rrweb patches shared globals such as
+// `Element.prototype.attachShadow` (shadow-dom-manager) and the observers, and
+// multiple recorder instances or repeated start/stop cycles wrap the same global
+// more than once. Restores then routinely ran out of order and silently no-op'd.
+// Each leaked wrapper stayed in the call path, and repeated cycles grew the chain
+// without bound until a real call walked a chain deep enough to overflow the call
+// stack ("RangeError: Maximum call stack size exceeded").
+interface PatchLayer {
+  next: (...args: unknown[]) => unknown;
+}
+
+function isFunction(value: any): value is (...args: any[]) => any {
+  return typeof value === 'function';
+}
+
+// copy from https://github.com/getsentry/sentry-javascript/blob/b2109071975af8bf0316d3b5b38f519bdaf5dc15/packages/utils/src/object.ts
+export function patch(
+  source: { [key: string]: any },
+  name: string,
+  replacement: (...args: unknown[]) => unknown,
+): () => void {
+  try {
+    if (!(name in source)) {
+      return () => {
+        //
+      };
+    }
+
+    const original = source[name] as (...args: unknown[]) => unknown;
+
+    const layer: PatchLayer = {
+      next: original,
+    };
+
+    // The wrapper receives this stable delegate instead of `original`, so the
+    // function it actually calls can be re-pointed when a lower layer is removed.
+    const callNext = function (this: unknown, ...args: unknown[]) {
+      return layer.next.apply(this, args);
+    };
+
+    const wrapped = replacement(callNext);
+
+    // Make sure it's a function first, as we need to attach an empty prototype for `defineProperties` to work
+    // otherwise it'll throw "TypeError: Object.defineProperties called on non-object"
+    if (typeof wrapped === 'function') {
+      wrapped.prototype = wrapped.prototype || {};
+      Object.defineProperties(wrapped, {
+        __rrweb_original__: {
+          enumerable: false,
+          value: original,
+        },
+        __rrweb_layer__: {
+          enumerable: false,
+          value: layer,
+        },
+      });
+    }
+
+    source[name] = wrapped;
+
+    return () => {
+      // If we're still on top, hand back whatever we currently delegate to
+      // (lower layers may already have been removed, so this is not necessarily
+      // the `original` we captured at install time).
+      if (source[name] === wrapped) {
+        source[name] = layer.next;
+        return;
+      }
+
+      // Otherwise newer wrappers sit on top of us. Find the layer directly above us
+      // and re-point it past us, removing our wrapper from the call path without
+      // disturbing the newer wrappers. posthog-js ships its own copy of this
+      // function under `__posthog_layer__` and wraps the same console methods, so
+      // walk both markers — a walk that recognised only its own would give up here
+      // and leave our wrapper in the call path for the life of the page.
+      const layerOf = (method: unknown): PatchLayer | undefined =>
+        isFunction(method)
+          ?
+            (((method as any).__rrweb_layer__ ?? (method as any).__posthog_layer__) as PatchLayer | undefined)
+          : undefined;
+      let current: any = source[name];
+      let currentLayer = layerOf(current);
+      while (currentLayer) {
+        if (currentLayer.next === wrapped) {
+          currentLayer.next = layer.next;
+          return;
+        }
+        current = currentLayer.next;
+        currentLayer = layerOf(current);
+      }
+
+      // If we get here we're buried under a non-rrweb wrapper that closed over
+      // us directly, or we've already been removed / replaced wholesale. There's
+      // nothing safe to do, so leave the chain untouched.
+    };
+  } catch {
+    return () => {
+      //
+    };
+    // This can throw when multiple instrumentation layers try to wrap the same global object,
+    // such as XMLHttpRequest, and redefine the same non-configurable wrapper marker.
+  }
+}
+
+export default {
+  childNodes,
+  parentNode,
+  parentElement,
+  textContent,
+  previousSibling,
+  nextSibling,
+  lastChild,
+  isConnected,
+  contains,
+  getRootNode,
+  host,
+  styleSheets,
+  shadowRoot,
+  querySelector,
+  querySelectorAll,
+  mutationObserver: mutationObserverCtor,
+  patch,
+} as {
+  childNodes: typeof childNodes;
+  parentNode: typeof parentNode;
+  parentElement: typeof parentElement;
+  textContent: typeof textContent;
+  previousSibling: typeof previousSibling;
+  nextSibling: typeof nextSibling;
+  lastChild: typeof lastChild;
+  isConnected: typeof isConnected;
+  contains: typeof contains;
+  getRootNode: typeof getRootNode;
+  host: typeof host;
+  styleSheets: typeof styleSheets;
+  shadowRoot: typeof shadowRoot;
+  querySelector: typeof querySelector;
+  querySelectorAll: typeof querySelectorAll;
+  mutationObserver: typeof mutationObserverCtor;
+  patch: typeof patch;
+};

@@ -1,0 +1,1172 @@
+import {
+  serializeNodeWithId,
+  transformAttribute,
+  IGNORED_NODE,
+  ignoreAttribute,
+  isShadowRoot,
+  needMaskingText,
+  maskInputValue,
+  maskAttributeValue,
+  Mirror,
+  isNativeShadowDom,
+  getInputType,
+  toLowerCase,
+  nowMs,
+  getSuspensionGeneration,
+  recordMutationCost,
+  isStylesheetLink,
+} from '@posthog/rrweb-snapshot';
+import type { observerParam, MutationBufferParam } from '../types';
+import type {
+  mutationRecord,
+  attributeCursor,
+  removedNodeMutation,
+  addedNodeMutation,
+} from '@posthog/rrweb-types';
+import {
+  isBlocked,
+  isBlockedIncludingShadowHosts,
+  isAncestorRemoved,
+  isIgnored,
+  isSerialized,
+  hasShadowRoot,
+  isSerializedIframe,
+  isSerializedStylesheet,
+  inDom,
+  getShadowHost,
+  closestElementOfNode,
+} from '../utils';
+import dom from '@posthog/rrweb-utils';
+
+type SelectMutationObserver = (select: HTMLSelectElement) => void;
+const selectMutationObservers = new WeakMap<
+  Document,
+  Set<SelectMutationObserver>
+>();
+
+// Shadow roots have separate mutation buffers but share their document's input observer.
+export function registerSelectMutationObserver(
+  doc: Document,
+  observer: SelectMutationObserver,
+): () => void {
+  const observers =
+    selectMutationObservers.get(doc) || new Set<SelectMutationObserver>();
+  selectMutationObservers.set(doc, observers);
+  observers.add(observer);
+  return () => {
+    observers.delete(observer);
+    if (!observers.size && selectMutationObservers.get(doc) === observers) {
+      selectMutationObservers.delete(doc);
+    }
+  };
+}
+
+const moveKey = (id: number, parentId: number) => `${id}@${parentId}`;
+
+const XML_NAMESPACE = 'http://www.w3.org/XML/1998/namespace';
+const XMLNS_NAMESPACE = 'http://www.w3.org/2000/xmlns/';
+const XLINK_NAMESPACE = 'http://www.w3.org/1999/xlink';
+
+function getSerializedAttributeName(
+  target: Element,
+  localName: string,
+  namespace: string | null,
+): string {
+  if (!namespace) return localName;
+  const attribute = target.getAttributeNodeNS(namespace, localName);
+  if (attribute) return attribute.name;
+  // Removed attributes no longer expose their prefix, so retain standard ones.
+  if (namespace === XLINK_NAMESPACE) return `xlink:${localName}`;
+  if (namespace === XML_NAMESPACE) return `xml:${localName}`;
+  if (namespace === XMLNS_NAMESPACE) {
+    return localName === 'xmlns' ? localName : `xmlns:${localName}`;
+  }
+  const prefix = target.lookupPrefix(namespace);
+  return prefix ? `${prefix}:${localName}` : localName;
+}
+
+/**
+ * controls behaviour of a MutationObserver
+ */
+export default class MutationBuffer {
+  private frozen = false;
+  private locked = false;
+  private takePendingRecords: (() => mutationRecord[]) | undefined;
+
+  private texts = new Map<Node, string | null>();
+  private attributes = new Map<Node, attributeCursor>();
+  private generatedAttributes = new WeakMap<Node, Set<string>>();
+  private selectedAttributeChanges = new Set<HTMLSelectElement>();
+  private removes: removedNodeMutation[] = [];
+  // Repeated moves can queue the same root before any mirror cleanup runs.
+  // Keep first-seen order without traversing an identical root again at emit.
+  private mapRemoves = new Set<Node>();
+
+  private movedMap: Record<string, true> = {};
+
+  /**
+   * the browser MutationObserver emits multiple mutations after
+   * a delay for performance reasons, making tracing added nodes hard
+   * in our `processMutations` callback function.
+   * For example, if we append an element el_1 into body, and then append
+   * another element el_2 into el_1, these two mutations may be passed to the
+   * callback function together when the two operations were done.
+   * Generally we need to trace child nodes of newly added nodes, but in this
+   * case if we count el_2 as el_1's child node in the first mutation record,
+   * then we will count el_2 again in the second mutation record which was
+   * duplicated.
+   * To avoid of duplicate counting added nodes, we use a Set to store
+   * added nodes and its child nodes during iterate mutation records. Then
+   * collect added nodes from the Set which have no duplicate copy. But
+   * this also causes newly added nodes will not be serialized with id ASAP,
+   * which means all the id related calculation should be lazy too.
+   */
+  private addedSet = new Set<Node>();
+  private movedSet = new Set<Node>();
+  private droppedSet = new Set<Node>();
+  private removesSubTreeCache = new Set<Node>();
+  // Removed nodes whose subtrees have not been added to removesSubTreeCache
+  // yet. The cache only answers "is this node's parent inside a removed
+  // subtree?" during this buffer's next emission, and until then the DOM is
+  // the one the removal was processed against (processMutations ends with
+  // emit()). So instead of walking every removed subtree up front, the drain
+  // checks the parent's ancestors against these roots. If emission is
+  // deferred (frozen, locked, or it threw), the DOM may change before the
+  // next one, so the subtrees are walked then, as before.
+  private removedRoots = new Set<Node>();
+
+  private mutationCb: observerParam['mutationCb'];
+  private blockClass: observerParam['blockClass'];
+  private blockSelector: observerParam['blockSelector'];
+  private maskTextClass: observerParam['maskTextClass'];
+  private maskTextSelector: observerParam['maskTextSelector'];
+  private inlineStylesheet: observerParam['inlineStylesheet'];
+  private maskInputOptions: observerParam['maskInputOptions'];
+  private maskTextFn: observerParam['maskTextFn'];
+  private maskInputFn: observerParam['maskInputFn'];
+  private maskAllElementAttributes: observerParam['maskAllElementAttributes'];
+  private maskAttributeFn: observerParam['maskAttributeFn'];
+  private keepIframeSrcFn: observerParam['keepIframeSrcFn'];
+  private recordCanvas: observerParam['recordCanvas'];
+  private canvasMaskingConfigured: observerParam['canvasMaskingConfigured'];
+  private inlineImages: observerParam['inlineImages'];
+  private slimDOMOptions: observerParam['slimDOMOptions'];
+  private dataURLOptions: observerParam['dataURLOptions'];
+  private doc: observerParam['doc'];
+  private mirror: observerParam['mirror'];
+  private iframeManager: observerParam['iframeManager'];
+  private stylesheetManager: observerParam['stylesheetManager'];
+  private shadowDomManager: observerParam['shadowDomManager'];
+  private canvasManager: observerParam['canvasManager'];
+  private processedNodeManager: observerParam['processedNodeManager'];
+  private unattachedDoc: HTMLDocument;
+  private canvasManagerReleased = false;
+
+  public init(options: MutationBufferParam): void {
+    (
+      [
+        'mutationCb',
+        'blockClass',
+        'blockSelector',
+        'maskTextClass',
+        'maskTextSelector',
+        'inlineStylesheet',
+        'maskInputOptions',
+        'maskTextFn',
+        'maskInputFn',
+        'maskAllElementAttributes',
+        'maskAttributeFn',
+        'keepIframeSrcFn',
+        'recordCanvas',
+        'canvasMaskingConfigured',
+        'inlineImages',
+        'slimDOMOptions',
+        'dataURLOptions',
+        'doc',
+        'mirror',
+        'iframeManager',
+        'stylesheetManager',
+        'shadowDomManager',
+        'canvasManager',
+        'processedNodeManager',
+      ] as const
+    ).forEach((key) => {
+      // just a type trick, the runtime result is correct
+      this[key] = options[key] as never;
+    });
+    // Balanced by releaseCanvasManager() in reset().
+    this.canvasManager.acquire();
+  }
+
+  public freeze(): void {
+    this.frozen = true;
+    this.canvasManager.freeze();
+  }
+
+  public unfreeze(): void {
+    this.frozen = false;
+    this.canvasManager.unfreeze();
+    this.emit();
+  }
+
+  public isFrozen(): boolean {
+    return this.frozen;
+  }
+
+  public lock(): void {
+    this.locked = true;
+    this.canvasManager.lock();
+  }
+
+  public unlock(): void {
+    this.locked = false;
+    this.canvasManager.unlock();
+    this.emit();
+  }
+
+  public readPendingRecordsFrom(observer: MutationObserver): void {
+    this.takePendingRecords = () => observer.takeRecords();
+  }
+
+  public reset(): void {
+    // Don't reset the shared shadowDomManager here — that would disconnect every shadow-root observer on the page when any single buffer is torn down.
+    this.releaseCanvasManager();
+  }
+
+  // Idempotent so teardown can run twice (iframe pagehide + stop); shadow restore handlers call this directly, not reset(), per the recursion-guard unit test.
+  public releaseCanvasManager(): void {
+    if (this.canvasManagerReleased) {
+      return;
+    }
+    this.canvasManagerReleased = true;
+    this.canvasManager.reset();
+    // Don't null `this.doc` here — a MutationObserver callback queued before
+    // the observer was disconnected can still drain through `emit`, which
+    // passes `this.doc` to `serializeNodeWithId`. Splicing the buffer out of
+    // `mutationBuffers[]` + removing the cleanup closure from `handlers[]`
+    // releases the only strong refs to the buffer; GC handles the rest.
+  }
+
+  public bufferDoc(): Document {
+    return this.doc;
+  }
+
+  public destroy(): void {
+    this.selectedAttributeChanges.clear();
+    for (const node of this.mapRemoves) {
+      // Consume before traversal, as shift() did, including when it throws.
+      this.mapRemoves.delete(node);
+      this.mirror.removeNodeFromMap(node);
+    }
+  }
+
+  public processMutations = (mutations: mutationRecord[]): void => {
+    mutations.forEach(this.processMutation); // adds mutations to the buffer
+    this.emit(); // clears buffer if not locked/frozen
+  };
+
+  public emit = (): void => {
+    if (this.frozen || this.locked) {
+      this.walkRemovedRoots();
+      return;
+    }
+
+    // Processing a burst serializes every added subtree inline, which on churn-heavy
+    // pages (virtualized lists, calendars) is where the recorder's main-thread time
+    // goes. Measure it so that cost is visible without a Chrome trace.
+    const startedAt = nowMs();
+    const startGeneration = getSuspensionGeneration();
+    try {
+      this.processBufferedMutations();
+    } finally {
+      // Normally consumed by processBufferedMutations; left over only if it threw.
+      this.walkRemovedRoots();
+      recordMutationCost(nowMs() - startedAt, startGeneration);
+    }
+  };
+
+  // What processRemoves did when the removal was processed: add every node of
+  // each removed subtree (as dom.childNodes walks it) to removesSubTreeCache.
+  private walkRemovedRoots(): void {
+    if (!this.removedRoots.size) return;
+    for (const root of this.removedRoots) {
+      processRemoves(root, this.removesSubTreeCache);
+    }
+    this.removedRoots.clear();
+  }
+
+  // Whether n's parent is in removesSubTreeCache, or in the subtree of a
+  // removed root not walked yet: in the DOM this emission runs against, the
+  // nodes dom.childNodes reaches from a root are exactly the nodes whose
+  // dom.parentNode chain reaches it. `memo` caches the ancestor lookups for
+  // one emission.
+  private isParentRemoved(n: Node, memo: Map<Node, boolean>): boolean {
+    if (this.removesSubTreeCache.size === 0 && this.removedRoots.size === 0) {
+      return false;
+    }
+    const parent = dom.parentNode(n);
+    if (!parent) return false;
+    if (this.removesSubTreeCache.has(parent)) return true;
+    if (this.removedRoots.size === 0) return false;
+    const chain: Node[] = [];
+    let found = false;
+    let node: Node | null = parent;
+    while (node) {
+      const known = memo.get(node);
+      if (known !== undefined) {
+        found = known;
+        break;
+      }
+      chain.push(node);
+      if (this.removedRoots.has(node)) {
+        found = true;
+        break;
+      }
+      node = dom.parentNode(node);
+    }
+    for (const c of chain) memo.set(c, found);
+    return found;
+  }
+
+  // Queued nodes can become blocked before emission. Check the current tree,
+  // including each shadow host: closest()/parentElement do not cross that boundary.
+  private isBlockedAtEmission(node: Node | null): boolean {
+    return isBlockedIncludingShadowHosts(
+      node,
+      this.blockClass,
+      this.blockSelector,
+    );
+  }
+
+  private processBufferedMutations = () => {
+    // delay any modification of the mirror until this function
+    // so that the mirror for takeFullSnapshot doesn't get mutated while it's event is being processed
+
+    const adds: addedNodeMutation[] = [];
+    const addedIds = new Set<number>();
+
+    const getNextId = (n: Node): number | null => {
+      let ns: Node | null = n;
+      let nextId: number | null = IGNORED_NODE; // slimDOM: ignored
+      while (nextId === IGNORED_NODE) {
+        ns = ns && dom.nextSibling(ns);
+        nextId = ns && this.mirror.getId(ns);
+      }
+      return nextId;
+    };
+    // Reuse configuration and callbacks within this emission, not DOM values.
+    // serializeNodeWithId does not mutate the options; needsMask stays unset so
+    // each node still checks its own masking context.
+    let serializationOptions:
+      | Parameters<typeof serializeNodeWithId>[1]
+      | undefined;
+    // Returns true when the node has been handled for this emission (either
+    // serialized successfully or deliberately skipped — e.g. blocked / not in
+    // DOM). Returns false when parentId or nextId are still unresolved, so
+    // the topological-order driver below can mark its subtree as dropped
+    // for this emission (the pending set is cleared at the end of emit()).
+    const pushAdd = (n: Node): boolean => {
+      const parent = dom.parentNode(n);
+      if (!parent || !inDom(n) || (parent as Element).tagName === 'TEXTAREA') {
+        return true;
+      }
+      // A blocked node itself still needs a placeholder, but its descendants
+      // must not be serialized from stale added/moved entries.
+      if (this.isBlockedAtEmission(parent)) return true;
+      const parentId = isShadowRoot(parent)
+        ? this.mirror.getId(getShadowHost(n))
+        : this.mirror.getId(parent);
+      const nextId = getNextId(n);
+      if (parentId === -1 || nextId === -1) {
+        return false;
+      }
+      serializationOptions ??= this.buildSerializationOptions();
+      const sn = serializeNodeWithId(n, serializationOptions);
+      if (sn) {
+        adds.push({
+          parentId,
+          nextId,
+          node: sn,
+        });
+        addedIds.add(sn.id);
+      }
+      return true;
+    };
+
+    // Drain mapRemoves before pushAdd so the mirror only holds nodes that
+    // are still live. Reparent detection in record/index.ts depends on this
+    // order — it resolves an `add`'s fresh id back to an element via
+    // `mirror.getNode` and matches it against the iframe behind the removed
+    // id. Reorder this and iframe moves will look like remove+add to that
+    // path, tearing down observers on a still-live iframe.
+    for (const node of this.mapRemoves) {
+      this.mapRemoves.delete(node);
+      this.mirror.removeNodeFromMap(node);
+    }
+
+    // Fold movedSet into addedSet so a single topological-order drain
+    // handles both.
+    const removedMemo = new Map<Node, boolean>();
+    for (const n of this.movedSet) {
+      if (
+        this.isParentRemoved(n, removedMemo) &&
+        !this.movedSet.has(dom.parentNode(n)!)
+      ) {
+        continue;
+      }
+      this.addedSet.add(n);
+    }
+
+    // Mark droppable addedSet entries so the drain below skips them without
+    // re-walking the DOM for parentRemoved/droppedSet membership per node.
+    for (const n of Array.from(this.addedSet)) {
+      const inDroppedTree = isAncestorInSet(this.droppedSet, n);
+      const parentWasRemoved = this.isParentRemoved(n, removedMemo);
+      // A node that is itself in movedSet is never dropped, even when its
+      // parent chain was removed in the same batch.
+      const movedExempt =
+        this.movedSet.has(n) || isAncestorInSet(this.movedSet, n);
+      if ((inDroppedTree || parentWasRemoved) && !movedExempt) {
+        this.droppedSet.add(n);
+        this.addedSet.delete(n);
+      }
+    }
+
+    // Topological-order drain of this.addedSet. Previous siblings and
+    // nextSibling walks reach a node whose parentId is already in the
+    // mirror before touching its children, so pushAdd never has to drop
+    // a node that would otherwise need a rescan. Nodes whose parent
+    // cannot be resolved for this emission are recorded in missingParents
+    // so their descendants early-out via the same set.
+    const missingParents = new Set<Node>();
+    let n: Node | null = null;
+    const iter = this.addedSet.values();
+    let curr = iter.next();
+    while (this.addedSet.size) {
+      // Reuse the current row — n's previous sibling is next to serialize.
+      // Probe past IGNORED_NODE siblings (slimDOM-filtered tags like <script>
+      // or comments interleaved with new siblings) so a mixed row doesn't
+      // force the drain back to walk-up/descend per node.
+      let backProbe: Node | null = null;
+      if (n !== null) {
+        backProbe = dom.previousSibling(n);
+        while (backProbe && this.mirror.getId(backProbe) === IGNORED_NODE) {
+          backProbe = dom.previousSibling(backProbe);
+        }
+      }
+      if (backProbe && this.addedSet.has(backProbe)) {
+        n = backProbe;
+      } else {
+        if (!this.addedSet.has(curr.value as Node)) {
+          // iter protects us from re-walking tombstones left in the Set after
+          // delete-during-iteration; take the next live entry
+          curr = iter.next();
+        }
+        n = curr.value as Node;
+
+        // Walk up to the top of this contiguous added subtree so a parent is
+        // never serialized before its own ancestor in this.addedSet.
+        //
+        // Shadow DOM: when the DOM parent is a ShadowRoot we switch to the
+        // shadow host for the ancestor check. Serializer-side `pushAdd`
+        // translates ShadowRoot → host via `isShadowRoot(parent) ? getId(host)
+        // : getId(parent)`, so if the host is also in addedSet we must
+        // serialize the host first — otherwise its shadow children land here
+        // with an un-mirrored parent and get dropped.
+        while (true) {
+          const parentNode = dom.parentNode(n);
+          const logicalParent =
+            parentNode && parentNode.nodeType === Node.DOCUMENT_FRAGMENT_NODE
+              ? (dom.host(parentNode as ShadowRoot) as Node | null)
+              : (parentNode as Node | null);
+          if (logicalParent && this.addedSet.has(logicalParent)) {
+            n = logicalParent;
+            continue;
+          }
+          break;
+        }
+
+        // Then descend to the row's last added sibling (jump via lastChild
+        // when possible so the inner loop isn't O(nextSibling walk) per row).
+        const parentNode = dom.parentNode(n);
+        if (parentNode && this.addedSet.has(dom.lastChild(parentNode) as Node)) {
+          n = dom.lastChild(parentNode) as Node;
+        } else if (parentNode) {
+          // Walk forward through siblings, probing past IGNORED_NODE siblings
+          // so a new node inserted before an ignored node (e.g. a <script>
+          // rrweb filtered out of the mirror) can still be reached from an
+          // earlier new sibling. Matches getNextId's loop, which skips past
+          // IGNORED_NODE siblings when computing nextId for the emitted add.
+          while (true) {
+            let probe: Node | null = dom.nextSibling(n);
+            while (probe && this.mirror.getId(probe) === IGNORED_NODE) {
+              probe = dom.nextSibling(probe);
+            }
+            if (probe && this.addedSet.has(probe)) {
+              n = probe;
+              continue;
+            }
+            break;
+          }
+        }
+      }
+
+      this.addedSet.delete(n);
+
+      // A missing parent propagates: once we fail to resolve a parent for
+      // emission, every descendant we encounter in this drain gets the same
+      // treatment without re-asking the mirror. For shadow children the
+      // "logical parent" for propagation is the shadow host, matching how
+      // pushAdd resolves parentId.
+      const parentNode = dom.parentNode(n);
+      const logicalParent =
+        parentNode && parentNode.nodeType === Node.DOCUMENT_FRAGMENT_NODE
+          ? (dom.host(parentNode as ShadowRoot) as Node | null)
+          : (parentNode as Node | null);
+      if (logicalParent && missingParents.has(logicalParent)) {
+        missingParents.add(n);
+        continue;
+      }
+
+      // pushAdd handles isBlockedAtEmission, shadow-host reparenting,
+      // serializationOptions caching, canvasMaskingConfigured, and
+      // iframe/stylesheet attach callbacks, and reports back whether the
+      // node was serialized or dropped.
+      const handled = pushAdd(n);
+      if (!handled) {
+        missingParents.add(n);
+      }
+    }
+
+    // One summary line per emit() rather than one warn per dropped node.
+    // Per-node warnings cascade through subtrees (a dropped 13k-node table
+    // mount would produce 13k lines, which the rrweb console-record plugin
+    // then persists into the replay). The count is enough signal; the
+    // bodies are omitted so no masked content leaks into console-record
+    // events via the plugin's `instanceof Node` branch.
+    if (missingParents.size > 0) {
+      console.warn(
+        `[rrweb] dropped ${missingParents.size} node(s) with unresolved parent at emit`,
+      );
+    }
+
+    const payload = {
+      texts: Array.from(this.texts, ([node, value]) => ({ node, value }))
+        .filter((text) => !this.isBlockedAtEmission(text.node))
+        .map((text) => {
+          const n = text.node;
+          const parent = dom.parentNode(n);
+          if (parent && (parent as Element).tagName === 'TEXTAREA') {
+            // the node is being ignored as it isn't in the mirror, so shift mutation to attributes on parent textarea
+            this.genTextAreaValueMutation(parent as HTMLTextAreaElement);
+          }
+          return {
+            id: this.mirror.getId(n),
+            value: text.value,
+          };
+        })
+        // no need to include them on added elements, as they have just been serialized with up to date attribubtes
+        .filter((text) => !addedIds.has(text.id))
+        // text mutation's id was not in the mirror map means the target node has been removed
+        .filter((text) => this.mirror.has(text.id)),
+      attributes: Array.from(this.attributes.values())
+        .filter((attribute) => !this.isBlockedAtEmission(attribute.node))
+        .map((attribute) => {
+          const { attributes } = attribute;
+          if (
+            !this.maskAllElementAttributes &&
+            !this.maskAttributeFn &&
+            typeof attributes.style === 'string'
+          ) {
+            const diffAsStr = JSON.stringify(attribute.styleDiff);
+            const unchangedAsStr = JSON.stringify(attribute._unchangedStyles);
+            // check if the style diff is actually shorter than the regular string based mutation
+            // (which was the whole point of #464 'compact style mutation').
+            if (diffAsStr.length < attributes.style.length) {
+              // also: CSSOM fails badly when var() is present on shorthand properties, so only proceed with
+              // the compact style mutation if these have all been accounted for
+              if (
+                (diffAsStr + unchangedAsStr).split('var(').length ===
+                attributes.style.split('var(').length
+              ) {
+                attributes.style = attribute.styleDiff;
+              }
+            }
+          }
+          // Mask after synthesis and style compaction decisions. Compact style
+          // objects are disabled whenever string attribute masking is configured.
+          if (this.maskAllElementAttributes || this.maskAttributeFn) {
+            for (const [name, value] of Object.entries(attributes)) {
+              if (typeof value === 'string' || value === null) {
+                attributes[name] = maskAttributeValue({
+                  element: attribute.node as Element,
+                  name,
+                  value,
+                  maskAllElementAttributes: this.maskAllElementAttributes,
+                  maskAttributeFn: this.maskAttributeFn,
+                  isGenerated: this.generatedAttributes
+                    .get(attribute.node)
+                    ?.has(name),
+                });
+              }
+            }
+          }
+          return {
+            id: this.mirror.getId(attribute.node),
+            attributes: attributes,
+          };
+        })
+        // no need to include them on added elements, as they have just been serialized with up to date attribubtes
+        .filter((attribute) => !addedIds.has(attribute.id))
+        // attribute mutation's id was not in the mirror map means the target node has been removed
+        .filter((attribute) => this.mirror.has(attribute.id)),
+      removes: this.removes,
+      adds,
+    };
+
+    const stylesheetLinksWithNewSource: HTMLLinkElement[] = [];
+    if (this.inlineStylesheet) {
+      for (const { id, attributes } of payload.attributes) {
+        if (!('rel' in attributes) && !('href' in attributes)) continue;
+        const node = this.mirror.getNode(id) as HTMLLinkElement | null;
+        if (
+          node &&
+          toLowerCase(node.nodeName) === 'link' &&
+          isStylesheetLink(node.getAttribute('rel')) &&
+          node.getAttribute('href') &&
+          !node.disabled
+        ) {
+          stylesheetLinksWithNewSource.push(node);
+        }
+      }
+    }
+
+    // Reset before the empty-payload return: these collections strongly
+    // reference DOM nodes, and payload holds its own references.
+    this.texts.clear();
+    this.attributes.clear();
+    this.generatedAttributes = new WeakMap<Node, Set<string>>();
+    this.removes = [];
+    this.addedSet = new Set<Node>();
+    this.movedSet = new Set<Node>();
+    this.droppedSet = new Set<Node>();
+    this.removesSubTreeCache = new Set<Node>();
+    this.removedRoots = new Set<Node>();
+    this.movedMap = {};
+
+    const selectedAttributeChanges = this.selectedAttributeChanges;
+    this.selectedAttributeChanges = new Set();
+    if (
+      payload.texts.length ||
+      payload.attributes.length ||
+      payload.removes.length ||
+      payload.adds.length
+    ) {
+      this.mutationCb(payload);
+    }
+    for (const select of selectedAttributeChanges) {
+      selectMutationObservers
+        .get(select.ownerDocument)
+        ?.forEach((observer) => observer(select));
+    }
+
+    // after the payload, so replay applies the new rel/href before the CSS that replaces the link
+    for (const link of stylesheetLinksWithNewSource) {
+      this.stylesheetManager.inlineLinkStylesheetAfterChange(link, {
+        currentId: () => this.mirror.getId(link),
+        reserializeWithoutCss: () => ({
+          previous: this.mirror.getMeta(link),
+          current: serializeNodeWithId(link, {
+            ...this.buildSerializationOptions(),
+            inlineStylesheet: false,
+          }),
+        }),
+        lastSerialization: () => this.mirror.getMeta(link),
+        readdAsMove: () => this.recordReinsertion(link),
+      });
+    }
+  };
+
+  // Goes through the same path as a node taken out and put back in place, so a
+  // frozen or locked buffer holds it with the mutations recorded before it.
+  private recordReinsertion(node: Node): void {
+    const parent = dom.parentNode(node);
+    if (!parent) return;
+    // the add needs the node's next sibling recorded, and the page can insert
+    // it in the same task, before the observer delivers its record
+    this.takePendingRecords?.().forEach(this.processMutation);
+    const childListRecord = (removedNodes: Node[], addedNodes: Node[]) =>
+      ({
+        type: 'childList',
+        target: parent,
+        removedNodes,
+        addedNodes,
+        oldValue: null,
+        attributeName: null,
+      }) as unknown as mutationRecord;
+    this.processMutation(childListRecord([node], []));
+    this.processMutation(childListRecord([], [node]));
+    this.emit();
+  }
+
+  private buildSerializationOptions(): Parameters<
+    typeof serializeNodeWithId
+  >[1] {
+    return {
+      doc: this.doc,
+      mirror: this.mirror,
+      blockClass: this.blockClass,
+      blockSelector: this.blockSelector,
+      maskTextClass: this.maskTextClass,
+      maskTextSelector: this.maskTextSelector,
+      skipChild: true,
+      newlyAddedElement: true,
+      inlineStylesheet: this.inlineStylesheet,
+      maskInputOptions: this.maskInputOptions,
+      maskTextFn: this.maskTextFn,
+      maskInputFn: this.maskInputFn,
+      maskAllElementAttributes: this.maskAllElementAttributes,
+      maskAttributeFn: this.maskAttributeFn,
+      slimDOMOptions: this.slimDOMOptions,
+      dataURLOptions: this.dataURLOptions,
+      recordCanvas: this.recordCanvas,
+      canvasMaskingConfigured: this.canvasMaskingConfigured,
+      inlineImages: this.inlineImages,
+      onSerialize: (currentN) => {
+        if (isSerializedIframe(currentN, this.mirror)) {
+          this.iframeManager.addIframe(currentN as HTMLIFrameElement);
+        }
+        if (isSerializedStylesheet(currentN, this.mirror)) {
+          this.stylesheetManager.trackLinkElement(
+            currentN as HTMLLinkElement,
+          );
+        }
+        if (
+          hasShadowRoot(currentN) &&
+          !isBlocked(
+            currentN,
+            this.blockClass,
+            this.blockSelector,
+            true,
+          )
+        ) {
+          this.shadowDomManager.addShadowRoot(
+            dom.shadowRoot(currentN)!,
+            this.doc,
+          );
+        }
+      },
+      onIframeLoad: (iframe, childSn) => {
+        this.iframeManager.attachIframe(iframe, childSn);
+        this.shadowDomManager.observeAttachShadow(iframe);
+      },
+      onIframeListenerRegistered: (
+        iframe: HTMLIFrameElement,
+        disposer: () => void,
+      ) => {
+        this.iframeManager.registerLoadListenerDisposer(iframe, disposer);
+      },
+      onStylesheetLoad: (link, childSn, previousSn) => {
+        this.stylesheetManager.attachLinkElement(link, childSn, previousSn);
+      },
+    };
+  }
+
+  public bufferBelongsToIframe = (iframeEl: HTMLIFrameElement): boolean => {
+    return this.doc === iframeEl.contentDocument;
+  };
+
+  private genTextAreaValueMutation = (textarea: HTMLTextAreaElement) => {
+    let item = this.attributes.get(textarea);
+    if (!item) {
+      item = {
+        node: textarea,
+        attributes: {},
+        styleDiff: {},
+        _unchangedStyles: {},
+      };
+      this.attributes.set(textarea, item);
+    }
+    const value = Array.from(
+      dom.childNodes(textarea),
+      (cn) => dom.textContent(cn) || '',
+    ).join('');
+    item.attributes.value = maskInputValue({
+      element: textarea,
+      maskInputOptions: this.maskInputOptions,
+      tagName: textarea.tagName,
+      type: getInputType(textarea),
+      value,
+      maskInputFn: this.maskInputFn,
+    });
+  };
+
+  private processMutation = (m: mutationRecord) => {
+    if (isIgnored(m.target, this.mirror, this.slimDOMOptions)) {
+      return;
+    }
+    switch (m.type) {
+      case 'characterData': {
+        const value = dom.textContent(m.target);
+
+        if (
+          !isBlocked(m.target, this.blockClass, this.blockSelector, false) &&
+          value !== m.oldValue
+        ) {
+          this.texts.set(
+            m.target,
+            needMaskingText(
+              m.target,
+              this.maskTextClass,
+              this.maskTextSelector,
+              true, // checkAncestors
+            ) && value
+              ? this.maskTextFn
+                ? this.maskTextFn(value, closestElementOfNode(m.target))
+                : value.replace(/[\S]/g, '*')
+              : value,
+          );
+        }
+        break;
+      }
+      case 'attributes': {
+        const target = m.target as Element;
+        const tagNameLower = toLowerCase(target.tagName);
+        const sourceAttributeName = m.attributeName as string;
+        const attributeNamespace = m.attributeNamespace ?? null;
+        let attributeName = getSerializedAttributeName(
+          target,
+          sourceAttributeName,
+          attributeNamespace,
+        );
+        let value = attributeNamespace
+          ? target.getAttributeNS(attributeNamespace, sourceAttributeName)
+          : (m.target as Element).getAttribute(sourceAttributeName);
+
+        if (
+          tagNameLower === 'option' &&
+          attributeName === 'selected' &&
+          this.maskInputOptions.select
+        ) {
+          let parent = dom.parentElement(target);
+          if (parent?.tagName === 'OPTGROUP')
+            parent = dom.parentElement(parent);
+          // A scalar loses choices; custom multiselects keep their legacy attributes.
+          const customMultiselect =
+            this.maskInputFn &&
+            parent?.tagName === 'SELECT' &&
+            (parent as HTMLSelectElement).multiple;
+          if (!customMultiselect) {
+            if (value !== m.oldValue && parent?.tagName === 'SELECT') {
+              this.selectedAttributeChanges.add(parent as HTMLSelectElement);
+            }
+            return;
+          }
+        }
+
+        if (attributeName === 'value') {
+          const htmlTarget = target as HTMLElement;
+          const type = getInputType(htmlTarget);
+
+          value = maskInputValue({
+            element: htmlTarget,
+            maskInputOptions: this.maskInputOptions,
+            tagName: target.tagName,
+            type,
+            value,
+            maskInputFn: this.maskInputFn,
+          });
+        }
+        if (
+          isBlocked(m.target, this.blockClass, this.blockSelector, false) ||
+          value === m.oldValue
+        ) {
+          return;
+        }
+
+        let item = this.attributes.get(m.target);
+        const isIframeSrc =
+          tagNameLower === 'iframe' && attributeName === 'src';
+        if (
+          isIframeSrc &&
+          !this.keepIframeSrcFn(value as string) &&
+          (target as HTMLIFrameElement).contentDocument
+        ) {
+          return;
+        }
+
+        // Keep this property on inputs that used to be password inputs
+        // This is used to ensure we do not unmask value when using e.g. a "Show password" type button
+        if (
+          attributeName === 'type' &&
+          tagNameLower === 'input' &&
+          (m.oldValue || '').toLowerCase() === 'password'
+        ) {
+          target.setAttribute('data-rr-is-password', 'true');
+        }
+
+        if (!ignoreAttribute(tagNameLower, attributeName, value)) {
+          if (!item) {
+            item = {
+              node: m.target,
+              attributes: {},
+              styleDiff: {},
+              _unchangedStyles: {},
+            };
+            this.attributes.set(m.target, item);
+          }
+          // Transform with the source name before representing an inaccessible
+          // iframe's source under the final rr_src key.
+          const transformedValue = transformAttribute(
+            this.doc,
+            tagNameLower,
+            toLowerCase(attributeName),
+            value,
+            target,
+            this.dataURLOptions,
+          );
+          if (isIframeSrc && !this.keepIframeSrcFn(value as string)) {
+            attributeName = 'rr_src';
+          }
+          // overwrite attribute if the mutation was triggered in same time
+          item.attributes[attributeName] = transformedValue;
+          this.generatedAttributes.get(m.target)?.delete(attributeName);
+          if (attributeName === 'style') {
+            if (!this.unattachedDoc) {
+              try {
+                // avoid upsetting original document from a Content Security point of view
+                this.unattachedDoc =
+                  document.implementation.createHTMLDocument();
+              } catch (e) {
+                // fallback to more direct method
+                this.unattachedDoc = this.doc;
+              }
+            }
+            const old = this.unattachedDoc.createElement('span');
+            const targetStyle = (target as HTMLElement | SVGElement).style;
+            if (m.oldValue) {
+              old.style.cssText = m.oldValue;
+            }
+            for (const pname of Array.from(targetStyle)) {
+              const newValue = targetStyle.getPropertyValue(pname);
+              const newPriority = targetStyle.getPropertyPriority(pname);
+              if (
+                newValue !== old.style.getPropertyValue(pname) ||
+                newPriority !== old.style.getPropertyPriority(pname)
+              ) {
+                if (newPriority === '') {
+                  item.styleDiff[pname] = newValue;
+                } else {
+                  item.styleDiff[pname] = [newValue, newPriority];
+                }
+              } else {
+                // for checking
+                item._unchangedStyles[pname] = [newValue, newPriority];
+              }
+            }
+            for (const pname of Array.from(old.style)) {
+              if (targetStyle.getPropertyValue(pname) === '') {
+                // "if not set, returns the empty string"
+                item.styleDiff[pname] = false; // delete
+              }
+            }
+          } else if (attributeName === 'open' && tagNameLower === 'dialog') {
+            if (target.matches('dialog:modal')) {
+              item.attributes['rr_open_mode'] = 'modal';
+            } else {
+              item.attributes['rr_open_mode'] = 'non-modal';
+            }
+            let generated = this.generatedAttributes.get(m.target);
+            if (!generated) {
+              generated = new Set();
+              this.generatedAttributes.set(m.target, generated);
+            }
+            generated.add('rr_open_mode');
+          }
+        }
+        break;
+      }
+      case 'childList': {
+        // Runs before the blocked-parent return so hosts removed from a
+        // blocked container are released too. Still attached by the time the
+        // batch is processed means moved, not removed.
+        m.removedNodes.forEach((n) => {
+          if (!inDom(n)) {
+            this.shadowDomManager.removeShadowRootsIn(n);
+          }
+        });
+
+        /**
+         * Parent is blocked, ignore all child mutations
+         */
+        if (isBlocked(m.target, this.blockClass, this.blockSelector, true))
+          return;
+
+        if ((m.target as Element).tagName === 'TEXTAREA') {
+          // children would be ignored in genAdds as they aren't in the mirror
+          this.genTextAreaValueMutation(m.target as HTMLTextAreaElement);
+          return; // any removedNodes won't have been in mirror either
+        }
+
+        m.addedNodes.forEach((n) => this.genAdds(n, m.target));
+        m.removedNodes.forEach((n) => {
+          const nodeId = this.mirror.getId(n);
+          const parentId = isShadowRoot(m.target)
+            ? this.mirror.getId(dom.host(m.target))
+            : this.mirror.getId(m.target);
+          if (
+            isBlocked(m.target, this.blockClass, this.blockSelector, false) ||
+            isIgnored(n, this.mirror, this.slimDOMOptions) ||
+            !isSerialized(n, this.mirror)
+          ) {
+            return;
+          }
+          // removed node has not been serialized yet, just remove it from the Set
+          if (this.addedSet.has(n)) {
+            deepDelete(this.addedSet, n);
+            this.droppedSet.add(n);
+          } else if (this.addedSet.has(m.target) && nodeId === -1) {
+            /**
+             * If target was newly added and removed child node was
+             * not serialized, it means the child node has been removed
+             * before callback fired, so we can ignore it because
+             * newly added node will be serialized without child nodes.
+             * TODO: verify this
+             */
+          } else if (isAncestorRemoved(m.target, this.mirror)) {
+            /**
+             * If parent id was not in the mirror map any more, it
+             * means the parent node has already been removed. So
+             * the node is also removed which we do not need to track
+             * and replay.
+             */
+          } else if (
+            this.movedSet.has(n) &&
+            this.movedMap[moveKey(nodeId, parentId)]
+          ) {
+            deepDelete(this.movedSet, n);
+          } else {
+            this.removes.push({
+              parentId,
+              id: nodeId,
+              isShadow:
+                isShadowRoot(m.target) && isNativeShadowDom(m.target)
+                  ? true
+                  : undefined,
+            });
+            this.removedRoots.add(n);
+          }
+          this.mapRemoves.add(n);
+        });
+        break;
+      }
+      default:
+        break;
+    }
+  };
+
+  /**
+   * Make sure you check if `n`'s parent is blocked before calling this function
+   * */
+  private genAdds = (n: Node, target?: Node) => {
+    // this node was already recorded in other buffer, ignore it
+    if (this.processedNodeManager.inOtherBuffer(n, this)) return;
+
+    // if n is added to set, there is no need to travel it and its' children again
+    if (this.addedSet.has(n)) {
+      // Re-insert n so the addedSet iteration order in emit() matches the
+      // latest DOM order. Only n itself moves; its already-present children
+      // keep their earlier positions. The drain re-derives parentId/nextId
+      // per node, so parent-before-child order still comes out correct.
+      this.addedSet.delete(n);
+      this.addedSet.add(n);
+      return;
+    }
+    if (this.movedSet.has(n)) return;
+
+    if (this.mirror.hasNode(n)) {
+      if (isIgnored(n, this.mirror, this.slimDOMOptions)) {
+        return;
+      }
+      this.movedSet.add(n);
+      let targetId: number | null = null;
+      if (target && this.mirror.hasNode(target)) {
+        targetId = this.mirror.getId(target);
+      }
+      if (targetId && targetId !== -1) {
+        this.movedMap[moveKey(this.mirror.getId(n), targetId)] = true;
+      }
+    } else {
+      this.addedSet.add(n);
+      this.droppedSet.delete(n);
+    }
+
+    // if this node is blocked `serializeNode` will turn it into a placeholder element
+    // but we have to remove it's children otherwise they will be added as placeholders too
+    if (!isBlocked(n, this.blockClass, this.blockSelector, false)) {
+      // Text nodes cannot have children or a shadow root.
+      if (n.nodeType === n.TEXT_NODE) return;
+      // Avoid a callback per node on repeated subtree walks. Like forEach,
+      // capture the initial length but read each child from the live list.
+      const children = dom.childNodes(n);
+      for (let i = 0, length = children.length; i < length; i++) {
+        const childN = children[i];
+        if (childN) this.genAdds(childN);
+      }
+      if (hasShadowRoot(n)) {
+        const shadowChildren = dom.childNodes(dom.shadowRoot(n)!);
+        for (let i = 0, length = shadowChildren.length; i < length; i++) {
+          const childN = shadowChildren[i];
+          if (!childN) continue;
+          this.processedNodeManager.add(childN, this);
+          this.genAdds(childN, n);
+        }
+      }
+    }
+  };
+}
+
+/**
+ * Some utils to handle the mutation observer DOM records.
+ * It should be more clear to extend the native data structure
+ * like Set and Map, but currently Typescript does not support
+ * that.
+ */
+function deepDelete(addsSet: Set<Node>, n: Node) {
+  const stack = [n];
+
+  while (stack.length) {
+    const next = stack.pop()!;
+    addsSet.delete(next);
+    if (next.nodeType === next.TEXT_NODE) continue;
+    const children = dom.childNodes(next);
+    for (let i = 0, length = children.length; i < length; i++) {
+      const childN = children[i];
+      if (childN) stack.push(childN);
+    }
+  }
+}
+
+function processRemoves(n: Node, cache: Set<Node>) {
+  const queue = [n];
+
+  while (queue.length) {
+    const next = queue.pop()!;
+    if (cache.has(next)) continue;
+    cache.add(next);
+    dom.childNodes(next).forEach((n) => queue.push(n));
+  }
+
+  return;
+}
+
+function isAncestorInSet(set: Set<Node>, n: Node): boolean {
+  if (set.size === 0) return false;
+
+  let parent = dom.parentNode(n);
+  while (parent) {
+    if (set.has(parent)) return true;
+    parent = dom.parentNode(parent);
+  }
+  return false;
+}

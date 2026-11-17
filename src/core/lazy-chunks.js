@@ -18,47 +18,17 @@ import {Config} from './constants.js';
 import {doc} from './utils.js';
 import {loadScript} from './script-loader.js';
 import {setLazyChunkLoader} from './lazy.js';
-
-/** @const {string} config key overriding where the chunks are loaded from */
-export const LAZY_CHUNKS_URL_CONFIG = 'closure_lazy_chunks_url';
+import {LAZY_CHUNKS_URL_CONFIG, lazyChunksBase} from './script-base.js';
 
 /**
  * Kinds that upstream ships inside another of its scripts. The replay chunk
  * is the logic of upstream's `lazy-recorder.js`, which also contains rrweb;
- * we load rrweb from PostHog's `recorder.js` next to it. Its `<script>` is
+ * rrweb is our `recorder.js`, loaded next to it. Its `<script>` is
  * removed once it has run, so the page (which replay records) has one script
  * where upstream has one.
  * @const {!Object<string, boolean>}
  */
 const DETACHED_KINDS = {'replay': true};
-
-/**
- * The directory of `src`, with a trailing slash.
- * @param {string} src
- * @return {string}
- */
-function directoryOf(src) {
-  const path = src.split('#')[0].split('?')[0];
-  return path.slice(0, path.lastIndexOf('/') + 1);
-}
-
-/** @const {string} directory of the script running now (posthog.js) */
-const scriptBase = (function() {
-  const current = doc ? /** @type {?HTMLScriptElement} */ (doc.currentScript) : null;
-  return current && current.src ? directoryOf(current.src) : '';
-})();
-
-/**
- * @param {!Object} config PostHog config (quoted keys)
- * @return {string} the chunk directory, with a trailing slash, or ''
- */
-export function lazyChunksBase(config) {
-  const configured = config[LAZY_CHUNKS_URL_CONFIG];
-  if (typeof configured === 'string' && configured) {
-    return configured.charAt(configured.length - 1) === '/' ? configured : configured + '/';
-  }
-  return scriptBase;
-}
 
 /**
  * @param {!Object} config

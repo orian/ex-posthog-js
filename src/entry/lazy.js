@@ -7,7 +7,7 @@
  * `loadExternalDependency(posthog, kind, cb)`:
  *
  *   upstream kind                       our chunk
- *   lazy-recorder                       replay.js (+ PostHog's recorder.js, rrweb)
+ *   lazy-recorder                       replay.js (+ recorder.js, our rrweb build)
  *   exception-autocapture               exception-autocapture.js
  *   dead-clicks-autocapture             dead-clicks-autocapture.js
  *   web-vitals, web-vitals-with-attribution,
@@ -16,7 +16,8 @@
  *   tracing-headers                     tracing-headers.js
  *   logs                                logs.js
  *
- * PostHog-hosted assets (config.js, toolbar.js, recorder.js) are loaded from
+ * recorder.js (rrweb, built from third_party/posthog-rrweb) sits next to the
+ * chunks. PostHog-hosted assets (config.js, toolbar.js) are loaded from
  * PostHog as in the other builds.
  */
 // First: the chunk loader reads document.currentScript while posthog.js runs.

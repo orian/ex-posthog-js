@@ -31,10 +31,10 @@ their optional parts on demand, in headless Chrome with 4x CPU throttling
 
 | | official `array.js` | ours `lazy/posthog.js` | gain |
 |---|---|---|---|
-| Main script (gzip) | 122.4 KB | 85.5 KB | **-30%** |
-| Downloaded at startup | 171 KB | 85.5 KB | **-50%** |
-| Downloaded with session replay on | 244 KB | 154.6 KB | **-37%** |
-| Downloaded with every ported feature on | 272 KB | 168.6 KB | **-38%** |
+| Main script (gzip) | 122.4 KB | 85.6 KB | **-30%** |
+| Downloaded at startup | 171 KB | 85.6 KB | **-50%** |
+| Downloaded with session replay on | 244 KB | 153.2 KB | **-37%** |
+| Downloaded with every ported feature on | 272 KB | 167.7 KB | **-38%** |
 | Script load + parse + eval | 36.8 ms | 21.5 ms | **-42%** |
 | `posthog.init()` | 26.0 ms | 16.5 ms | **-37%** |
 | 1000 `capture()` calls | 495-580 ms | 269-297 ms | **~-50%** |
@@ -42,9 +42,11 @@ their optional parts on demand, in headless Chrome with 4x CPU throttling
 | Total main-thread time added in that session, rrweb included (vs no SDK) | +2,312 ms | +1,503 ms | **-35%** |
 | Data sent (events, recordings) | same | same | identical |
 
-- **Session replay overhead**: rrweb itself (PostHog's fork, the same code in
-  both SDKs) costs the same in both, about 380 ms per minute of a realistic
-  session. Everything around it is cheaper in ours: event size estimates
+- **Session replay overhead**: rrweb is PostHog's fork in both, but ours is
+  our own build of it with optimisations that leave the recording
+  identical: 358 vs 444 ms per minute of a realistic session in the same
+  run (see [Faster recording, same recording](#faster-recording-same-recording)).
+  Everything around it is cheaper in ours too: event size estimates
   without a `Blob` per event (308 -> 22 ms), compression (436 -> about 150
   ms: gzip validation with one read, a faster CRC-32, and short replay fields
   through our own encoder instead of a CompressionStream round trip), and no
@@ -79,10 +81,10 @@ are gzip -9; "downloaded" is every SDK script the page loaded.
 
 | | official `array.js` | ours `lazy/posthog.js` |
 |---|---|---|
-| Main script | `array.js` 122.4 KB (372 KB raw) | `posthog.js` 84.0 KB (234 KB raw), ~0.69x |
-| Downloaded at startup, default setup | 171 KB: `array.js` + `surveys.js` 48.7 (fetched even with surveys off; not ported here) | 84.0 KB, ~0.49x (0.69x without `surveys.js`) |
-| Downloaded with session replay on | 244 KB: + `lazy-recorder.js` 72.5 | 153 KB: + `replay.js` 21.2 + PostHog's `recorder.js` 46.5, ~0.63x |
-| Downloaded with replay, exceptions, dead clicks, web vitals, tracing headers and console logs on | 272 KB: + `web-vitals-with-attribution.js` 7.0, `exception-autocapture.js` 6.5, `dead-clicks-autocapture.js` 8.5, `logs.js` 2.8, `tracing-headers.js` 2.6 | 167 KB: + `web-vitals.js` 5.9, `exception-autocapture.js` 0.9, `dead-clicks-autocapture.js` 3.9, `logs.js` 1.6, `tracing-headers.js` 2.2, ~0.61x |
+| Main script | `array.js` 122.4 KB (372 KB raw) | `posthog.js` 85.6 KB, ~0.70x |
+| Downloaded at startup, default setup | 171 KB: `array.js` + `surveys.js` 48.7 (fetched even with surveys off; not ported here) | 85.6 KB, ~0.50x (0.70x without `surveys.js`) |
+| Downloaded with session replay on | 244 KB: + `lazy-recorder.js` 72.5 | 153.2 KB: + `replay.js` 20.9 + `recorder.js` 46.7 (PostHog's rrweb fork, rebuilt), ~0.63x |
+| Downloaded with replay, exceptions, dead clicks, web vitals, tracing headers and console logs on | 272 KB: + `web-vitals-with-attribution.js` 7.0, `exception-autocapture.js` 6.5, `dead-clicks-autocapture.js` 8.5, `logs.js` 2.8, `tracing-headers.js` 2.6 | 167.7 KB: + `web-vitals.js` 5.9, `exception-autocapture.js` 0.9, `dead-clicks-autocapture.js` 3.9, `logs.js` 1.6, `tracing-headers.js` 2.2, ~0.61x |
 | Script download + parse + eval (default setup) | 36.8 ms (1x) | 21.5 ms (~0.58x) |
 | `posthog.init()` (default / everything on) | 26.0 / 30.8 ms | 16.5 / 20.7 ms (~0.65x) |
 | 1000 `capture()` calls (incl. client rate limiting) | 495-580 ms | 269-297 ms (~0.5x) |
@@ -94,15 +96,15 @@ Without `surveys.js` (not ported), the like-for-like gaps are the main script
 where upstream's bundles its own copy; `replay.js` + `recorder.js` is 67.7 KB
 vs `lazy-recorder.js` 72.5 KB). Our lazy build makes the same number of
 requests as upstream minus `surveys.js`, plus one: replay loads two scripts
-(our `replay.js` and PostHog's `recorder.js`, in parallel) where upstream
+(our `replay.js` and `recorder.js`, in parallel) where upstream
 loads `lazy-recorder.js`.
 
 ### Other builds
 
 | | official | ours |
 |---|---|---|
-| Core only | `module.slim` 54.0 KB (npm build) | `posthog.core.js` 37.0 KB |
-| Everything in one main script | `array.full.js` 231 KB (also includes surveys; still lazy-loads some parts) | `posthog.full.js` 112.8 KB; only `recorder.js` (46.5) is downloaded, when replay is on |
+| Core only | `module.slim` 54.0 KB (npm build) | `posthog.core.js` 38.6 KB |
+| Everything in one main script | `array.full.js` 231 KB (also includes surveys; still lazy-loads some parts) | `posthog.full.js` 114.3 KB; only `recorder.js` (46.7) is downloaded, when replay is on |
 
 | default setup | load + eval | `init()` | 1000 captures | downloaded |
 |---|---|---|---|---|
@@ -119,9 +121,10 @@ Other differences besides size and speed:
 
 - **Requests.** Upstream lazy-loads `surveys.js` on every page (even with
   surveys off in the project); we have no surveys module. `posthog.full.js`
-  compiles every lazy part in, loading only PostHog's rrweb fork
-  (`recorder.js`); the lazy build loads its parts where upstream loads its
-  `/static/` scripts (with replay as two scripts, see above).
+  compiles every lazy part in, loading only rrweb (`recorder.js`, PostHog's
+  fork built from `third_party/posthog-rrweb`, next to the SDK); the lazy
+  build loads its parts where upstream loads its `/static/` scripts (with
+  replay as two scripts, see above).
 - **Compiled in vs lazy-loaded.** In `posthog.full.js` and the chunks,
   exception autocapture's wrappers, dead clicks, web vitals, tracing headers
   and console capture start immediately rather than after a script load. The
@@ -136,7 +139,8 @@ Other differences besides size and speed:
   time.
 - **Lazy assets are pinned.** PostHog CDN assets are requested for the upstream
   version we track (`UPSTREAM_VERSION`, currently 1.450.0), e.g.
-  `/static/1.450.0/recorder.js`, never for our own version. The diff test fails
+  `/static/1.450.0/toolbar.js` (or PostHog's `recorder.js` with
+  `closure_recorder_url: 'posthog'`), never for our own version. The diff test fails
   if our SDK requests an asset path that doesn't exist on the CDN.
 - **ES5 output with no injected polyfills.** Like upstream, we target old
   browsers; we use no ES2015+ built-ins at all rather than polyfilling them.
@@ -350,9 +354,13 @@ same decisions.
 
 #### CPU profile (`--profile`)
 
-Both SDKs record with the same rrweb build (ours loads `/static/1.450.0/recorder.js`,
-rrweb only; official loads `lazy-recorder.js`, rrweb plus upstream's replay
-logic), so the totals above mostly measure rrweb twice. `--profile` says where
+When these results were taken, both SDKs recorded with the same rrweb build
+(ours loaded PostHog's `/static/1.450.0/recorder.js`, rrweb only; official
+loads `lazy-recorder.js`, rrweb plus upstream's replay logic), so the totals
+above mostly measure rrweb twice. Ours now loads its own build of the fork
+(see [Session replay's recorder](#session-replays-recorder-rrweb)), whose
+source map points straight at the vendored TypeScript files, so the
+profiler attributes its frames without the index described below. `--profile` says where
 the time goes:
 
 ```sh
@@ -805,10 +813,12 @@ src/dom/           shared DOM helpers for the three modules below (element
 src/autocapture/   optional: $autocapture, $rageclick, $copy_autocapture (needs dom)
 src/dead-clicks/   optional: $dead_click / $dead_swipe (needs dom)
 src/heatmaps/      optional: $$heatmap (needs dom + dead-clicks)
-src/replay/        optional: session replay (rrweb is loaded at runtime from /static/recorder.js)
+src/replay/        optional: session replay (rrweb is loaded at runtime from recorder.js)
 src/web-vitals/    optional: $web_vitals (Google's web-vitals compiled in from third_party/)
 src/tracing-headers/ optional: tracing headers / traceparent on the app's fetch and XHR
 third_party/web-vitals/ Google web-vitals 6.2.1 (Apache-2.0), ported to JSDoc; see its README
+third_party/posthog-rrweb/ PostHog's rrweb fork (MIT) as in posthog-js 1.450.0's recorder.js, with
+                   our optimisations; built into dist/recorder.js (see its README)
 src/otlp/          shared OTLP helpers for logs and metrics (attribute encoder, resource
                    attributes, flush timer, backoff, the console/fetch `patch` layer)
 src/logs/          opt-in: posthog.captureLog / posthog.logger / posthog.logs and console
@@ -818,7 +828,9 @@ src/metrics/       opt-in: posthog.metrics (count, gauge, histogram, network met
 src/toolbar/       opt-in: the toolbar loader (posthog.loadToolbar, posthog.toolbar)
 src/entry/         bundle entry points (core, core-flags, full, lazy)
 docker/closure-compiler/Dockerfile   Closure Compiler v20261109 (official Maven jar, JRE 21)
-scripts/build.sh   builds every bundle in Docker
+docker/recorder-build/Dockerfile     node 24.21.0 + esbuild 0.25.12, for recorder.js
+scripts/build.sh   builds every bundle in Docker (and calls build-recorder.sh)
+scripts/build-recorder.sh  builds recorder.js (rrweb) from third_party/posthog-rrweb
 test/              Node harness (fake browser) + headless-Chrome smoke test
 test/diff/         differential test vs the official SDK (fake PostHog server, CDP driver)
 test/bench/        session benchmark: demo app (site/), human-like input, journeys
@@ -836,8 +848,8 @@ upstream/          shallow clone of PostHog/posthog-js, kept for reference only 
 |---|---|---|
 | `dist/posthog.core.js` | core only | ~38.6 KB |
 | `dist/posthog.core-flags.js` | core + feature flags | ~45.3 KB |
-| `dist/posthog.full.js` | everything: all modules below | ~114.1 KB |
-| `dist/chunks/core.js` | core chunk | ~40.0 KB |
+| `dist/posthog.full.js` | everything: all modules below | ~114.3 KB |
+| `dist/chunks/core.js` | core chunk | ~40.1 KB |
 | `dist/chunks/flags.js` | flags chunk (needs core) | ~7.3 KB |
 | `dist/chunks/experiments.js` | experiments chunk (needs flags) | ~6.5 KB |
 | `dist/chunks/exceptions.js` | exception capture chunk (needs core) | ~8.5 KB |
@@ -845,25 +857,27 @@ upstream/          shallow clone of PostHog/posthog-js, kept for reference only 
 | `dist/chunks/autocapture.js` | autocapture chunk (needs dom) | ~3.5 KB |
 | `dist/chunks/deadclicks.js` | dead clicks chunk (needs dom) | ~4.5 KB |
 | `dist/chunks/heatmaps.js` | heatmaps chunk (needs deadclicks) | ~1.5 KB |
-| `dist/chunks/replay.js` | session replay chunk (needs core) | ~23.1 KB |
+| `dist/chunks/replay.js` | session replay chunk (needs core) | ~23.2 KB |
 | `dist/chunks/webvitals.js` | web vitals chunk, web-vitals library included (needs core) | ~7.9 KB |
 | `dist/chunks/tracingheaders.js` | tracing headers chunk (needs core) | ~2.7 KB |
 | `dist/chunks/otlp.js` | shared OTLP helpers (needs core) | ~1.9 KB |
 | `dist/chunks/logs.js` | logs and console capture (needs otlp) | ~6.5 KB |
 | `dist/chunks/metrics.js` | metrics (needs otlp) | ~5.3 KB |
 | `dist/chunks/toolbar.js` | toolbar loader (needs core) | ~1.4 KB |
-| `dist/lazy/posthog.js` | the lazy build's main script: like `array.js` (see below) | ~85.5 KB |
+| `dist/lazy/posthog.js` | the lazy build's main script: like `array.js` (see below) | ~85.6 KB |
 | `dist/lazy/replay.js` | replay recorder logic (upstream `lazy-recorder.js` without rrweb) | ~20.9 KB |
 | `dist/lazy/exception-autocapture.js` | error wrapping functions | ~0.9 KB |
 | `dist/lazy/dead-clicks-autocapture.js` | dead click detector | ~3.9 KB |
 | `dist/lazy/web-vitals.js` | Google's web-vitals, every flavour | ~5.9 KB |
 | `dist/lazy/tracing-headers.js` | fetch/XHR tracing patches | ~2.2 KB |
 | `dist/lazy/logs.js` | console log capture | ~1.6 KB |
+| `dist/recorder.js`, `dist/chunks/recorder.js`, `dist/lazy/recorder.js` | rrweb (PostHog's fork) and its console and network plugins, next to each build; esbuild, not Closure | ~46.7 KB |
 
-Session replay also loads upstream's `recorder.js` (rrweb and its console and
-network plugins, ~46.5 KB gzip) from the assets host when recording starts.
-Upstream loads `lazy-recorder.js` instead (~72.5 KB: rrweb plus the replay
-logic that is compiled into our bundle).
+Session replay loads `recorder.js` (rrweb and its console and network
+plugins) when recording starts, from next to the SDK script (see
+[Session replay's recorder](#session-replays-recorder-rrweb)). Upstream loads
+`lazy-recorder.js` instead (~72.5 KB: rrweb plus the replay logic that is
+compiled into our bundle).
 
 In `posthog.full.js` and the chunks, web vitals load nothing at runtime: Google's web-vitals library (6.2.1, the
 release upstream pins) is compiled into the chunk. Upstream loads
@@ -995,7 +1009,7 @@ kind, cb)`, from a chunk next to `posthog.js`:
 
 | upstream `/static/<kind>.js` | ours `lazy/<chunk>.js` | loaded when |
 |---|---|---|
-| `lazy-recorder` | `replay` + PostHog's `recorder.js` (rrweb), requested together | recording starts (remote config, `startSessionRecording`) |
+| `lazy-recorder` | `replay` + `recorder.js` (rrweb), requested together | recording starts (remote config, `startSessionRecording`) |
 | `exception-autocapture` | `exception-autocapture` | exception autocapture turns on |
 | `dead-clicks-autocapture` | `dead-clicks-autocapture` | dead clicks (or heatmaps' detector) start |
 | `web-vitals`, `web-vitals-with-attribution`, `web-vitals-soft-navs`, `web-vitals-with-attribution-soft-navs` | `web-vitals` | web vitals start |
@@ -1010,8 +1024,8 @@ attribution and soft-navs options) and checks
 those are missing it loads the chunk, then uses its attributed or plain
 callbacks for that flavour and, for the attribution flavours, starts the
 attribution build's resource observer, as loading that script does upstream.
-The replay chunk is the half of `lazy-recorder.js` we own; rrweb still comes
-from PostHog's `recorder.js`, requested at the same time, and recording starts
+The replay chunk is the half of `lazy-recorder.js` we own; rrweb comes from
+`recorder.js` next to the chunks, requested at the same time, and recording starts
 once both have loaded. Its `<script>` element is removed once it has run, so
 the page (which replay records) has one script where upstream has one.
 
@@ -1027,14 +1041,165 @@ posthog.init('phc_...', { closure_lazy_chunks_url: 'https://cdn.example.com/post
 ```
 
 (Upstream has no `closure_*` options, so the name can't collide with one of
-its keys.) PostHog-hosted assets stay PostHog-hosted: the remote config
-(`/array/<token>/config.js`), `toolbar.js` and `recorder.js`. The build is a
+its keys.) `recorder.js` sits next to the chunks too, so this key moves it as
+well (`closure_recorder_url` overrides it). PostHog-hosted assets stay
+PostHog-hosted: the remote config (`/array/<token>/config.js`) and
+`toolbar.js`. The build is a
 Closure chunk graph rooted at `posthog.js` with its own namespace object,
 `window.__phl`, so it can share a page with the chunk build (`__phc`).
 
 The standard PostHog HTML snippet also works. Calls the snippet queued before
 the SDK loaded are replayed after `init`, with `identify` and `register` going
 first.
+
+### Session replay's recorder (rrweb)
+
+rrweb is not compiled into any build: like upstream, session replay loads it
+when recording starts, as `recorder.js` (rrweb's record side plus the console
+and network plugins, with upstream's entry point and globals:
+`__PosthogExtensions__.rrweb.{record, version, wasMaxDepthReached, ...}`,
+`__PosthogExtensions__.rrwebPlugins`, `window.rrweb`, ...). We build that
+file ourselves from PostHog's fork, vendored in
+[`third_party/posthog-rrweb`](third_party/posthog-rrweb/README.md):
+
+- **Source.** The fork as posthog-js 1.450.0 shipped it: upstream builds
+  `recorder.js` from its pnpm workspace (`packages/rrweb`,
+  `@posthog/rrweb-record` 0.0.89) at the release tag `posthog-js@1.450.0`
+  (`63bc454`), which is the commit our `upstream/` clone is at. Those fork
+  versions are not on npm, so the tag is the source. `original/` keeps the
+  files unchanged; `src/` is what we build, with the optimisations below.
+- **Build.** `scripts/build-recorder.sh` (run by `build.sh`) bundles the
+  TypeScript with esbuild 0.25.12 on node 24.21.0 in a pinned Docker image
+  (`docker/recorder-build`), minified with a source map, for the browsers
+  upstream's Babel config targets. It is PostHog's TypeScript fork, not a
+  port, so it is **not** Closure-compiled: it stays diffable against upstream,
+  and ADVANCED renaming would break the names rrweb shares with its data and
+  the replayer. No npm dependency is added to the SDK; the one dependency of
+  the record side (`base64-arraybuffer` 1.0.2, MIT) is vendored.
+- **Output.** The same file is written next to every build that loads it:
+  `dist/recorder.js`, `dist/chunks/recorder.js`, `dist/lazy/recorder.js`.
+  46.7 KB gzip (46,702 bytes; 46,464 before the optimisations below)
+  against PostHog's 46.5 KB (46,549 bytes).
+- **Where it is loaded from.** `closure_recorder_url` (upstream has no
+  `closure_*` keys):
+
+  ```js
+  posthog.init('phc_...', {})                                       // <SDK dir>/recorder.js?v=<our version>
+  posthog.init('phc_...', { closure_recorder_url: 'https://cdn.example.com/rec.js' })  // that URL
+  posthog.init('phc_...', { closure_recorder_url: 'posthog' })      // PostHog's /static/1.450.0/recorder.js
+  ```
+
+  Unset, it is next to the SDK script, found like the lazy build's chunks
+  (`document.currentScript` while the SDK runs; in the lazy build, next to the
+  chunks, so `closure_lazy_chunks_url` moves it too). If that directory is
+  unknown (the SDK was not loaded by a `<script src>`), PostHog's
+  `recorder.js` is loaded instead. `'posthog'` loads PostHog's CDN build as
+  before, with upstream's URL rules (`asset_host`, `?v=`,
+  `strict_script_versioning`). Either way it is injected with the core's
+  `loadScript` (`prepare_external_dependency_script`,
+  `disable_external_dependency_loading`, `external_scripts_inject_target`).
+- **Same recording.** Before any change to the fork, every diff scenario was
+  identical for both builds with our `recorder.js` against official 1.450.0
+  with PostHog's `lazy-recorder.js`. The `replay_*` scenarios compare the
+  decoded `$snapshot` payloads, node ids included. That is the evidence that
+  the rebuild records exactly what PostHog's build records.
+
+#### Faster recording, same recording
+
+The [CPU profile](#cpu-profile---profile) found rrweb hot spots that can be
+made cheaper without changing what is recorded. Each change below is its own
+commit in `third_party/posthog-rrweb/src` (the commit says why the output
+can't change), passed the recording equivalence test below (2 x 60 s
+journeys; from the third change on, plus the DOM fuzz), and was measured with
+`node test/bench/session.mjs --profile --variants ours` (5 rounds, 60 s, 4x
+CPU, medians of the profiled runs). Another agent's Chrome diff jobs
+(`phc-diff-*`) ran during most measurements (load average 2.5-5 on 24 cores),
+so the rrweb total moves by about ±10 ms between identical builds; the
+per-function figures are steadier.
+
+| Change | Hot spot, before -> after | rrweb total |
+|---|---|---|
+| rebuild of the unmodified fork (baseline) | | 348 ms |
+| untainted methods and accessors: call the cached function directly, no `bind` and cache key per `contains`/`getRootNode` | rrweb-utils 39.6 -> 30.1 ms (`getUntaintedMethod` 8.2 -> 0) | 338 ms |
+| removed subtrees checked lazily (ancestor lookup against the removed roots) instead of walking every removed subtree | `mutation.ts` 73 -> 52 ms (`processRemoves` 10.3 -> 0, `childNodes` getter 9.0 -> 3.3) | 321 ms |
+| event payloads built with `Object.assign` instead of object spread | spread helpers 8.4 -> 0.5 ms | 327 ms |
+| `getWindowScroll` reads `scrollingElement` once | scroll observer 27.4 -> 24.2 ms | 327 ms |
+
+Tried and dropped, because they measured no gain:
+
+- **Memoising `isBlocked` per element within a mutation batch.** The
+  block checks cost the same with the memo (21.7 vs 21.4 ms): on this app
+  almost every check is for a different element, so the lookups only added
+  work. The recording was identical.
+- **An iterative `removeNodeFromMap`.** Its cost is the native `childNodes`
+  getter for every node of the removed subtree, which a loop doesn't avoid
+  (14.0 vs 15.5 ms).
+- **The throttle's `setTimeout`.** It is not per wheel event: rrweb
+  schedules one trailing timer per 100 ms window and scrolled element, which
+  its trailing-edge sampling needs.
+
+What remains is mutation processing (~215-240 ms of ~330), mostly
+serialising re-added nodes (`serializeElementNode`, `serializeNodeWithId`,
+Mirror `add`). Reducing it means recording less (coalescing or diffing
+re-rendered subtrees), which changes the recording, so it is out of scope.
+
+Official 1.450.0 and ours in the same run at the end (5 rounds, 60 s, 4x
+CPU, profiled runs; load average ~4 from another agent's Chrome jobs, so
+absolute times are higher than in the tables above):
+
+| | official (`lazy-recorder.js`) | ours (`recorder.js`, rebuilt + optimised) |
+|---|---|---|
+| rrweb + recorder plugins | 444 ms | 358 ms (-19%) |
+| of which mutations | 296 ms | 241 ms |
+| of which scroll observer | 58 ms | 31 ms |
+| SDK total incl. rrweb | 2,215 ms | 1,297 ms |
+| rrweb events, full snapshots, `$snapshot` requests | 683, 1, 17 | 682, 1, 17 |
+
+Part of the gap to official is the build itself: PostHog's `recorder.js`
+goes through Babel, whose `_objectSpread2` and class field helpers run on
+every event (the earlier profile put rrweb at 379 vs 378 ms when both SDKs
+loaded PostHog's build).
+
+#### Recording equivalence test
+
+The diff suite compares our SDK with the official one on short scenarios.
+Changes to the fork itself are checked against the unmodified fork on the
+session benchmark's journeys:
+
+```sh
+./scripts/build.sh
+npm run test:recorder-equivalence                      # 60 s journeys, 4x CPU, seed 1
+npm run test:recorder-equivalence -- --runs 3 --duration 120 --seed 7
+npm run test:recorder-equivalence -- --self            # original vs original (harness check)
+```
+
+It builds `third_party/posthog-rrweb/original` and `src` into
+`dist/equivalence/`, loads both into the demo app page, then our
+`posthog.full.js` with replay on. The SDK sees one rrweb whose `record`
+starts both recorders with the options it passes (plugins included) and
+forwards `addCustomEvent`, `takeFullSnapshot` and `freezePage` to both, so
+both record the same DOM, input and SDK calls at the same time. Each
+recorder's events are serialised as they are emitted; after the journeys the
+two streams must be identical, event for event, node ids included. Only each
+event's wall-clock `timestamp` is normalised. The two copies run on a shared
+clock (test builds only, `build.mjs --equivalence`): `Date.now` is frozen for
+the duration of a task and timers due at the same moment run in one task, so
+a millisecond ticking between the two copies' handlers can't change a
+throttle decision (mouse moves, scroll).
+
+The journeys alone rarely hit some mutation paths (a removed subtree whose
+children are re-added elsewhere in the same batch never happens on the demo
+app), so after them the same page runs a seeded DOM fuzz (`--fuzz B`, 400
+batches by default, `0` turns it off): one task per batch of random appends,
+removes, moves, remove-then-move-a-descendant, remove-and-re-add, wraps,
+sibling swaps, `innerHTML` replacement, text, attribute, style and
+`ph-no-capture`/`ph-mask` class changes, with some batches recorded while
+the page is frozen (`freezePage`, then a custom event unfreezes it). rrweb's
+own console warnings (`[rrweb] dropped N node(s)`) are captured by both
+copies' console plugins, so they are compared per copy (told apart by the
+stack trace) rather than in stream order. A 60 s run records about 1,050
+events (1.8 MB). A build that ignores removed parents fails within 5 s of
+fuzz; the original against itself (`--self`) is identical.
 
 ## Closure conventions
 
@@ -1185,7 +1350,7 @@ CDP: the page calls `h.click(selector)`, `h.move(x, y)`, `h.type(text)` or
 accepted differences: only `$lib_version`.
 
 Run against the lazy build, the runner also checks that our chunk requests
-(`/sdk/ours/lazy/<chunk>.js`, and PostHog's `recorder.js`) happen in the same
+(`/sdk/ours/lazy/<chunk>.js`, including `recorder.js`) happen in the same
 order and in the same scenarios as the official SDK's `/static/<kind>.js`
 requests, with the kind map from [The lazy build](#the-lazy-build)
 (`lazy-recorder` is our `replay` chunk plus `recorder.js`, requested together;
@@ -1214,14 +1379,18 @@ scenarios throw on purpose say `diff-expected` and are not reported as page
 errors.
 Session replay scenarios (`replay_*`) serve a remote config with
 `sessionRecording` and compare the `$snapshot` payloads too: the official SDK
-loads `/static/lazy-recorder.js`, ours `/static/recorder.js` (plus, in the lazy
-build, its `replay` chunk), both from the vendored official dist (`/static/`
-requests are not compared). The normaliser
+loads `/static/lazy-recorder.js` from the vendored official dist, ours our
+`dist/recorder.js` (in the lazy build `dist/lazy/recorder.js`, plus its
+`replay` chunk) next to the SDK (`/static/` and `/sdk/` requests are not
+compared). The normaliser
 decodes the per-event `cv: '2024-10'` gzip fields and compares the recorded
 DOM, mutations, custom events (including `$posthog_config`) and network entries
 with node ids as-is. rrweb timestamps, browser-measured network timings and
 transfer sizes are volatile; the SDK and recorder `<script>` URLs in the
-recorded DOM are normalised; `$snapshot_bytes` is checked against the payload
+recorded DOM are normalised (scheme and host included: upstream's comes from
+the assets host, ours from the SDK's), and so is the recorder script's
+`nextHopProtocol` in the network plugin's initial entries (the browser
+exposes it only for our same-origin script); `$snapshot_bytes` is checked against the payload
 (it must equal upstream's size estimate) because sizes include those URLs.
 The replay scenarios set `disable_surveys` because upstream injects
 `surveys.js` (not ported) into the recorded DOM otherwise; `dead_clicks` sets
@@ -1317,9 +1486,12 @@ through the JSON fallback there.
   masking, console and network plugins, canvas options, the interaction hold,
   buffering (0.9 MB / 2 s, 6.3 MB split, sessionStorage parking on unload),
   per-event compression, idle detection, session rotation, JSON-LD capture,
-  the debug properties and the public API. rrweb comes from upstream's
-  `recorder.js`, loaded with the same URL rules as upstream's lazy scripts
-  (`?v=`, `strict_script_versioning`, `asset_host`), unless
+  the debug properties and the public API. rrweb comes from our
+  `recorder.js` (PostHog's fork, rebuilt; see
+  [Session replay's recorder](#session-replays-recorder-rrweb)) next to the
+  SDK, or from PostHog's with `closure_recorder_url: 'posthog'` (then with the
+  same URL rules as upstream's lazy scripts: `?v=`,
+  `strict_script_versioning`, `asset_host`), unless
   `window.__PosthogExtensions__.rrweb.record` already exists.
 
 - Web vitals (`extensions/web-vitals/index.ts` and the four `web-vitals*`

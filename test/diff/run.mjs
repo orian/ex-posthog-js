@@ -115,10 +115,15 @@ function estimateCompressedEventSize(value) {
 // PostHog's recorder.js, which both load): its resource entry in the network plugin's initial
 // capture has no upstream counterpart. (Its <script> is removed once it has run.)
 const OUR_REPLAY_CHUNK = /\/sdk\/ours\/lazy\/replay\.js(\?|$)/
+// Our recorder.js is served next to the SDK (same origin as the page), upstream's
+// lazy-recorder.js from the assets host: its resource entry's `nextHopProtocol` is only
+// exposed for the same-origin script.
+const RECORDER_SCRIPT = /\/(?:sdk\/ours\/(?:[\w-]+\/)?recorder|static\/(?:[\w.-]+\/)?(?:lazy-)?recorder)\.js(\?|$)/
 function dropReplayChunkEntry(e) {
     const payload = e && e.type === 6 && e.data && e.data.plugin === 'rrweb/network@1' && e.data.payload
     if (!payload || !Array.isArray(payload.requests)) return e
     const requests = payload.requests.filter((r) => !OUR_REPLAY_CHUNK.test(r.name || ''))
+        .map((r) => (RECORDER_SCRIPT.test(r.name || '') && 'nextHopProtocol' in r ? { ...r, nextHopProtocol: '<origin-dependent>' } : r))
     return { ...e, data: { ...e.data, payload: { ...payload, requests } } }
 }
 
@@ -136,8 +141,12 @@ function expandSnapshot(e) {
 
 function normaliseUrls(value) {
     return value
+        // rrweb's script: upstream's /static/lazy-recorder.js on the assets host, ours
+        // recorder.js next to the SDK (dist/, dist/chunks/ or dist/lazy/: PostHog's
+        // recorder.js rebuilt), or PostHog's /static/recorder.js with closure_recorder_url.
+        .replace(/(?:https?:\/\/[\w.-]+(?::\d+)?)?\/sdk\/ours\/(?:[\w-]+\/)?recorder\.js(?:\?v=[\w.-]+)?/g, '<recorder>')
+        .replace(/(?:https?:\/\/[\w.-]+(?::\d+)?)?\/static\/(?:[\w.-]+\/)?(?:lazy-)?recorder\.js(?:\?v=[\w.-]+)?/g, '<recorder>')
         .replace(/\/sdk\/(official\/array\.js|ours\/[\w.\/-]+\.js)/g, '/sdk/<sdk>')
-        .replace(/\/static\/(?:[\w.-]+\/)?(?:lazy-)?recorder\.js(?:\?v=[\w.-]+)?/g, '/static/<recorder>')
 }
 
 // Network plugin entries: browser-measured timings and transfer sizes, the
