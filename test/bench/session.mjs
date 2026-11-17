@@ -24,6 +24,10 @@
 //   --profile-window W   session (default: the measured window) | load (from navigation, so
 //                        SDK evaluation, init and the first full snapshot are included)
 //   --profile-only       skip the plain runs (profile tables only)
+//   --unload-probe       before leaving the page, time the SDK's unload work: dispatch
+//                        beforeunload + pagehide synchronously and measure the handlers
+//                        ($pageleave, flushing queued events and replay, sync gzip, beacons);
+//                        with --save-profiles also profiled into DIR/unload/
 //
 // Positional `[runs] [seconds]` still work. See README.md "Benchmarks".
 import fs from 'node:fs'
@@ -63,6 +67,7 @@ function parseArgs(argv) {
         else if (a === '--save-profiles') o.saveProfiles = val()
         else if (a === '--profile-window') o.profileWindow = val()
         else if (a === '--profile-only') o.profile = o.profileOnly = true
+        else if (a === '--unload-probe') o.unloadProbe = true
         else if (a.startsWith('--')) throw new Error('unknown option ' + a)
         else pos.push(a)
     }
@@ -322,6 +327,22 @@ async function runOnce(chrome, srv, v, run, profiled = false) {
     peakHeap = Math.max(peakHeap, after.JSHeapUsedSize)
     const page_ = await page.evaluate('window.__phbench.result()')
     await sleep(1000)
+    // The SDK's unload handlers, run synchronously by dispatching the events (the real
+    // navigation below then finds the queues empty). With --save-profiles, profiled into
+    // DIR/unload/ (20 µs sampling).
+    const probeProfile = opts.unloadProbe && v.key !== 'none' && opts.saveProfiles && !profiled
+    if (probeProfile) await startProfile(page, 20)
+    const unloadMs = opts.unloadProbe && v.key !== 'none' ? await page.evaluate(`(function () {
+        var t = performance.now()
+        window.dispatchEvent(new Event('beforeunload'))
+        window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: false }))
+        return performance.now() - t
+    })()`) : null
+    if (probeProfile) {
+        const dir = path.join(opts.saveProfiles, 'unload')
+        fs.mkdirSync(dir, { recursive: true })
+        fs.writeFileSync(path.join(dir, `${v.key}-${run}.cpuprofile`), JSON.stringify(await stopProfile(page)))
+    }
     await page.goto('about:blank') // unload: final flushes ($pageleave, last replay batch)
     await sleep(2000)
     await page.close()
@@ -335,7 +356,7 @@ async function runOnce(chrome, srv, v, run, profiled = false) {
     }
     const d = (k) => (after[k] - before[k]) * 1000
     return {
-        variant: v.key, run, profiled, loadMs, wallMs, journeys, input: human.stats,
+        variant: v.key, run, profiled, loadMs, wallMs, unloadMs, journeys, input: human.stats,
         cpu: profile ? attributor.attribute(profile) : undefined,
         taskMs: d('TaskDuration'), scriptMs: d('ScriptDuration'), layoutMs: d('LayoutDuration'), styleMs: d('RecalcStyleDuration'),
         heapEndMB: after.JSHeapUsedSize / 1048576, heapPeakMB: peakHeap / 1048576,
@@ -397,7 +418,7 @@ try {
 contention.seen = [...contention.seen]
 
 const KEYS = ['taskMs', 'scriptMs', 'layoutMs', 'styleMs', 'longTasks', 'longTaskMs', 'interactions', 'inpP75', 'inpMax', 'nextPaintP75', 'nextPaintMax', 'heapEndMB', 'heapPeakMB',
-    'eventRequests', 'eventBytes', 'events', 'replayRequests', 'replayBytes', 'snapshots', 'rrwebEvents', 'fullSnapshots', 'firstFullSnapshotMs', 'otherApiRequests', 'nodes', 'wallMs']
+    'eventRequests', 'eventBytes', 'events', 'replayRequests', 'replayBytes', 'snapshots', 'rrwebEvents', 'fullSnapshots', 'firstFullSnapshotMs', 'otherApiRequests', 'nodes', 'wallMs', 'unloadMs']
 const medians = Object.fromEntries(VARIANTS.map((v) => [v.key, Object.fromEntries(KEYS.map((k) => [k, median(samples[v.key].map((s) => s[k]))]))]))
 const base = medians.none
 const f = (x, d = 0) => (x === null || x === undefined ? '-' : x.toFixed(d))
@@ -421,6 +442,13 @@ console.table(Object.fromEntries(VARIANTS.filter((v) => v.key !== 'none').map((v
         'replay KB': f(m.replayBytes / 1024, 1), '1st full snapshot ms': f(m.firstFullSnapshotMs), 'other API reqs': f(m.otherApiRequests),
     }]
 })))
+if (opts.unloadProbe) {
+    console.log('\nUnload handlers (beforeunload + pagehide dispatched synchronously), ms:')
+    console.table(Object.fromEntries(VARIANTS.filter((v) => v.key !== 'none').map((v) => {
+        const xs = samples[v.key].map((s) => s.unloadMs).filter((x) => x !== null)
+        return [v.key, { median: f(medians[v.key].unloadMs, 1), min: f(Math.min(...xs), 1), max: f(Math.max(...xs), 1) }]
+    })))
+}
 }
 
 let profile
