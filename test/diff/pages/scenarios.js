@@ -1736,3 +1736,89 @@
     }
   }
 })()
+
+// ---- Native request compression that fails or produces invalid output ---------------------
+// Upstream compresses /e/ bodies with CompressionStream and validates the output (gzip
+// header, CRC-32 and size trailer) before sending it. Each scenario wraps CompressionStream
+// before the SDK loads, so both SDKs see the same broken stream:
+// - gzip_native_bad_crc / gzip_native_bad_header: the output fails validation, so native gzip
+//   is turned off and the batch (and every later one) is compressed synchronously;
+// - gzip_native_throws_once: the first stream throws a plain error: that batch is compressed
+//   synchronously, native gzip stays on;
+// - gzip_native_not_readable: compressing fails with Safari 16's NotReadableError: the batch
+//   is sent uncompressed and native gzip is turned off.
+;(function () {
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms) }) }
+  var scenario = new URLSearchParams(location.search).get('scenario')
+  var NativeCS = window.CompressionStream
+
+  function concat(chunks) {
+    var n = 0
+    chunks.forEach(function (c) { n += c.length })
+    var out = new Uint8Array(n)
+    var o = 0
+    chunks.forEach(function (c) { out.set(c, o); o += c.length })
+    return out
+  }
+
+  /** mutate(bytes, call) returns the bytes to emit; throwOn(call) makes the constructor throw. */
+  function wrapCompressionStream(mutate, throwOn) {
+    window.__csCalls = 0
+    window.CompressionStream = function (format) {
+      var call = ++window.__csCalls
+      if (throwOn && throwOn(call)) throw new Error('diff-expected: CompressionStream unavailable')
+      var inner = new NativeCS(format)
+      var chunks = []
+      var out = new TransformStream({
+        transform: function (c) { chunks.push(c) },
+        flush: function (ctl) {
+          ctl.enqueue(mutate(concat(chunks), call))
+        },
+      })
+      inner.readable.pipeTo(out.writable).catch(function () {})
+      return { writable: inner.writable, readable: out.readable }
+    }
+  }
+
+  if (scenario === 'gzip_native_bad_crc') {
+    wrapCompressionStream(function (b) { b[b.length - 8] ^= 0xff; return b })
+  } else if (scenario === 'gzip_native_bad_header') {
+    wrapCompressionStream(function () { return new TextEncoder().encode('definitely not a gzip stream') })
+  } else if (scenario === 'gzip_native_throws_once') {
+    wrapCompressionStream(function (b) { return b }, function (call) { return call === 1 })
+  } else if (scenario === 'gzip_native_not_readable') {
+    // Writing the input fails with NotReadableError (Chrome reports an errored readable side
+    // to Response.blob() as a TypeError, so the error is raised on the writable side).
+    window.__csCalls = 0
+    window.CompressionStream = function () {
+      window.__csCalls++
+      return {
+        writable: new WritableStream({ write: function () { throw new DOMException('diff-expected: unreadable', 'NotReadableError') } }),
+        readable: new ReadableStream(),
+      }
+    }
+  }
+
+  function run(ph, h) {
+    ph.init(h.token, h.config({ autocapture: false, capture_pageview: false, disable_surveys: true }))
+    return sleep(600).then(function () {
+      ph.capture('first', { n: 1 })
+      return sleep(700)
+    }).then(function () {
+      ph.capture('second', { n: 2 })
+      return sleep(700)
+    }).then(function () {
+      ph.capture('third', { n: 3 })
+      return sleep(700)
+    }).then(function () {
+      window.__flagResults = { compressionStreamCalls: window.__csCalls }
+    })
+  }
+
+  Object.assign(window.SCENARIOS, {
+    gzip_native_bad_crc: run,
+    gzip_native_bad_header: run,
+    gzip_native_throws_once: run,
+    gzip_native_not_readable: run,
+  })
+})()

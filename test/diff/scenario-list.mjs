@@ -29,3 +29,5 @@ SCENARIO_NAMES.push('logs_api', 'logs_before_send', 'logs_batching', 'logs_batch
     'toolbar_fallback', 'toolbar_none')
 // Every lazily loaded part at once (pages/scenarios.js, last block).
 SCENARIO_NAMES.push('lazy_all_features')
+// Native request compression failing or producing invalid output (pages/scenarios.js, last blocks).
+SCENARIO_NAMES.push('gzip_native_bad_crc', 'gzip_native_bad_header', 'gzip_native_throws_once', 'gzip_native_not_readable')

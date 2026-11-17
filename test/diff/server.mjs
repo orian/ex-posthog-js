@@ -23,7 +23,14 @@ const MOUNTS = {
 function decodeBody(buf, url, contentType) {
     if (!buf.length) return undefined
     let raw = buf
-    if (buf[0] === 0x1f && buf[1] === 0x8b) raw = zlib.gunzipSync(buf)
+    if (buf[0] === 0x1f && buf[1] === 0x8b) {
+        // A corrupt gzip body (bad CRC, truncated) is what ingestion would reject: record it as such.
+        try {
+            raw = zlib.gunzipSync(buf)
+        } catch (e) {
+            return `<invalid gzip: ${e.code || e.message}>`
+        }
+    }
     let text = raw.toString('utf8')
     const compression = url.searchParams.get('compression')
     if ((contentType || '').includes('x-www-form-urlencoded') || text.startsWith('data=')) {
