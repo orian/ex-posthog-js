@@ -48,6 +48,28 @@ const instances = {};
 
 let executeArrayDepth = 0;
 
+/**
+ * While a call queued by the snippet is replayed: the time it was queued. The snippet
+ * stamps each call (`call.t`, ms since the epoch); events it captures get that time.
+ * @type {?Date}
+ */
+let queuedTime = null;
+
+/**
+ * Runs `fn` with events stamped at `t` (ms since the epoch) when it is a number.
+ * @param {*} t
+ * @param {function()} fn
+ */
+function atQueuedTime(t, fn) {
+  const previous = queuedTime;
+  queuedTime = isNumber(t) ? new Date(/** @type {number} */ (t)) : null;
+  try {
+    fn();
+  } finally {
+    queuedTime = previous;
+  }
+}
+
 const NOOP = function() {};
 const PRIMARY_INSTANCE_NAME = 'posthog';
 const CONSENT_COOKIELESS_WARN = 'Consent opt in/out is not valid with cookieless_mode="always" and will be ignored';
@@ -330,6 +352,8 @@ export class PostHog {
     this.isShutdown_ = false;
     /** @private {boolean} */
     this.initialPageviewCaptured_ = false;
+    /** @type {*} when the snippet queued `init` (ms since the epoch): the initial pageview's time */
+    this.snippetInitTime_ = undefined;
     /** @private {?function()} */
     this.visibilityStateListener_ = null;
     /** @private {boolean} */
@@ -1101,14 +1125,16 @@ export class PostHog {
       const execute = function(calls, thisArg) {
         calls.forEach(function(item) {
           try {
-            if (isArray(item[0])) {
-              let caller = thisArg;
-              each(item, function(call) {
-                caller = caller[call[0]].apply(caller, call.slice(1));
-              });
-            } else {
-              thisArg[item[0]].apply(thisArg, item.slice(1));
-            }
+            atQueuedTime(item['t'], function() {
+              if (isArray(item[0])) {
+                let caller = thisArg;
+                each(item, function(call) {
+                  caller = caller[call[0]].apply(caller, call.slice(1));
+                });
+              } else {
+                thisArg[item[0]].apply(thisArg, item.slice(1));
+              }
+            });
           } catch (e) {
             logger.error('Error executing queued PostHog call', item, e);
           }
@@ -1341,7 +1367,7 @@ export class PostHog {
     if (this.config['save_campaign_params'] || this.config['save_referrer']) this.persistence.set_initial_person_info();
 
     const systemTime = new Date();
-    const timestamp = opts['timestamp'] || systemTime;
+    const timestamp = opts['timestamp'] || queuedTime || systemTime;
     const uuid = isValidUUID(opts['uuid']) ? /** @type {string} */ (opts['uuid']) : uuidv7();
     /** @type {!Object} */
     let data = {
@@ -2528,6 +2554,8 @@ export class PostHog {
   captureInitialPageview_() {
     if (!doc) return;
     if (doc.visibilityState !== 'visible') {
+      // A hidden page is viewed when it is shown, not when the snippet ran.
+      this.snippetInitTime_ = undefined;
       if (!this.visibilityStateListener_) {
         const self = this;
         this.visibilityStateListener_ = function() {
@@ -2539,7 +2567,11 @@ export class PostHog {
     }
     if (!this.initialPageviewCaptured_) {
       this.initialPageviewCaptured_ = true;
-      this.capture(EVENT_PAGEVIEW, {'title': doc.title}, {'send_instantly': true});
+      const self = this;
+      atQueuedTime(this.snippetInitTime_, function() {
+        self.capture(EVENT_PAGEVIEW, {'title': doc.title}, {'send_instantly': true});
+      });
+      this.snippetInitTime_ = undefined;
       if (this.visibilityStateListener_) {
         doc.removeEventListener('visibilitychange', this.visibilityStateListener_);
         this.visibilityStateListener_ = null;
@@ -2830,6 +2862,8 @@ export function initFromSnippet() {
     each(snippet['_i'], function(item) {
       if (item && isArray(item)) {
         const instance = main.init(item[0], item[1], item[2]);
+        // The initial pageview is captured a tick later, at the time the snippet queued init.
+        if (instance) instance.snippetInitTime_ = item['t'];
         const instanceSnippet = snippet[item[2]] || snippet;
         if (instance.loaded && processed.indexOf(instanceSnippet) === -1) {
           processed.push(instanceSnippet);
