@@ -341,6 +341,37 @@ export const scenarios = {
         },
     },
 
+    'snippet stub calls keep the time they were queued': {
+        builds: ['core', 'full', 'lazy'],
+        async run(load) {
+            const queued = Date.now() - 5000
+            const stamp = (call, t) => Object.assign(call, { t })
+            const { b, ph } = await load({
+                before(window) {
+                    const stub = []
+                    stub.__SV = 1
+                    stub._i = [stamp([TOKEN, { ...FAST }, undefined], queued)]
+                    stub.push(stamp(['capture', 'early', { a: 1 }], queued + 100))
+                    stub.push(stamp(['identify', 'early-user'], queued + 200))
+                    stub.push(['capture', 'unstamped'])
+                    window.posthog = stub
+                },
+            })
+            assert.equal(ph.__loaded, true)
+            const loadedAt = Date.now()
+            await sleep(FLUSH)
+            const at = (name) => Date.parse(events(b).find((e) => e.event === name).timestamp)
+            assert.equal(at('$pageview'), queued, 'the initial pageview: when init was queued')
+            assert.equal(at('early'), queued + 100)
+            assert.equal(at('$identify'), queued + 200)
+            assert.ok(at('unstamped') >= loadedAt - 1000, 'no stamp: the replay time')
+            assert.equal(events(b).find((e) => e.event === 'early').properties.$event_time_override_provided, undefined)
+            ph.capture('later')
+            await sleep(FLUSH)
+            assert.ok(at('later') >= loadedAt, 'calls after the replay: their own time')
+        },
+    },
+
     'history_change captures SPA pageviews': {
         builds: ['core'],
         async run(load) {
